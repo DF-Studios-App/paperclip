@@ -9,6 +9,7 @@ import {
   sessionCodec as geminiSessionCodec,
   isGeminiSessionUnrecoverableError,
 } from "@paperclipai/adapter-gemini-local/server";
+import { sessionCodec as agySessionCodec } from "@paperclipai/adapter-agy-local/server";
 import {
   sessionCodec as opencodeSessionCodec,
   isOpenCodeUnknownSessionError,
@@ -174,6 +175,27 @@ describe("adapter session codecs", () => {
       cwd: "/tmp/gemini",
     });
     expect(geminiSessionCodec.getDisplayId?.(serialized ?? null)).toBe("gemini-session-1");
+  });
+
+  it("normalizes agy session params with cwd", () => {
+    const parsed = agySessionCodec.deserialize({
+      session_id: "agy-session-1",
+      cwd: "/tmp/agy",
+      workspaceId: "ws-1",
+    });
+    expect(parsed).toEqual({
+      sessionId: "agy-session-1",
+      cwd: "/tmp/agy",
+      workspaceId: "ws-1",
+    });
+
+    const serialized = agySessionCodec.serialize(parsed);
+    expect(serialized).toEqual({
+      sessionId: "agy-session-1",
+      cwd: "/tmp/agy",
+      workspaceId: "ws-1",
+    });
+    expect(agySessionCodec.getDisplayId?.(serialized ?? null)).toBe("agy-session-1");
   });
 
   it("preserves gemini ACP session params for ACP lane resumes", () => {
