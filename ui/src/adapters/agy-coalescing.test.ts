@@ -79,10 +79,23 @@ describe("AGY UI transcript coalescing and tool identity", () => {
       },
     );
 
-    const entries = chunks[0].chunk
-      .trim()
-      .split("\n")
-      .flatMap((line) => parseAgyStdoutLine(line, ts));
+    const entries = buildTranscript(chunks, agyLocalUIAdapter);
+    expect(entries).toEqual([
+      {
+        kind: "assistant",
+        ts,
+        text: "Hello",
+        delta: true,
+        itemId: "conv-1:1",
+      },
+      {
+        kind: "assistant",
+        ts,
+        text: "World",
+        delta: true,
+        itemId: "conv-1:3",
+      },
+    ]);
 
     const items = transcriptToTaskChatItems(entries, { running: false, runId: "run-1" });
     const messages = items.filter((item) => item.kind === "message");

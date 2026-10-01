@@ -76,7 +76,10 @@ function parseCumulativeUsage(value: unknown): UsageSummary | null {
   return {
     inputTokens: asNumber(raw.inputTokens ?? raw.input_tokens, 0),
     outputTokens: asNumber(raw.outputTokens ?? raw.output_tokens, 0),
-    cachedInputTokens: asNumber(raw.cachedInputTokens ?? raw.cached_input_tokens, 0),
+    cachedInputTokens: asNumber(
+      raw.cachedInputTokens ?? raw.cached_input_tokens ?? raw.cache_read_tokens,
+      0,
+    ),
   };
 }
 

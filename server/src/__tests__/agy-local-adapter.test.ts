@@ -150,6 +150,7 @@ describe("agy_local session codec", () => {
       repoUrl: "https://github.com/org/repo",
       repoRef: "main",
       remoteExecution: { driver: "ssh", target: "dev-box" },
+      cumulativeUsage: { inputTokens: 1200, outputTokens: 120, cachedInputTokens: 60 },
     };
 
     const serialized = sessionCodec.serialize(params);
