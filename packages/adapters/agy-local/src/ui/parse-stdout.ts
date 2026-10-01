@@ -1,29 +1,17 @@
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
-
-function safeJsonParse(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
-}
+import { agyUsage, normalizeAgyEvents } from "../events.js";
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
 export function parseAgyStdoutLine(line: string, ts: string): TranscriptEntry[] {
-  const parsed = asRecord(safeJsonParse(line));
-  if (!parsed) {
-    // Treat plain text line as stdout
-    return [{ kind: "stdout", ts, text: line }];
-  }
+  const events = normalizeAgyEvents(line);
+  if (!events) return [{ kind: "stdout", ts, text: line }];
+  return events.flatMap((event) => parseEvent(event, line, ts));
+}
 
+function parseEvent(parsed: Record<string, unknown>, line: string, ts: string): TranscriptEntry[] {
   const type = asString(parsed.type).trim().toLowerCase();
 
   if (type === "system") {
@@ -42,7 +30,32 @@ export function parseAgyStdoutLine(line: string, ts: string): TranscriptEntry[] 
   }
 
   if (type === "assistant" || type === "text") {
-    return [{ kind: "assistant", ts, text: asString(parsed.text ?? parsed.content ?? parsed.message ?? line) }];
+    const delta = parsed.delta === true;
+    const convId = asString(parsed.conversation_id ?? parsed.sessionId ?? parsed.session_id, "agy");
+    const itemId = parsed.itemId
+      ? asString(parsed.itemId)
+      : parsed.stepIndex != null
+      ? `${convId}:${parsed.stepIndex}`
+      : undefined;
+    return [
+      {
+        kind: "assistant",
+        ts,
+        text: asString(parsed.text ?? parsed.content ?? parsed.message ?? line),
+        ...(delta ? { delta: true } : {}),
+        ...(itemId ? { itemId } : {}),
+      },
+    ];
+  }
+
+  if (type === "result") {
+    const usage = agyUsage(parsed.stats ?? parsed.usage);
+    const isError = parsed.isError === true || parsed.is_error === true;
+    return [{ kind: "result", ts, text: asString(parsed.text ?? parsed.response),
+      inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+      cachedTokens: usage.cachedInputTokens, costUsd: typeof parsed.costUsd === "number" ? parsed.costUsd : 0,
+      subtype: asString(parsed.status ?? parsed.subtype), isError,
+      errors: isError ? [asString(parsed.error ?? parsed.message, "AGY CLI error")] : [] }];
   }
 
   if (type === "user") {
@@ -50,25 +63,45 @@ export function parseAgyStdoutLine(line: string, ts: string): TranscriptEntry[] 
   }
 
   if (type === "thinking") {
-    return [{ kind: "thinking", ts, text: asString(parsed.text ?? line) }];
+    const delta = parsed.delta === true;
+    const convId = asString(parsed.conversation_id ?? parsed.sessionId ?? parsed.session_id, "agy");
+    const itemId = parsed.itemId
+      ? asString(parsed.itemId)
+      : parsed.stepIndex != null
+      ? `${convId}:${parsed.stepIndex}`
+      : undefined;
+    return [
+      {
+        kind: "thinking",
+        ts,
+        text: asString(parsed.text ?? line),
+        ...(delta ? { delta: true } : {}),
+        ...(itemId ? { itemId } : {}),
+      },
+    ];
   }
 
   if (type === "tool_call") {
     const name = asString(parsed.name ?? parsed.tool ?? "tool");
+    const rawToolUseId = asString(parsed.toolUseId ?? parsed.tool_use_id ?? parsed.call_id ?? parsed.id).trim();
+    const toolUseId = rawToolUseId.length > 0 ? rawToolUseId : undefined;
     return [
       {
         kind: "tool_call",
         ts,
         name,
         input: parsed.input ?? parsed.arguments ?? parsed.args ?? {},
+        ...(toolUseId ? { toolUseId } : {}),
       },
     ];
   }
 
   if (type === "tool_result" || type === "tool_response") {
-    const toolUseId = asString(parsed.toolUseId ?? parsed.tool_use_id ?? "tool_result");
+    const rawToolUseId = asString(parsed.toolUseId ?? parsed.tool_use_id ?? parsed.call_id ?? parsed.id).trim();
+    const toolUseId = rawToolUseId.length > 0 ? rawToolUseId : "tool_result";
     const content = asString(parsed.content ?? parsed.output ?? parsed.result ?? line);
     const isError = parsed.isError === true || parsed.is_error === true;
+    const toolName = parsed.toolName ? asString(parsed.toolName) : parsed.name ? asString(parsed.name) : undefined;
     return [
       {
         kind: "tool_result",
@@ -76,6 +109,7 @@ export function parseAgyStdoutLine(line: string, ts: string): TranscriptEntry[] 
         toolUseId,
         content,
         isError,
+        ...(toolName ? { toolName } : {}),
       },
     ];
   }

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -50,6 +50,7 @@ import {
 import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { DEFAULT_AGY_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveAgySkillsHome } from "./skills.js";
+import { buildAgyRemoteSkillsCommand } from "./remote-skills.js";
 import {
   describeAgyFailure,
   detectAgyAuthRequired,
@@ -67,6 +68,16 @@ function resolveAgyProvider(model: string): string | null {
   if (normalized.startsWith("claude-")) return "anthropic";
   if (normalized.startsWith("gpt-")) return "openai";
   return null;
+}
+
+function parseCumulativeUsage(value: unknown): UsageSummary | null {
+  const raw = parseObject(value);
+  if (!raw || Object.keys(raw).length === 0) return null;
+  return {
+    inputTokens: asNumber(raw.inputTokens ?? raw.input_tokens, 0),
+    outputTokens: asNumber(raw.outputTokens ?? raw.output_tokens, 0),
+    cachedInputTokens: asNumber(raw.cachedInputTokens ?? raw.cached_input_tokens, 0),
+  };
 }
 
 async function ensureAgySkillsInjected(
@@ -343,12 +354,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             });
       if (remoteHomeDir && preparedExecutionTargetRuntime.assetDirs.skills) {
         remoteSkillsDir = path.posix.join(remoteHomeDir, ".gemini", "skills");
-        await runAdapterExecutionTargetShellCommand(
+        const skillSync = await runAdapterExecutionTargetShellCommand(
           runId,
           executionTarget,
-          `mkdir -p ${JSON.stringify(path.posix.dirname(remoteSkillsDir))} && rm -rf ${JSON.stringify(remoteSkillsDir)} && cp -a ${JSON.stringify(preparedExecutionTargetRuntime.assetDirs.skills)} ${JSON.stringify(remoteSkillsDir)}`,
+          buildAgyRemoteSkillsCommand(
+            remoteSkillsDir,
+            preparedExecutionTargetRuntime.assetDirs.skills,
+            agySkillEntries.filter((entry) => desiredAgySkillNames.includes(entry.key)).map((entry) => entry.runtimeName),
+          ),
           { cwd, env, timeoutSec, graceSec, onLog },
         );
+        if (skillSync.timedOut || skillSync.exitCode !== 0) {
+          throw new Error("Failed to synchronize managed AGY skills on the execution target");
+        }
       }
     } catch (error) {
       await Promise.allSettled([
@@ -576,7 +594,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const failed = (attempt.proc.exitCode ?? 0) !== 0;
+    const failed = (attempt.proc.exitCode ?? 0) !== 0 || attempt.parsed.isError;
     const clearSessionForTurnLimit = isAgyTurnLimitResult(
       attempt.proc.stdout,
       attempt.proc.stderr,
@@ -593,11 +611,65 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const canFallbackToRuntimeSession = !isRetry;
     const resolvedSessionId =
       attempt.parsed.sessionId ??
-      (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
+      (canFallbackToRuntimeSession ? sessionId : null);
+
+    const isSameSession = Boolean(
+      sessionId &&
+      canResumeSession &&
+      canFallbackToRuntimeSession &&
+      resolvedSessionId &&
+      resolvedSessionId === sessionId,
+    );
+
+    const previousCumulativeUsage = isSameSession
+      ? parseCumulativeUsage(runtimeSessionParams.cumulativeUsage)
+      : null;
+
+    let resolvedUsage = attempt.parsed.usage;
+    let resolvedUsageBasis: "per_run" | "session_cumulative" | null = attempt.parsed.usageBasis;
+    let nextCumulativeUsage: UsageSummary | null = previousCumulativeUsage;
+
+    if (attempt.parsed.hasStepUsage) {
+      resolvedUsageBasis = "per_run";
+      if (attempt.parsed.resultUsage) {
+        nextCumulativeUsage = attempt.parsed.resultUsage;
+      } else if (previousCumulativeUsage) {
+        nextCumulativeUsage = {
+          inputTokens: previousCumulativeUsage.inputTokens + resolvedUsage.inputTokens,
+          outputTokens: previousCumulativeUsage.outputTokens + resolvedUsage.outputTokens,
+          cachedInputTokens: (previousCumulativeUsage.cachedInputTokens ?? 0) + (resolvedUsage.cachedInputTokens ?? 0),
+        };
+      } else {
+        nextCumulativeUsage = resolvedUsage;
+      }
+    } else if (attempt.parsed.resultUsage) {
+      if (isSameSession && previousCumulativeUsage) {
+        resolvedUsage = {
+          inputTokens: Math.max(0, attempt.parsed.resultUsage.inputTokens - previousCumulativeUsage.inputTokens),
+          outputTokens: Math.max(0, attempt.parsed.resultUsage.outputTokens - previousCumulativeUsage.outputTokens),
+          cachedInputTokens: Math.max(
+            0,
+            (attempt.parsed.resultUsage.cachedInputTokens ?? 0) - (previousCumulativeUsage.cachedInputTokens ?? 0),
+          ),
+        };
+        resolvedUsageBasis = "per_run";
+        nextCumulativeUsage = attempt.parsed.resultUsage;
+      } else if (!isSameSession) {
+        resolvedUsage = attempt.parsed.resultUsage;
+        resolvedUsageBasis = "per_run";
+        nextCumulativeUsage = attempt.parsed.resultUsage;
+      } else {
+        resolvedUsage = attempt.parsed.resultUsage;
+        resolvedUsageBasis = "session_cumulative";
+        nextCumulativeUsage = attempt.parsed.resultUsage;
+      }
+    }
+
     const resolvedSessionParams = resolvedSessionId
       ? ({
           sessionId: resolvedSessionId,
           cwd: effectiveExecutionCwd,
+          ...(nextCumulativeUsage ? { cumulativeUsage: nextCumulativeUsage } : {}),
           ...(workspaceId ? { workspaceId } : {}),
           ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
           ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
@@ -623,14 +695,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
 
     return {
-      exitCode: attempt.proc.exitCode,
+      exitCode: failed && attempt.proc.exitCode === 0 ? 1 : attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
       errorMessage: failed ? fallbackErrorMessage : null,
       errorCode,
       errorFamily: quotaMeta.exhausted ? "transient_upstream" : null,
       retryNotBefore: quotaMeta.retryNotBefore ?? null,
-      usage: attempt.parsed.usage,
+      usage: resolvedUsage,
+      usageBasis: resolvedUsageBasis,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
@@ -647,7 +720,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       summary: attempt.parsed.summary,
       clearSession:
-        clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+        clearSessionForTurnLimit || Boolean(
+          !resolvedSessionId && (clearSessionOnMissingSession || (runtimeSessionId && !canResumeSession)),
+        ),
     };
   };
 
@@ -657,7 +732,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (
       sessionId &&
       !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
+      ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.isError) &&
       isAgyUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
     ) {
       await onLog(
