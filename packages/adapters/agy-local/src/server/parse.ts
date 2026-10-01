@@ -1,92 +1,87 @@
-import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { asString } from "@paperclipai/adapter-utils/server-utils";
+import { agyUsage, hasAgyUsage, normalizeAgyEvents, record } from "../events.js";
 
-const CONVERSATION_ID_RE =
-  /(?:conversation|session)(?:\s+id)?[:\s]+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i;
-const CONVERSATION_TRAVERSED_RE =
-  /(?:traversed\s+workspace\s+for\s+conversation\s+|conversation\s+)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i;
+const CONVERSATION_ID_RE = /(?:conversation|session)(?:\s+id)?[:\s]+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i;
+const CONVERSATION_TRAVERSED_RE = /traversed\s+workspace\s+for\s+conversation\s+([a-f0-9-]{36})/i;
 
 export function parseAgyOutput(stdout: string, stderr: string) {
-  let sessionId: string | null = null;
-  const messages: string[] = [];
+  const combined = stdout + "\n" + stderr;
+  let sessionId: string | null = (combined.match(CONVERSATION_ID_RE) ?? combined.match(CONVERSATION_TRAVERSED_RE))?.[1] ?? null;
   let errorMessage: string | null = null;
-  const usage = {
-    inputTokens: 0,
-    cachedInputTokens: 0,
-    outputTokens: 0,
-  };
+  let isError = false;
+  let finalText: string | null = null;
+  let streamedText = "";
+  const messages: string[] = [];
+  let usage = agyUsage(null);
+  let resultUsage: ReturnType<typeof agyUsage> | null = null;
+  const stepUsage = new Map<number, ReturnType<typeof agyUsage>>();
   let costUsd: number | null = null;
-
-  // Extract session/conversation ID from explicit patterns in output
-  const combinedText = `${stdout}\n${stderr}`;
-  const conversationMatch =
-    combinedText.match(CONVERSATION_ID_RE) ?? combinedText.match(CONVERSATION_TRAVERSED_RE);
-  if (conversationMatch && conversationMatch[1]) {
-    sessionId = conversationMatch[1];
-  }
-
-  // Parse stdout lines
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-
-    // Check if the line is JSON
-    if (line.startsWith("{") && line.endsWith("}")) {
-      const event = parseJson(line);
-      if (event) {
-        const type = asString(event.type, "").trim().toLowerCase();
-        const subtype = asString(event.subtype, "").trim().toLowerCase();
-
-        if (type === "system" && subtype === "init") {
-          const eventSessionId = asString(
-            event.sessionId ?? event.session_id ?? event.conversationId ?? event.conversation_id,
-            "",
-          );
-          if (eventSessionId) sessionId = eventSessionId;
-        } else if (type === "error" || type === "stderr") {
-          errorMessage = asString(event.message ?? event.error ?? event.text, errorMessage ?? "");
-        } else if (type === "assistant" || type === "text") {
-          const text = asString(event.text ?? event.content ?? event.message, "");
-          if (text) messages.push(text);
-        } else if (type === "result" || type === "stats" || type === "usage") {
-          const stats = parseObject(event.stats ?? event.usage ?? event);
-          if (stats) {
-            usage.inputTokens = asNumber(stats.inputTokens ?? stats.input_tokens, usage.inputTokens);
-            usage.outputTokens = asNumber(stats.outputTokens ?? stats.output_tokens, usage.outputTokens);
-            usage.cachedInputTokens = asNumber(
-              stats.cachedInputTokens ?? stats.cached_input_tokens,
-              usage.cachedInputTokens,
-            );
-            const cost = stats.total_cost_usd ?? stats.costUsd ?? stats.cost;
-            if (typeof cost === "number") {
-              costUsd = cost;
-            }
-          }
+    const events = normalizeAgyEvents(line);
+    if (!events) { messages.push(line); continue; }
+    for (const event of events) {
+      const id = asString(event.sessionId ?? event.session_id ?? event.conversationId ?? event.conversation_id, "");
+      if (id) sessionId = id;
+      if (typeof event.stepIndex === "number" && event.stepUsage != null) {
+        // A step may emit usage repeatedly; retain its latest totals once.
+        stepUsage.set(event.stepIndex, agyUsage(event.stepUsage));
+      }
+      const type = asString(event.type, "").toLowerCase();
+      if (type === "assistant" || type === "text") {
+        const text = asString(event.text ?? event.content ?? event.message, "");
+        if (event.delta === true) streamedText += text;
+        else if (text) messages.push(text);
+      } else if (type === "error" || type === "stderr") {
+        isError = true;
+        errorMessage = asString(event.message ?? event.error ?? event.text, "AGY CLI error");
+      } else if (type === "result" || type === "stats" || type === "usage") {
+        if (typeof event.text === "string") finalText = event.text;
+        if (event.isError === true || event.is_error === true) {
+          isError = true;
+          errorMessage = asString(event.error ?? event.message, "AGY CLI error");
         }
-        continue;
+        const rawStats = event.stats ?? event.usage ?? (type === "stats" || type === "usage" ? event : null);
+        if (rawStats && hasAgyUsage(rawStats)) {
+          const stats = record(rawStats);
+          resultUsage = agyUsage(stats);
+          usage = resultUsage;
+          const cost = stats.total_cost_usd ?? stats.costUsd ?? stats.cost;
+          if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) costUsd = cost;
+        } else if (rawStats) {
+          const stats = record(rawStats);
+          const cost = stats.total_cost_usd ?? stats.costUsd ?? stats.cost;
+          if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) costUsd = cost;
+        }
       }
     }
-
-    // Accumulate non-JSON text lines as part of the summary
-    messages.push(line);
   }
-
-  // If we have an exit error or stderr contains error indications
-  if (!errorMessage) {
-    const stderrLines = stderr
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.toLowerCase().includes("error") || l.toLowerCase().includes("failed"));
-    if (stderrLines.length > 0) {
-      errorMessage = stderrLines[0];
+  const hasStepUsage = stepUsage.size > 0;
+  let usageBasis: "per_run" | "session_cumulative" | null = null;
+  if (hasStepUsage) {
+    usage = agyUsage(null);
+    for (const step of stepUsage.values()) {
+      usage.inputTokens += step.inputTokens;
+      usage.outputTokens += step.outputTokens;
+      usage.cachedInputTokens += step.cachedInputTokens;
     }
+    usageBasis = "per_run";
+  } else if (resultUsage) {
+    usageBasis = "session_cumulative";
   }
-
+  errorMessage ||= stderr.split(/\r?\n/).map((line) => line.trim())
+    .find((line) => /error|failed/i.test(line)) ?? null;
   return {
     sessionId,
-    summary: messages.join("\n").trim(),
+    summary: (finalText ?? (streamedText || messages.join("\n"))).trim(),
     usage,
+    usageBasis,
+    hasStepUsage,
+    resultUsage,
     costUsd,
-    errorMessage: errorMessage || null,
+    errorMessage,
+    isError,
   };
 }
 

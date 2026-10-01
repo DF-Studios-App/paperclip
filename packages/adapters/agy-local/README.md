@@ -71,4 +71,16 @@ The adapter's `testEnvironment` preflight probe:
 
 ### Session Recovery
 
-If a run fails due to an unknown, expired, or missing conversation session (e.g. `conversation not found` or `unknown session`), the adapter returns `clearSession: true` to purge the invalid session ID and automatically restart fresh on the next heartbeat.
+The adapter persists the `conversation_id` from init, step and terminal result events. It resumes with `--conversation` only when the working directory and execution-target identity match. A confirmed missing conversation triggers one fresh retry in the same heartbeat; a successful replacement session is saved, otherwise `clearSession: true` clears the stale ID. An incompatible session is never reused as a fallback.
+
+`agy_local` explicitly supports session resume. Native context management remains unconfirmed, so Paperclip uses its conservative default compaction policy: 200 runs, 2,000,000 raw input tokens, or 72 hours, configurable through runtime session compaction overrides.
+
+### Stream parsing and usage
+
+All three consumers share dependency-free normalization of AGY `event: init`, `step_update`, and `result` envelopes, while retaining legacy type-based events. Response deltas concatenate without added newlines; the terminal response is authoritative. Step usage is counted once per step and reported with `usageBasis: "per_run"`, ensuring the heartbeat does not session-delta already distinct run tokens.
+
+When step usage is absent, the adapter falls back to `result.usage`. If previous cumulative usage is known in session parameters from earlier turns, the adapter computes the per-run delta and reports `usageBasis: "per_run"`; otherwise, it declares `usageBasis: "session_cumulative"` so the control plane derives the run delta from prior session history. Alternating between step usage and cumulative fallback maintains continuous cumulative tracking in `sessionParams`, preventing both undercounting and double counting on resumed sessions. See the [official headless protocol](https://www.antigravity.google/docs/cli/headless/). Regression fixtures include a sanitized local AGY 1.2.11 run.
+
+### Remote skills
+
+Remote execution stores managed skill copies in `~/.gemini/.paperclip-agy-skills` and links them into `~/.gemini/skills`. External entries, including name collisions and dangling links, are preserved. Only links pointing to the exact private store entry are refreshed or removed when deselected; the skills directory is never replaced. Symlinked skills/store roots are rejected. Existing unmarked copies from older adapter versions are treated as external and require manual migration if they collide.
