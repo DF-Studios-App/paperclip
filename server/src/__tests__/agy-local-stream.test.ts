@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { execute, parseAgyOutput } from "@paperclipai/adapter-agy-local/server";
+import { execute, parseAgyOutput, sessionCodec } from "@paperclipai/adapter-agy-local/server";
+import { resolveNextSessionState } from "../services/heartbeat.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 import { parseAgyStdoutLine } from "@paperclipai/adapter-agy-local/ui";
@@ -681,6 +682,120 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       expect(res2.sessionParams).toMatchObject({
         sessionId: "sess-new",
         cumulativeUsage: { inputTokens: 500, outputTokens: 50, cachedInputTokens: 0 },
+      });
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("preserves cumulativeUsage across persistence via resolveNextSessionState so third run computes delta correctly", async () => {
+    try {
+      // Turn 1: 1,000 tokens
+      const turn1Output = [
+        JSON.stringify({ event: "init", conversation_id: "sess-persist-test", init: {} }),
+        JSON.stringify({
+          event: "result",
+          result: {
+            conversation_id: "sess-persist-test",
+            status: "SUCCESS",
+            response: "Turn 1",
+            usage: { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 },
+          },
+        }),
+      ].join("\n");
+
+      const res1 = await executeTurn({ runId: "r-1", stdout: turn1Output });
+      expect(res1.usage.inputTokens).toBe(1000);
+      expect(res1.usageBasis).toBe("per_run");
+
+      // Pass through resolveNextSessionState (which serializes and deserializes via sessionCodec)
+      const nextSession1 = resolveNextSessionState({
+        adapterType: "agy_local",
+        codec: sessionCodec,
+        adapterResult: res1,
+        outcome: "succeeded",
+        previousParams: null,
+        previousDisplayId: null,
+        previousLegacySessionId: null,
+      });
+      expect(nextSession1.params?.cumulativeUsage).toEqual({
+        inputTokens: 1000,
+        outputTokens: 0,
+        cachedInputTokens: 0,
+      });
+
+      // Turn 2: Cumulative total = 1,200 tokens (delta = 200)
+      const turn2Output = [
+        JSON.stringify({ event: "init", conversation_id: "sess-persist-test", init: {} }),
+        JSON.stringify({
+          event: "result",
+          result: {
+            conversation_id: "sess-persist-test",
+            status: "SUCCESS",
+            response: "Turn 2",
+            usage: { input_tokens: 1200, output_tokens: 0, cache_read_tokens: 0 },
+          },
+        }),
+      ].join("\n");
+
+      // Simulate DB jsonb persistence roundtrip (serializes as JSON, then deserialized by sessionCodec for next run)
+      const persistedParams1 = sessionCodec.deserialize(JSON.parse(JSON.stringify(nextSession1.params)));
+
+      const res2 = await executeTurn({
+        runId: "r-2",
+        sessionId: "sess-persist-test",
+        sessionParams: persistedParams1,
+        stdout: turn2Output,
+      });
+      expect(res2.usage.inputTokens).toBe(200);
+      expect(res2.usageBasis).toBe("per_run");
+
+      const nextSession2 = resolveNextSessionState({
+        adapterType: "agy_local",
+        codec: sessionCodec,
+        adapterResult: res2,
+        outcome: "succeeded",
+        previousParams: nextSession1.params,
+        previousDisplayId: nextSession1.displayId,
+        previousLegacySessionId: nextSession1.legacySessionId,
+      });
+      expect(nextSession2.params?.cumulativeUsage).toEqual({
+        inputTokens: 1200,
+        outputTokens: 0,
+        cachedInputTokens: 0,
+      });
+
+      // Simulate DB jsonb persistence roundtrip for turn 2
+      const persistedParams2 = sessionCodec.deserialize(JSON.parse(JSON.stringify(nextSession2.params)));
+
+      // Turn 3: 300 additional tokens (cumulative total = 1,500 tokens)
+      const turn3Output = [
+        JSON.stringify({ event: "init", conversation_id: "sess-persist-test", init: {} }),
+        JSON.stringify({
+          event: "result",
+          result: {
+            conversation_id: "sess-persist-test",
+            status: "SUCCESS",
+            response: "Turn 3",
+            usage: { input_tokens: 1500, output_tokens: 0, cache_read_tokens: 0 },
+          },
+        }),
+      ].join("\n");
+
+      const res3 = await executeTurn({
+        runId: "r-3",
+        sessionId: "sess-persist-test",
+        sessionParams: persistedParams2,
+        stdout: turn3Output,
+      });
+      // Before fix: sessionCodec discarded cumulativeUsage, so Turn 3 had no previousCumulativeUsage,
+      // and counted all 1,500 tokens as session_cumulative.
+      // With fix: 1500 - 1200 = 300 tokens, basis per_run!
+      expect(res3.usage.inputTokens).toBe(300);
+      expect(res3.usageBasis).toBe("per_run");
+      expect(res3.sessionParams).toMatchObject({
+        sessionId: "sess-persist-test",
+        cumulativeUsage: { inputTokens: 1500, outputTokens: 0, cachedInputTokens: 0 },
       });
     } finally {
       vi.restoreAllMocks();
