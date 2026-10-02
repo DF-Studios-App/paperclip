@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   execute,
   isAgyTurnLimitResult,
@@ -324,6 +324,18 @@ describe("agy_local models catalog", () => {
 });
 
 describe("agy_local execute argument construction & session retry", () => {
+  let commandResolvableSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    commandResolvableSpy = vi
+      .spyOn(executionTarget, "ensureAdapterExecutionTargetCommandResolvable")
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    commandResolvableSpy?.mockRestore();
+  });
+
   it("omits --model when auto is configured and leaves permission skipping disabled by default", async () => {
     const runProcessSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockResolvedValue({
       exitCode: 0,
@@ -495,13 +507,44 @@ describe("agy_local execute argument construction & session retry", () => {
       "stdout",
       expect.stringContaining('resume session "sess-stale" is unavailable; retrying with a fresh session'),
     );
+    expect(commandResolvableSpy).toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
 
     runProcessSpy.mockRestore();
   });
+
+  it("fails execution when command is not resolvable", async () => {
+    commandResolvableSpy.mockRejectedValueOnce(new Error('Command not found in PATH: "agy"'));
+
+    await expect(
+      execute({
+        runId: "run-unresolvable",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: {
+          command: "agy",
+          cwd: process.cwd(),
+        },
+        context: {},
+        onLog: vi.fn(),
+      }),
+    ).rejects.toThrow('Command not found in PATH: "agy"');
+  });
 });
 
 describe("agy_local testEnvironment", () => {
+  let commandResolvableSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    commandResolvableSpy = vi
+      .spyOn(executionTarget, "ensureAdapterExecutionTargetCommandResolvable")
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    commandResolvableSpy?.mockRestore();
+  });
+
   it("probes help without model generation and returns auth guidance", async () => {
     const runProcessSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockResolvedValue({
       exitCode: 0,
@@ -522,6 +565,7 @@ describe("agy_local testEnvironment", () => {
     // Probed with ["help"], not a prompt or generation
     expect(runProcessSpy.mock.calls[0][3]).toEqual(["help"]);
 
+    expect(commandResolvableSpy).toHaveBeenCalled();
     // Contains the explicit auth guidance check
     const authGuidance = result.checks.find((c) => c.code === "agy_auth_preflight_guidance");
     expect(authGuidance).toBeDefined();
@@ -529,5 +573,21 @@ describe("agy_local testEnvironment", () => {
     expect(authGuidance?.message).toContain("verifies CLI installation and command execution only");
 
     runProcessSpy.mockRestore();
+  });
+
+  it("fails environment check when agy command is not resolvable", async () => {
+    commandResolvableSpy.mockRejectedValueOnce(new Error('Command not found in PATH: "agy"'));
+
+    const result = await testEnvironment({
+      companyId: "c1",
+      adapterType: "agy_local",
+      config: { command: "agy", cwd: process.cwd() },
+    });
+
+    expect(result.status).toBe("fail");
+    const unresolvableCheck = result.checks.find((c) => c.code === "agy_command_unresolvable");
+    expect(unresolvableCheck).toBeDefined();
+    expect(unresolvableCheck?.level).toBe("error");
+    expect(unresolvableCheck?.message).toContain('Command not found in PATH: "agy"');
   });
 });

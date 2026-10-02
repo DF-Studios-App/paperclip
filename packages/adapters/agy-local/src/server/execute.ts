@@ -9,7 +9,6 @@ import {
   overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
-  adapterExecutionTargetUsesManagedHome,
   adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
@@ -43,7 +42,6 @@ import {
   parseObject,
   renderTemplate,
   renderPaperclipWakePrompt,
-  stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -221,7 +219,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -230,7 +227,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -341,20 +337,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionCwd: effectiveExecutionCwd,
       });
       remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
-      const managedHome = adapterExecutionTargetUsesManagedHome(executionTarget);
-      if (managedHome && preparedExecutionTargetRuntime.runtimeRootDir) {
-        env.HOME = preparedExecutionTargetRuntime.runtimeRootDir;
-      }
-      const remoteHomeDir =
-        managedHome && preparedExecutionTargetRuntime.runtimeRootDir
-          ? preparedExecutionTargetRuntime.runtimeRootDir
-          : await readAdapterExecutionTargetHomeDir(runId, executionTarget, {
-              cwd,
-              env,
-              timeoutSec,
-              graceSec,
-              onLog,
-            });
+      // AGY authenticates from the remote user's ~/.gemini state. Keep the
+      // actual remote HOME even when the workspace/runtime is managed; the
+      // managed runtime root is for Paperclip assets, not user credentials.
+      const remoteHomeDir = await readAdapterExecutionTargetHomeDir(runId, executionTarget, {
+        cwd,
+        env,
+        timeoutSec,
+        graceSec,
+        onLog,
+      });
       if (remoteHomeDir && preparedExecutionTargetRuntime.assetDirs.skills) {
         remoteSkillsDir = path.posix.join(remoteHomeDir, ".gemini", "skills");
         const skillSync = await runAdapterExecutionTargetShellCommand(
