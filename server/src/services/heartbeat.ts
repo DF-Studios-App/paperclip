@@ -4766,6 +4766,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     }
   }
 
+  if (profile!.metadata?.source !== "paperclip_runner" || profile!.metadata?.agentId !== input.agent.id ||
+      profile!.metadata?.assignmentDigest !== assignmentDigest) {
+    throw new Error("Invalid native runtime profile provenance");
+  }
+
   let [gateway] = (
     await input.db
       .select()
@@ -4779,8 +4784,32 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       )
   ).filter(
     (candidate) =>
-      candidate.metadata?.nativeRuntimeAssignmentDigest === assignmentDigest,
+      candidate.metadata?.nativeRuntimeAssignmentDigest === assignmentDigest &&
+      candidate.metadata?.agentId === input.agent.id &&
+      candidate.profileId === profile!.id &&
+      (!candidate.agentId || candidate.agentId === input.agent.id),
   );
+  // Gateways created before the agent binding existed have a null agentId, and
+  // named-gateway auth only rejects another agent's run token when it is set.
+  // The assignment digest includes the agent id, so a reused gateway is this
+  // agent's own: bind it here instead of waiting for the assignment to change.
+  if (gateway && !gateway.agentId) {
+    await input.db
+      .update(toolMcpGateways)
+      .set({ agentId: input.agent.id, contextScopeType: "agent", contextScopeId: input.agent.id, updatedAt: new Date() })
+      .where(
+        and(
+          eq(toolMcpGateways.id, gateway.id),
+          eq(toolMcpGateways.companyId, input.agent.companyId),
+          isNull(toolMcpGateways.agentId),
+        ),
+      );
+    [gateway] = await input.db
+      .select()
+      .from(toolMcpGateways)
+      .where(eq(toolMcpGateways.id, gateway.id))
+      .limit(1);
+  }
   if (!gateway) {
     const slug = `native-${input.agent.id.replaceAll("-", "").slice(0, 12)}-${assignmentDigest.slice(0, 16)}`;
     try {
@@ -4792,6 +4821,9 @@ export async function buildPaperclipRuntimeMcpServers(input: {
           description: "Run-scoped Paperclip Runner MCP gateway.",
           profileId: profile!.id,
           defaultProfileMode: "gateway_only",
+          agentId: input.agent.id,
+          contextScopeType: "agent",
+          contextScopeId: input.agent.id,
           metadata: {
             nativeRuntimeAssignmentDigest: assignmentDigest,
             agentId: input.agent.id,
@@ -4817,6 +4849,12 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         .limit(1);
       if (!gateway) throw error;
     }
+  }
+
+  if (gateway!.agentId !== input.agent.id || gateway!.profileId !== profile!.id ||
+      gateway!.metadata?.agentId !== input.agent.id ||
+      gateway!.metadata?.nativeRuntimeAssignmentDigest !== assignmentDigest) {
+    throw new Error("Invalid native runtime gateway provenance");
   }
 
   const token = await service.createNamedGatewayToken({
@@ -5026,6 +5064,15 @@ export async function createManagedMcpRunConfig(input: {
         eq(toolMcpGateways.companyId, input.agent.companyId),
         eq(toolMcpGateways.status, "active"),
         isNull(toolMcpGateways.archivedAt),
+        // A native profile remains an immutable assignment even if gateway
+        // metadata is cleared. Explicit shared gateways use ordinary profiles.
+        sql`not exists (
+          select 1 from ${toolProfiles}
+          where ${toolProfiles.id} = ${toolMcpGateways.profileId}
+            and ${toolProfiles.companyId} = ${toolMcpGateways.companyId}
+            and (${toolProfiles.profileKey} like 'native:%'
+              or ${toolProfiles.metadata}->>'source' = 'paperclip_runner')
+        )`,
       ),
     )
     .orderBy(asc(toolMcpGateways.name));
@@ -5096,7 +5143,9 @@ export async function createManagedMcpRunConfig(input: {
   );
 
   const applicableGateways = rows.filter((gateway) =>
-    gatewayAppliesToRun({
+    // The immutable native assignment is delivered separately. Including any
+    // historical native gateway here duplicates and broadens that assignment.
+    !Object.hasOwn(gateway.metadata ?? {}, "nativeRuntimeAssignmentDigest") && gatewayAppliesToRun({
       gateway,
       agentId: input.agent.id,
       projectId: input.projectId,
@@ -28486,8 +28535,12 @@ export function heartbeatService(
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
                 )).then(rows => rows[0] ?? null)
               : null;
+          const canCoalesceComments = !isConversation(issue) && opts.allowRunCoalescing !== false;
+          // A resumed receipt already passed admission under this issue lock.
+          // Consume it with its successor even when chat keeps other messages
+          // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
-            !isConversation(issue) && opts.allowRunCoalescing !== false &&
+            (executionWaitRequestId || canCoalesceComments) &&
             !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id))
               ? await tx
                   .select()
@@ -28498,11 +28551,13 @@ export function heartbeatService(
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                      canCoalesceComments ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
                     ),
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
           const adoptedComments = pendingComments.filter((wake) => {
+            if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
             const deferredContext = parseObject(
