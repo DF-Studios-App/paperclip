@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 
@@ -8,7 +9,6 @@ type PreparedAgyRuntimeConfig = {
 };
 
 const LOCK_WAIT_MS = 100;
-const LOCK_TIMEOUT_MS = 120_000;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -29,16 +29,77 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
+function assertContained(root: string, candidate: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Antigravity MCP config path resolves outside the workspace.");
+  }
+}
+
+async function validateConfigPaths(input: {
+  root: string;
+  agentsDir: string;
+  configPath: string;
+  lockPath: string;
+}): Promise<void> {
+  const agents = await fs.lstat(input.agentsDir);
+  if (!agents.isDirectory() || agents.isSymbolicLink()) {
+    throw new Error("Antigravity workspace `.agents` must be a real directory, not a symlink.");
+  }
+  assertContained(input.root, await fs.realpath(input.agentsDir));
+
+  for (const filePath of [input.configPath, input.lockPath]) {
+    try {
+      const stat = await fs.lstat(filePath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("Antigravity MCP config and lock paths must be regular files, not symlinks.");
+      }
+      assertContained(input.root, await fs.realpath(filePath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+async function atomicWriteFile(
+  agentsDir: string,
+  filePath: string,
+  content: string | Buffer,
+  mode: number,
+  validate: () => Promise<void>,
+): Promise<void> {
+  const temporaryPath = path.join(agentsDir, `.paperclip-mcp-${randomUUID()}.tmp`);
+  const handle = await fs.open(temporaryPath, "wx", mode);
+  try {
+    await handle.writeFile(content);
+  } finally {
+    await handle.close();
+  }
+  try {
+    await validate();
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function acquireLock(
+  lockPath: string,
+  validate: () => Promise<void>,
+  signal?: AbortSignal,
+): Promise<() => Promise<void>> {
   const owner = JSON.stringify({ pid: process.pid, nonce: `${Date.now()}-${Math.random()}` });
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  while (Date.now() < deadline) {
+  while (true) {
+    signal?.throwIfAborted();
+    await validate();
     try {
       const handle = await fs.open(lockPath, "wx", 0o600);
       await handle.writeFile(owner, "utf8");
       await handle.close();
       return async () => {
         try {
+          await validate();
           if ((await fs.readFile(lockPath, "utf8")) === owner) await fs.unlink(lockPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -48,6 +109,7 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
       try {
+        await validate();
         const current = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: unknown };
         if (typeof current.pid === "number" && !processIsAlive(current.pid)) {
           const stalePath = `${lockPath}.${process.pid}.${Date.now()}.stale`;
@@ -68,7 +130,6 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
       await new Promise((resolve) => setTimeout(resolve, LOCK_WAIT_MS));
     }
   }
-  throw new Error("Timed out waiting for the workspace Antigravity MCP config lock.");
 }
 
 function uniqueServerName(name: string, connectionId: string, used: Set<string>): string {
@@ -85,19 +146,26 @@ function uniqueServerName(name: string, connectionId: string, used: Set<string>)
 export async function prepareAgyRuntimeMcpConfig(
   cwd: string,
   servers: readonly AdapterRuntimeMcpServer[],
+  signal?: AbortSignal,
 ): Promise<PreparedAgyRuntimeConfig> {
   if (servers.length === 0) return { serverNames: [], cleanup: async () => {} };
 
   const agentsDir = path.join(cwd, ".agents");
   const configPath = path.join(agentsDir, "mcp_config.json");
   const lockPath = path.join(agentsDir, ".paperclip-mcp-config.lock");
+  const root = await fs.realpath(cwd);
   await fs.mkdir(agentsDir, { recursive: true });
-  const releaseLock = await acquireLock(lockPath);
+  const validate = () => validateConfigPaths({ root, agentsDir, configPath, lockPath });
+  await validate();
+  const releaseLock = await acquireLock(lockPath, validate, signal);
   let original: Buffer | null = null;
   let originalMode = 0o600;
   try {
     try {
-      const stat = await fs.stat(configPath);
+      const stat = await fs.lstat(configPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("Antigravity MCP config must be a regular file, not a symlink.");
+      }
       original = await fs.readFile(configPath);
       originalMode = stat.mode & 0o777;
     } catch (error) {
@@ -120,18 +188,16 @@ export async function prepareAgyRuntimeMcpConfig(
       };
     }
     const injectedContent = `${JSON.stringify({ ...existing, mcpServers }, null, 2)}\n`;
-    await fs.writeFile(configPath, injectedContent, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    await atomicWriteFile(agentsDir, configPath, injectedContent, 0o600, validate);
 
     return {
       serverNames: names,
       cleanup: async () => {
         try {
+          await validate();
           const current = await fs.readFile(configPath, "utf8");
           if (current === injectedContent && original) {
-            await fs.writeFile(configPath, original, { mode: originalMode });
+            await atomicWriteFile(agentsDir, configPath, original, originalMode, validate);
           } else if (current === injectedContent) {
             await fs.unlink(configPath);
           } else {
@@ -143,17 +209,28 @@ export async function prepareAgyRuntimeMcpConfig(
               const baseline = parseConfig(original.toString("utf8"));
               const baselineServers = isObject(baseline.mcpServers) ? baseline.mcpServers : {};
               active.mcpServers = { ...baselineServers, ...restoredServers };
-              await fs.writeFile(configPath, `${JSON.stringify(active, null, 2)}\n`, {
-                encoding: "utf8",
-                mode: originalMode,
-              });
+              await atomicWriteFile(
+                agentsDir,
+                configPath,
+                `${JSON.stringify(active, null, 2)}\n`,
+                originalMode,
+                validate,
+              );
             } else if (Object.keys(restoredServers).length > 0 || Object.keys(active).length > 1) {
               active.mcpServers = restoredServers;
-              await fs.writeFile(configPath, `${JSON.stringify(active, null, 2)}\n`, "utf8");
+              await atomicWriteFile(
+                agentsDir,
+                configPath,
+                `${JSON.stringify(active, null, 2)}\n`,
+                0o600,
+                validate,
+              );
             } else {
               await fs.unlink(configPath);
             }
           }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         } finally {
           await releaseLock();
         }
