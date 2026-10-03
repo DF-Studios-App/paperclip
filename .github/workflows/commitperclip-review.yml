@@ -14,7 +14,6 @@ permissions:
 
 jobs:
   review:
-    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
