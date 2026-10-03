@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   execute,
   isAgyTurnLimitResult,
@@ -361,11 +364,72 @@ describe("agy_local execute argument construction & session retry", () => {
     expect(runProcessSpy).toHaveBeenCalled();
     const callArgs = runProcessSpy.mock.calls[0][3];
     expect(callArgs).not.toContain("--dangerously-skip-permissions");
-    expect(callArgs).toContain("--print");
+    expect(callArgs).toContain("--input-format");
+    expect(callArgs[callArgs.indexOf("--input-format") + 1]).toBe("stream-json");
+    expect(callArgs).not.toContain("--print");
     expect(callArgs).not.toContain("--model");
+    const processOptions = runProcessSpy.mock.calls[0][4];
+    const stdinMessage = JSON.parse(processOptions.stdin?.trim() ?? "{}") as {
+      event?: string;
+      message?: { content?: string };
+    };
+    expect(stdinMessage).toMatchObject({
+      event: "user",
+      message: { content: expect.stringMatching(/^\/goal\s/) },
+    });
     expect(result.sessionId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
 
     runProcessSpy.mockRestore();
+  });
+
+  it("injects granted runtime MCP servers for the AGY process and removes them after the run", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-runtime-mcp-execute-"));
+    const configPath = path.join(cwd, ".agents", "mcp_config.json");
+    let configDuringRun: Record<string, unknown> | null = null;
+    const runProcessSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "Done",
+      stderr: "",
+    });
+
+    try {
+      await execute({
+        runId: "run-runtime-mcp",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: { command: "agy", model: "auto", cwd },
+        context: {},
+        runtimeMcp: {
+          getServers: () => [
+            {
+              name: "GitHub",
+              url: "http://127.0.0.1:3100/api/mcp/runtime-tools",
+              token: "test-run-token",
+              connectionId: "github-connection",
+            },
+          ],
+        },
+        onLog: vi.fn(),
+        onMeta: async () => {
+          configDuringRun = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>;
+        },
+      });
+
+      expect(configDuringRun).toMatchObject({
+        mcpServers: {
+          GitHub: {
+            serverUrl: "http://127.0.0.1:3100/api/mcp/runtime-tools",
+            headers: { Authorization: "Bearer test-run-token" },
+          },
+        },
+      });
+      await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      runProcessSpy.mockRestore();
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("passes --dangerously-skip-permissions only when explicitly configured", async () => {
@@ -393,6 +457,44 @@ describe("agy_local execute argument construction & session retry", () => {
 
     const callArgs = runProcessSpy.mock.calls[0][3];
     expect(callArgs).toContain("--dangerously-skip-permissions");
+    runProcessSpy.mockRestore();
+  });
+
+  it("normalizes packed legacy flags without bypassing the typed permission setting", async () => {
+    const runProcessSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "Done",
+      stderr: "",
+    });
+
+    await execute({
+      runId: "run-goal-prefix",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: {
+        command: "agy",
+        model: "auto",
+        cwd: process.cwd(),
+        promptTemplate: "/goal Continue the assigned task.",
+        extraArgs: ["--dangerously-skip-permissions --goal", "--example-flag"],
+      },
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    const callArgs = runProcessSpy.mock.calls[0][3];
+    expect(callArgs).not.toContain("--goal");
+    expect(callArgs).not.toContain("--dangerously-skip-permissions");
+    expect(callArgs).toContain("--example-flag");
+    const processOptions = runProcessSpy.mock.calls[0][4];
+    const stdinMessage = JSON.parse(processOptions.stdin?.trim() ?? "{}") as {
+      message?: { content?: string };
+    };
+    expect(stdinMessage.message?.content).toMatch(/^\/goal\s/);
+    expect(stdinMessage.message?.content?.match(/\/goal/g)).toHaveLength(1);
+
     runProcessSpy.mockRestore();
   });
 
