@@ -1,4 +1,5 @@
 export { execute } from "./execute.js";
+export { prepareAgyRuntimeMcpConfig } from "./runtime-config.js";
 export {
   listAgySkills,
   syncAgySkills,
