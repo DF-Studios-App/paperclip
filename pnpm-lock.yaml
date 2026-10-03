@@ -80,6 +80,9 @@ importers:
       '@clack/prompts':
         specifier: ^1.7.0
         version: 1.7.0
+      '@paperclipai/adapter-agy-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/agy-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -159,6 +162,22 @@ importers:
       acpx:
         specifier: 0.12.0
         version: 0.12.0(patch_hash=zxns4omawae6bjvy7kkhcgweei)
+      picocolors:
+        specifier: ^1.1.1
+        version: 1.1.1
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
+  packages/adapters/agy-local:
+    dependencies:
+      '@paperclipai/adapter-utils':
+        specifier: workspace:*
+        version: link:../../adapter-utils
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -901,6 +920,9 @@ importers:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
+      '@paperclipai/adapter-agy-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/agy-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -1109,6 +1131,9 @@ importers:
       '@mdxeditor/editor':
         specifier: ^4.2.3
         version: 4.2.3(@codemirror/language@6.12.4)(@lezer/highlight@1.2.3)(@types/react-dom@19.2.5(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@7.0.2)(yjs@13.6.32)
+      '@paperclipai/adapter-agy-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/agy-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
