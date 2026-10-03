@@ -64,4 +64,38 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     await expect(fs.access(path.join(cwd, ".agents"))).rejects.toMatchObject({ code: "ENOENT" });
     await prepared.cleanup();
   });
+
+  it("rejects a symlinked workspace MCP directory before writing the run token", async () => {
+    const cwd = await makeWorkspace();
+    const externalDir = await makeWorkspace();
+    await fs.symlink(externalDir, path.join(cwd, ".agents"), "junction");
+
+    await expect(
+      prepareAgyRuntimeMcpConfig(cwd, [
+        { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "test-run-token", connectionId: "github" },
+      ]),
+    ).rejects.toThrow(/must be a real directory/);
+    await expect(fs.access(path.join(externalDir, "mcp_config.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("waits for another run's config lease and proceeds after the first run cleans up", async () => {
+    const cwd = await makeWorkspace();
+    const first = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "First", url: "http://127.0.0.1:3100/first", token: "first-token", connectionId: "first" },
+    ]);
+    let secondSettled = false;
+    const secondPromise = prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "Second", url: "http://127.0.0.1:3100/second", token: "second-token", connectionId: "second" },
+    ]).then((prepared) => {
+      secondSettled = true;
+      return prepared;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(secondSettled).toBe(false);
+    await first.cleanup();
+    const second = await secondPromise;
+    expect(second.serverNames).toEqual(["Second"]);
+    await second.cleanup();
+  });
 });
