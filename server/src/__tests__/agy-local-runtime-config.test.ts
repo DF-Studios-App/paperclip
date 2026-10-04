@@ -205,4 +205,29 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     ).rejects.toThrow(/Refusing to write run-scoped MCP secrets to tracked file/);
     expect(await fs.readFile(configPath, "utf8")).toBe('{"mcpServers":{}}\n');
   });
+
+  it("passes a private Git exclude to AGY when repository metadata cannot be written", async () => {
+    const cwd = await makeWorkspace();
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    const excludePath = path.join(cwd, ".git", "info", "exclude");
+    await fs.unlink(excludePath);
+    await fs.mkdir(excludePath);
+
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+    ]);
+
+    const gitConfigIndex = Number(process.env.GIT_CONFIG_COUNT ?? "0");
+    expect(prepared.environment?.GIT_CONFIG_COUNT).toBe(String(gitConfigIndex + 1));
+    expect(prepared.environment?.[`GIT_CONFIG_KEY_${gitConfigIndex}`]).toBe("core.excludesFile");
+    const privateExcludePath = prepared.environment?.[`GIT_CONFIG_VALUE_${gitConfigIndex}`];
+    expect(privateExcludePath).toBeTruthy();
+    execFileSync(
+      "git",
+      ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"],
+      { cwd, env: { ...process.env, ...prepared.environment }, stdio: "ignore" },
+    );
+    await prepared.cleanup();
+    await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });

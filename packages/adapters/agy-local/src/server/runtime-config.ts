@@ -2,11 +2,13 @@ import { execFile } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 
 type PreparedAgyRuntimeConfig = {
   serverNames: string[];
+  environment?: Record<string, string>;
   cleanup: () => Promise<void>;
 };
 
@@ -73,10 +75,11 @@ async function ensurePrivateGitPaths(input: {
   configPath: string;
   lockPath: string;
   recoveryPath: string;
-}): Promise<void> {
+}): Promise<{ environment?: Record<string, string>; cleanup: () => Promise<void> }> {
+  const noCleanup = async () => {};
   const repoResult = await runGit(input.cwd, ["rev-parse", "--show-toplevel"]);
-  if (repoResult.status === 127) return;
-  if (repoResult.status === 128 && /not a git repository/i.test(repoResult.stderr)) return;
+  if (repoResult.status === 127) return { cleanup: noCleanup };
+  if (repoResult.status === 128 && /not a git repository/i.test(repoResult.stderr)) return { cleanup: noCleanup };
   if (repoResult.status !== 0) throw new Error("Could not inspect the workspace Git repository.");
 
   const repoRoot = await fs.realpath(repoResult.stdout.trim());
@@ -116,27 +119,74 @@ async function ensurePrivateGitPaths(input: {
   const temporaryIgnored = await runGit(repoRoot, ["check-ignore", "--quiet", "--no-index", "--", temporaryProbe]);
   if (temporaryIgnored.status === 1) missingRules.push(rules[3]!);
   else if (temporaryIgnored.status !== 0) throw new Error("Could not verify Git ignore rules for AGY MCP temporary files.");
-  if (missingRules.length === 0) return;
+  if (missingRules.length === 0) return { cleanup: noCleanup };
 
   const excludeResult = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
   if (excludeResult.status !== 0) throw new Error("Could not locate the workspace's local Git exclude file.");
   const excludePath = path.resolve(repoRoot, excludeResult.stdout.trim());
-  let prefix = "";
   try {
-    const stat = await fs.lstat(excludePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error("Workspace Git exclude path must be a regular file, not a symlink.");
+    let prefix = "";
+    try {
+      const stat = await fs.lstat(excludePath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("Workspace Git exclude path must be a regular file, not a symlink.");
+      }
+      prefix = (await fs.readFile(excludePath, "utf8")).endsWith("\n") ? "" : "\n";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    prefix = (await fs.readFile(excludePath, "utf8")).endsWith("\n") ? "" : "\n";
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const handle = await fs.open(excludePath, "a", 0o600);
-  try {
-    await handle.writeFile(`${prefix}# Paperclip run-scoped AGY MCP files\n${missingRules.join("\n")}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
+    const handle = await fs.open(excludePath, "a", 0o600);
+    try {
+      await handle.writeFile(`${prefix}# Paperclip run-scoped AGY MCP files\n${missingRules.join("\n")}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return { cleanup: noCleanup };
+  } catch {
+    // Some managed worktrees expose a writable workspace and a read-only Git
+    // directory. Pass a private temporary global excludes file to AGY and its
+    // Git subprocesses instead of blocking the run or exposing its token.
+    const existingExcludes = await runGit(repoRoot, ["config", "--path", "--get", "core.excludesFile"]);
+    if (existingExcludes.status !== 0 && existingExcludes.status !== 1) {
+      throw new Error("Could not read the workspace's configured Git exclude file.");
+    }
+    let baseRules = "";
+    if (existingExcludes.status === 0 && existingExcludes.stdout.trim()) {
+      try {
+        const configuredPath = existingExcludes.stdout.trim();
+        baseRules = await fs.readFile(path.isAbsolute(configuredPath) ? configuredPath : path.resolve(repoRoot, configuredPath), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new Error("Could not preserve the configured Git exclude file.", { cause: error });
+        }
+      }
+    }
+    const countText = process.env.GIT_CONFIG_COUNT ?? "0";
+    const count = Number(countText);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error("Could not extend the Git configuration for AGY runtime MCP files.");
+    }
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-agy-git-exclude-"));
+    const tempExcludePath = path.join(tempDir, "exclude");
+    try {
+      await fs.writeFile(tempExcludePath, `${baseRules}${baseRules && !baseRules.endsWith("\n") ? "\n" : ""}${rules.join("\n")}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      return {
+        environment: {
+          GIT_CONFIG_COUNT: String(count + 1),
+          [`GIT_CONFIG_KEY_${count}`]: "core.excludesFile",
+          [`GIT_CONFIG_VALUE_${count}`]: tempExcludePath,
+        },
+        cleanup: async () => fs.rm(tempDir, { recursive: true, force: true }),
+      };
+    } catch (error) {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
   }
 }
 
@@ -377,8 +427,10 @@ export async function prepareAgyRuntimeMcpConfig(
   const validate = () => validateConfigPaths({ root, agentsDir, configPath, lockPath, recoveryPath });
   await validate();
   const releaseLock = await acquireLock(lockPath, validate, signal);
+  let gitExcludeCleanup: () => Promise<void> = async () => {};
   try {
-    await ensurePrivateGitPaths({ cwd, agentsDir, configPath, lockPath, recoveryPath });
+    const gitExcludes = await ensurePrivateGitPaths({ cwd, agentsDir, configPath, lockPath, recoveryPath });
+    gitExcludeCleanup = gitExcludes.cleanup;
     await restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate });
 
     let original: Buffer | null = null;
@@ -425,10 +477,12 @@ export async function prepareAgyRuntimeMcpConfig(
 
     return {
       serverNames: names,
+      environment: gitExcludes.environment,
       cleanup: async () => {
         try {
           await restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate });
         } finally {
+          await gitExcludeCleanup();
           await releaseLock();
         }
       },
@@ -440,6 +494,7 @@ export async function prepareAgyRuntimeMcpConfig(
     } catch (caught) {
       recoveryError = caught;
     }
+    await gitExcludeCleanup();
     await releaseLock();
     if (recoveryError) throw new AggregateError([error, recoveryError], "AGY MCP config setup failed and recovery is still required.");
     throw error;

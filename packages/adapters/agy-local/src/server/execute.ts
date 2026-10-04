@@ -774,6 +774,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const runtimeMcpConfig = executionTargetIsRemote
       ? { serverNames: [] as string[], cleanup: async () => {} }
       : await prepareAgyRuntimeMcpConfig(effectiveExecutionCwd, runtimeMcpServers, ctx.signal);
+    Object.assign(env, runtimeMcpConfig.environment);
     try {
       if (runtimeMcpConfig.serverNames.length > 0) {
         await onLog(
