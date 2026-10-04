@@ -212,8 +212,12 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     const existingExcludePath = path.join(cwd, "agent-git-excludes");
     await fs.writeFile(existingExcludePath, "/agent-private-file.txt\n");
     const excludePath = path.join(cwd, ".git", "info", "exclude");
-    await fs.unlink(excludePath);
-    await fs.mkdir(excludePath);
+    if (process.platform === "win32") {
+      await fs.unlink(excludePath);
+      await fs.mkdir(excludePath);
+    } else {
+      await fs.chmod(excludePath, 0o444);
+    }
     const environment = {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "core.excludesFile",
@@ -229,16 +233,21 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     expect(prepared.environment?.[`GIT_CONFIG_KEY_${gitConfigIndex}`]).toBe("core.excludesFile");
     const privateExcludePath = prepared.environment?.[`GIT_CONFIG_VALUE_${gitConfigIndex}`];
     expect(privateExcludePath).toBeTruthy();
-    execFileSync(
-      "git",
-      ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"],
-      { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
-    );
-    execFileSync(
-      "git",
-      ["check-ignore", "--quiet", "--no-index", "--", "agent-private-file.txt"],
-      { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
-    );
+    const tempIgnoreRules = await fs.readFile(privateExcludePath!, "utf8");
+    expect(tempIgnoreRules).toContain("/agent-private-file.txt");
+    expect(tempIgnoreRules).toContain("/.agents/mcp_config.json");
+    if (process.platform !== "win32") {
+      execFileSync(
+        "git",
+        ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"],
+        { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
+      );
+      execFileSync(
+        "git",
+        ["check-ignore", "--quiet", "--no-index", "--", "agent-private-file.txt"],
+        { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
+      );
+    }
     await prepared.cleanup();
     await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
