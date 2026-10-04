@@ -232,6 +232,21 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     const tempIgnoreRules = await fs.readFile(privateExcludePath!, "utf8");
     expect(tempIgnoreRules).toContain("/agent-private-file.txt");
     expect(tempIgnoreRules).toContain("/.agents/mcp_config.json");
+
+    // The malformed repository exclude prevents Git from evaluating ignores.
+    // Move it aside to verify that AGY's returned Git config applies both the
+    // existing agent exclusion and Paperclip's secret-bearing runtime config.
+    await fs.rename(excludePath, `${excludePath}.unusable`);
+    const gitEnvironment = { ...process.env, ...environment, ...prepared.environment };
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"], {
+      cwd,
+      env: gitEnvironment,
+    });
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", "agent-private-file.txt"], {
+      cwd,
+      env: gitEnvironment,
+    });
+
     await prepared.cleanup();
     await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
