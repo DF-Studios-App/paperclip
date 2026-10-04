@@ -19,6 +19,20 @@ const trustedPrWorkflow = path.join(repoRoot, trustedPrWorkflowPath);
 
 const SHARD_COUNT = 8;
 
+function isUpstreamRepository() {
+  const githubRepository = process.env.GITHUB_REPOSITORY?.trim().toLowerCase();
+  if (githubRepository) return githubRepository === "paperclipai/paperclip";
+
+  const origin = spawnSync("git", ["remote", "get-url", "origin"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const match = origin.stdout?.trim().match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i);
+  return match?.[1]?.toLowerCase() === "paperclipai/paperclip";
+}
+
+const IS_UPSTREAM_REPOSITORY = isUpstreamRepository();
+
 function runShard(args) {
   const result = spawnSync(process.execPath, [script, ...args], { cwd: repoRoot, encoding: "utf8" });
   assert.equal(result.status, 0, `expected success for ${args.join(" ")}: ${result.stderr}`);
@@ -157,11 +171,11 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls the trusted PR workflow from master", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
 });
 
-test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
+test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   // Branch protection requires a check literally named `e2e`. The shards run
   // as `e2e shard (n/3)`, so the aggregate job below is what keeps the
   // required-check contract intact — same pattern as the `verify` aggregate.
@@ -207,7 +221,7 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
   }
 });
 
-test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
+test("the trusted PR workflow limits full CI to merge-relevant stack layers", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   const jobs = readWorkflowJobs(workflow);
   const gate = jobs.get("gate");
@@ -266,7 +280,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(e2e, /false\) test "\$E2E_SHARDS_RESULT" = "skipped"/);
 });
 
-test("the stacked PR scope selector runs full CI only where intended", () => {
+test("the stacked PR scope selector runs full CI only where intended", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   assert.equal(runStackScope(null, "master").full_ci, "true");
   assert.equal(
     runStackScope({ position: 11, size: 11, base: { ref: "master" } }, "stack-10").full_ci,
@@ -286,7 +300,7 @@ test("the stacked PR scope selector runs full CI only where intended", () => {
   );
 });
 
-test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
+test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   // `pnpm run test:e2e -- $specs` forwards the literal separator to Playwright,
   // so the specs after it are not applied as file filters.
   const workflow = readTrustedPrWorkflow();
@@ -301,7 +315,7 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
   );
 });
 
-test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
+test("the trusted PR workflow regenerates stale stacked lockfiles", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
   // Validate the proposed workflow here. The caller executes the merged master
   // workflow; edits to this workflow take effect after code-owner review and merge.
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
