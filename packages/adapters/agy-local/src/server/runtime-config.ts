@@ -113,21 +113,36 @@ async function ensurePrivateGitPaths(input: {
     `/${escapeGitIgnorePath(relativePaths[2]!)}*`,
     `/${escapeGitIgnorePath(path.relative(repoRoot, input.agentsDir).split(path.sep).join("/"))}/.paperclip-mcp-*.tmp`,
   ];
+  const effectiveEnvironment = { ...process.env, ...input.environment };
   const missingRules: string[] = [];
+  let needsTemporaryExclude = false;
   for (const [index, relativePath] of relativePaths.entries()) {
-    const ignored = await runGit(repoRoot, ["check-ignore", "--quiet", "--no-index", "--", relativePath]);
+    const ignored = await runGit(
+      repoRoot,
+      ["check-ignore", "--quiet", "--no-index", "--", relativePath],
+      effectiveEnvironment,
+    );
     if (ignored.status === 0) continue;
-    if (ignored.status !== 1) throw new Error("Could not verify Git ignore rules for AGY MCP runtime files.");
+    if (ignored.status !== 1) {
+      needsTemporaryExclude = true;
+      break;
+    }
     missingRules.push(rules[index]!);
   }
 
-  const temporaryProbe = path.join(agentsRelative, `.paperclip-mcp-${randomUUID()}.tmp`)
-    .split(path.sep)
-    .join("/");
-  const temporaryIgnored = await runGit(repoRoot, ["check-ignore", "--quiet", "--no-index", "--", temporaryProbe]);
-  if (temporaryIgnored.status === 1) missingRules.push(rules[3]!);
-  else if (temporaryIgnored.status !== 0) throw new Error("Could not verify Git ignore rules for AGY MCP temporary files.");
-  if (missingRules.length === 0) return { cleanup: noCleanup };
+  if (!needsTemporaryExclude) {
+    const temporaryProbe = path.join(agentsRelative, `.paperclip-mcp-${randomUUID()}.tmp`)
+      .split(path.sep)
+      .join("/");
+    const temporaryIgnored = await runGit(
+      repoRoot,
+      ["check-ignore", "--quiet", "--no-index", "--", temporaryProbe],
+      effectiveEnvironment,
+    );
+    if (temporaryIgnored.status === 1) missingRules.push(rules[3]!);
+    else if (temporaryIgnored.status !== 0) needsTemporaryExclude = true;
+  }
+  if (!needsTemporaryExclude && missingRules.length === 0) return { cleanup: noCleanup };
 
   const excludeResult = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
   if (excludeResult.status !== 0) throw new Error("Could not locate the workspace's local Git exclude file.");
@@ -155,7 +170,6 @@ async function ensurePrivateGitPaths(input: {
     // Some managed worktrees expose a writable workspace and a read-only Git
     // directory. Pass a private temporary global excludes file to AGY and its
     // Git subprocesses instead of blocking the run or exposing its token.
-    const effectiveEnvironment = { ...process.env, ...input.environment };
     const existingExcludes = await runGit(
       repoRoot,
       ["config", "--path", "--get", "core.excludesFile"],
