@@ -33,6 +33,20 @@ function readTextFile(filePath) {
   return readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
 }
 
+function isUpstreamRepository() {
+  const githubRepository = process.env.GITHUB_REPOSITORY?.trim().toLowerCase();
+  if (githubRepository) return githubRepository === "paperclipai/paperclip";
+
+  const origin = spawnSync("git", ["remote", "get-url", "origin"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  const match = origin.stdout?.trim().match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i);
+  return match?.[1]?.toLowerCase() === "paperclipai/paperclip";
+}
+
+const IS_UPSTREAM_REPOSITORY = isUpstreamRepository();
+
 function runShard(args) {
   const result = spawnSync(process.execPath, [script, ...args], { cwd: repoRoot, encoding: "utf8" });
   assert.equal(result.status, 0, `expected success for ${args.join(" ")}: ${result.stderr}`);
@@ -41,12 +55,20 @@ function runShard(args) {
 
 function readTrustedPrWorkflow() {
   const caller = readTextFile(prCallerWorkflow);
-  assert.match(
-    caller,
-    /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m,
-    "pr.yml must call the fork's trusted workflow",
-  );
-  // Validate the fork-local reusable workflow used by its PR check.
+  if (IS_UPSTREAM_REPOSITORY) {
+    assert.match(
+      caller,
+      /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
+      "upstream pr.yml must call the CODEOWNERS-protected workflow from master",
+    );
+  } else {
+    assert.match(
+      caller,
+      /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m,
+      "fork pr.yml must call its local reusable workflow",
+    );
+  }
+  // Validate the local reusable workflow used by the fork's PR check.
   return readTextFile(trustedPrWorkflow);
 }
 
@@ -184,7 +206,7 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the fork-local trusted PR workflow", () => {
+test("pr.yml calls the repository's trusted PR workflow", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
 });
 
@@ -250,7 +272,6 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     "verify_paperclip_runner",
     "build",
     "verify_serialized_server",
-    "canary_dry_run",
     "e2e_shards",
   ]) {
     assert.match(
@@ -260,6 +281,14 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
         : /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' \}\}$/m,
       `${jobId} must run only when the gate selects full CI`,
     );
+  }
+
+  const canary = jobs.get("canary_dry_run");
+  assert.match(canary, /^ {4}if: .*needs\.gate\.outputs\.full_ci == 'true'/m);
+  if (IS_UPSTREAM_REPOSITORY) {
+    assert.doesNotMatch(canary, /github\.repository == 'paperclipai\/paperclip'/);
+  } else {
+    assert.match(canary, /github\.repository == 'paperclipai\/paperclip'/);
   }
 
   assert.doesNotMatch(
@@ -290,7 +319,9 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(e2e, /false\) test "\$E2E_SHARDS_RESULT" = "skipped"/);
 });
 
-test("the stacked PR scope selector runs full CI only where intended", () => {
+test("the stacked PR scope selector runs full CI only where intended", {
+  skip: process.platform === "win32" ? "the workflow snippet requires bash and jq" : false,
+}, () => {
   assert.equal(runStackScope(null, "master").full_ci, "true");
   assert.equal(
     runStackScope({ position: 11, size: 11, base: { ref: "master" } }, "stack-10").full_ci,
