@@ -70,7 +70,28 @@ test("pr-trusted.yml skips only release-specific steps on fork repositories", ()
     "Release registry test coverage must only run on paperclipai/paperclip",
   );
 
-  // 4. Canary dry run job
+  // 4. Release workflow wiring matches the canonical publisher only.
+  const releaseVerifyMatch = trusted.match(
+    /- name: Test release verify workflow wiring\n\s+if: ([^\n]+)\n\s+run: node --test \.\/scripts\/__tests__\/release-verify-workflow\.test\.mjs/,
+  );
+  assert.ok(
+    releaseVerifyMatch,
+    "Release workflow wiring test must exist as a separate step",
+  );
+  assert.equal(
+    releaseVerifyMatch[1].trim(),
+    "github.repository == 'paperclipai/paperclip'",
+    "Upstream release workflow wiring test must only run on paperclipai/paperclip",
+  );
+
+  // 5. Non-publishing image and source contracts still run on the fork.
+  assert.match(
+    trusted,
+    /- name: Test cloud source and standard image contracts\n\s+run: node --test \.\/scripts\/cloud-source-verification\.test\.mjs \.\/scripts\/standard-image-contract\.test\.mjs/,
+    "Cloud source and standard image tests must remain enabled on forks",
+  );
+
+  // 6. Canary dry run job
   const canaryJob = trusted.match(
     /canary_dry_run:\n\s+name: Canary Dry Run\n\s+needs: \[gate\]\n\s+if: ([^\n]+)/,
   );

@@ -49,6 +49,7 @@ import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-resto
 import { DEFAULT_AGY_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveAgySkillsHome } from "./skills.js";
 import { buildAgyRemoteSkillsCommand } from "./remote-skills.js";
+import { prepareAgyRuntimeMcpConfig } from "./runtime-config.js";
 import {
   describeAgyFailure,
   detectAgyAuthRequired,
@@ -59,6 +60,10 @@ import {
 } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+function prefixAgyGoal(prompt: string): string {
+  return /^\/goal(?:\s|$)/.test(prompt) ? prompt : `/goal ${prompt}`;
+}
 
 function resolveAgyProvider(model: string): string | null {
   const normalized = model.trim().toLowerCase();
@@ -286,11 +291,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     resolvedCommand,
   });
 
-  const extraArgs = (() => {
+  const configuredExtraArgs = (() => {
     const fromExtraArgs = asStringArray(config.extraArgs);
     if (fromExtraArgs.length > 0) return fromExtraArgs;
     return asStringArray(config.args);
   })();
+  // Some older agent configs packed multiple CLI options into one array item.
+  // Split those entries when they contain the stale goal flag, then route
+  // permission bypass exclusively through its typed boolean setting below.
+  const normalizedExtraArgs = configuredExtraArgs.flatMap((arg) =>
+    /(?:^|\s)--?goal(?:\s|$)/i.test(arg) ? arg.trim().split(/\s+/).filter(Boolean) : [arg],
+  );
+  const ignoredLegacyGoalArgs = normalizedExtraArgs.filter((arg) => /^--?goal$/i.test(arg));
+  const extraArgs = normalizedExtraArgs.filter(
+    (arg) => !/^--?goal$/i.test(arg) && !/^--dangerously-skip-permissions$/i.test(arg),
+  );
 
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
   let remoteSkillsDir: string | null = null;
@@ -440,7 +455,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const commandNotes = (() => {
-    const notes: string[] = ["Prompt is passed to AGY CLI via --print."];
+    const notes: string[] = [
+      "Prompt is passed to AGY CLI through stdin as a stream-json user event.",
+      "Prefixed the task prompt with /goal so AGY works continuously toward the objective.",
+    ];
+    if (ignoredLegacyGoalArgs.length > 0) {
+      notes.push("Removed legacy -goal/--goal CLI arguments; /goal is sent as a prompt command.");
+    }
+    if (normalizedExtraArgs.some((arg) => /^--dangerously-skip-permissions$/i.test(arg))) {
+      notes.push("Ignored the raw permission-bypass CLI argument; the typed permission setting controls this option.");
+    }
     if (asBoolean(config.dangerouslySkipPermissions, false)) {
       notes.push("Added --dangerously-skip-permissions because the agent configuration enables it.");
     }
@@ -478,13 +502,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  const prompt = joinPromptSections([
+  const prompt = prefixAgyGoal(joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
     renderedPrompt,
-  ]);
+  ]));
   const promptMetrics = {
     promptChars: prompt.length,
     instructionsChars: instructionsPrefix.length,
@@ -513,11 +537,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     // Paperclip consumes structured events for session, tool, and usage data.
-    // Place this after extraArgs so a custom format cannot silently disable parsing.
+    // AGY's stream-json input mode also requires stream-json output. Place both
+    // flags after extraArgs so custom args cannot silently disable the protocol.
     args.push("--output-format", "stream-json");
-
-    // agy supports -p/--print to run a single prompt non-interactively
-    args.push("--print", prompt);
+    args.push("--input-format", "stream-json");
     return args;
   };
 
@@ -529,9 +552,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         command: resolvedCommand,
         cwd: effectiveExecutionCwd,
         commandNotes,
-        commandArgs: args.map((value, index) =>
-          index === args.length - 1 ? `<prompt ${prompt.length} chars>` : value,
-        ),
+        commandArgs: args,
         env: loggedEnv,
         prompt,
         promptMetrics,
@@ -547,6 +568,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       {
         cwd,
         env,
+        stdin: `${JSON.stringify({ event: "user", message: { content: prompt } })}\n`,
         timeoutSec,
         graceSec,
         onSpawn,
@@ -742,9 +764,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   try {
-    return await withWorkspaceRestore(executeTurn, async () => {
-      await restoreRemoteWorkspace?.();
-    });
+    const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+    if (executionTargetIsRemote && runtimeMcpServers.length > 0) {
+      await onLog(
+        "stderr",
+        "[paperclip] Paperclip-managed MCP servers are not yet injected for remote AGY execution targets.\n",
+      );
+    }
+    const runtimeMcpConfig = executionTargetIsRemote
+      ? { serverNames: [] as string[], cleanup: async () => {} }
+      : await prepareAgyRuntimeMcpConfig(effectiveExecutionCwd, runtimeMcpServers, ctx.signal, env);
+    Object.assign(env, runtimeMcpConfig.environment);
+    try {
+      if (runtimeMcpConfig.serverNames.length > 0) {
+        await onLog(
+          "stdout",
+          `[paperclip] Antigravity will use ${runtimeMcpConfig.serverNames.length} Paperclip-managed MCP server(s): ${runtimeMcpConfig.serverNames.join(", ")}.\n`,
+        );
+      }
+      return await withWorkspaceRestore(executeTurn, async () => {
+        await restoreRemoteWorkspace?.();
+      });
+    } finally {
+      await runtimeMcpConfig.cleanup();
+    }
   } finally {
     await Promise.allSettled([
       paperclipBridge?.stop(),

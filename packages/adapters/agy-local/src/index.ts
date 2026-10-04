@@ -52,12 +52,14 @@ Core fields:
 - extraArgs (string[], optional): additional CLI args.
 - env (object, optional): KEY=VALUE environment variables.
 
+Every run prefixes its prompt with Antigravity's \`/goal\` slash command. Do not configure \`-goal\` or \`--goal\` in \`extraArgs\`; those are not CLI startup flags and are ignored.
+
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds.
 - graceSec (number, optional): SIGTERM grace period in seconds.
 
 Notes:
-- Runs use non-interactive execution with prompt passed via \`--print\` and structured events emitted via \`--output-format stream-json\`.
+- Runs send prompts over stdin using AGY's \`--input-format stream-json\` protocol and consume structured events via \`--output-format stream-json\`. This avoids command-line length limits for large prompts.
 - Session policy: resume is supported; native context management is unconfirmed. Paperclip defaults to rotation after 200 runs, 2,000,000 raw input tokens, or 72 hours, with runtime overrides supported.
 - Sessions resume with \`--conversation <id>\` when the stored session working directory matches the current working directory.
 - Authentication uses the AGY CLI's existing local account session in \`~/.gemini/\`; complete sign-in through the authentication flow supported by the installed AGY version.

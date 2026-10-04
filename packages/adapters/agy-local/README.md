@@ -55,13 +55,30 @@ Available model identifiers for Antigravity CLI:
 ### Command Invocation
 
 ```sh
-agy --output-format stream-json -p [--dangerously-skip-permissions] [--model <model>] [--conversation <id>] "<prompt>"
+agy --output-format stream-json --input-format stream-json [--dangerously-skip-permissions] [--model <model>] [--conversation <id>]
 ```
 
-- `-p` / `--print`: Non-interactive headless output mode suitable for daemon / harness execution.
 - `--output-format stream-json`: Emits structured events used by Paperclip for transcript rendering, session capture, and usage parsing.
+- `--input-format stream-json`: Reads the prompt from stdin as a newline-delimited JSON `user` event. This avoids Windows command-line length limits for large Paperclip prompts.
 - `--dangerously-skip-permissions`: Optional; auto-approves AGY tool actions. Paperclip only passes it when `dangerouslySkipPermissions` is enabled.
 - `--conversation <id>`: Resumes prior session state when available.
+
+Paperclip-managed MCP servers granted to the agent are written to the workspace
+`.agents/mcp_config.json` for the duration of a local run. The adapter uses the
+Antigravity `serverUrl` and `headers.Authorization` fields, preserves existing
+workspace servers, and removes its run-scoped entries when the CLI exits.
+Remote execution targets do not receive these runtime MCP servers yet.
+
+Paperclip sends one JSON line to stdin in this shape:
+
+```json
+{"event":"user","message":{"content":"/goal <prompt>"}}
+```
+
+Every `agy_local` run starts with Antigravity's `/goal` slash command so the
+agent continues working toward its Paperclip objective. `/goal` is a prompt
+command, not a CLI flag; legacy `-goal` or `--goal` entries in `extraArgs` are
+ignored. This does not change Paperclip's own approval gates.
 
 ### Side-Effect Free Environment Testing
 
