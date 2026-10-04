@@ -2,6 +2,11 @@
 
 Low-level reference for how Paperclip packages are prepared and published to npm.
 
+> **Internal fork:** npm publication workflows are disabled in
+> `DF-Studios-App/paperclip`. This document describes upstream publishing; it
+> does not mean a package was published from this fork. See
+> [Internal Fork Operations](FORK-OPERATIONS.md).
+
 For the maintainer workflow, use [doc/RELEASING.md](RELEASING.md). This document focuses on packaging internals.
 
 ## Current Release Entry Points

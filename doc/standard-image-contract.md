@@ -1,5 +1,9 @@
 # Standard production image provenance
 
+> **Internal fork:** Docker image build and publication workflows are disabled
+> in `DF-Studios-App/paperclip`. This contract documents upstream images only.
+> See [Internal Fork Operations](FORK-OPERATIONS.md).
+
 Canonical `master` pushes publish the standard multi-platform `production`
 image at `ghcr.io/paperclipai/paperclip:sha-<full-40-character-SHA>`.
 Existing short-SHA, version and channel tags continue to work. Other refs and

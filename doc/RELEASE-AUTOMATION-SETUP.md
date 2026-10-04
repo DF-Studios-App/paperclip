@@ -2,6 +2,10 @@
 
 This document covers the GitHub and npm setup required for the current Paperclip release model:
 
+> **Internal fork:** do not apply this setup to `DF-Studios-App/paperclip`.
+> Release automation is disabled in the fork; this runbook describes upstream
+> infrastructure. See [Internal Fork Operations](FORK-OPERATIONS.md).
+
 - automatic canaries from `master`
 - manual stable promotion from a chosen source ref
 - npm trusted publishing via GitHub OIDC

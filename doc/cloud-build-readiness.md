@@ -1,5 +1,10 @@
 # Cloud build readiness
 
+> **Internal fork:** cloud readiness and migrator artifact workflows are
+> disabled in `DF-Studios-App/paperclip`. This runbook describes upstream
+> automation; no fork run should be expected. See
+> [Internal Fork Operations](FORK-OPERATIONS.md).
+
 The `Cloud readiness` workflow starts for every master push and retains the
 versioned `Cloud source verified v1` job. It calls the full `Release Verify`
 workflow for that exact commit, including typecheck, builds, general and

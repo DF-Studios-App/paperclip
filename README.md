@@ -565,7 +565,7 @@ We welcome contributions. See the [contributing guide](CONTRIBUTING.md) for deta
 
 - [Discord](https://discord.gg/m4HZY7xNG3) — Join the community
 - [Twitter / X](https://x.com/papercliping) — Follow updates and announcements
-- [GitHub Issues](https://github.com/paperclipai/paperclip/issues) — bugs and feature requests
+- [GitHub Issues](https://github.com/DF-Studios-App/paperclip/issues) — bugs and feature requests for this fork
 - [GitHub Discussions](https://github.com/paperclipai/paperclip/discussions) — ideas and RFC
 
 <br/>

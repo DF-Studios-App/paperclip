@@ -2,6 +2,20 @@
 
 Guidance for human and AI contributors working in this repository.
 
+## 0. Fork-Only Work and GitHub Destinations
+
+This Paperclip project is the internal fork `DF-Studios-App/paperclip`.
+All code changes, branches, new GitHub issues, and pull requests for this
+project must target that fork. Treat `origin` as the only writable GitHub
+remote. Treat `upstream` (`paperclipai/paperclip`) as read-only reference
+material; never push to it or create issues or pull requests there.
+
+Before creating an issue or pull request, verify the target repository is
+`DF-Studios-App/paperclip`. Use `gh issue create --repo DF-Studios-App/paperclip`
+and `gh pr create --repo DF-Studios-App/paperclip --base master` when using
+GitHub CLI. If the target cannot be verified, stop before creating the item
+and ask the user. See `doc/FORK-OPERATIONS.md`.
+
 ## 1. Purpose
 
 Paperclip is a control plane for AI-agent companies.

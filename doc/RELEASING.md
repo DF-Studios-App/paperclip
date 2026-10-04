@@ -2,6 +2,10 @@
 
 Maintainer runbook for shipping Paperclip across npm, GitHub, and the website-facing changelog surface.
 
+> **Internal fork:** release, package, and Docker publication Actions are
+> disabled in `DF-Studios-App/paperclip`. Do not wait for a release run or
+> treat a release as published from this fork. See [Internal Fork Operations](FORK-OPERATIONS.md).
+
 The release model is now commit-driven:
 
 1. Every push to `master` publishes a canary automatically.
