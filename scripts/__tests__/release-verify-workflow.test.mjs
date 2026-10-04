@@ -12,8 +12,19 @@ const repoRoot = path.resolve(
 );
 
 function readWorkflow(name) {
-  return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8");
+  return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8").replace(/\r\n/g, "\n");
 }
+
+const windowsGitBashPath = path.join(
+  process.env.ProgramFiles ?? "C:\\Program Files",
+  "Git",
+  "bin",
+  "bash.exe",
+);
+const bashExecutable =
+  process.platform === "win32" && existsSync(windowsGitBashPath)
+    ? windowsGitBashPath
+    : "bash";
 
 test("chaos verification isolates callers that verify the same source commit", () => {
   const chaosWorkflow = readWorkflow("runner-chaos-evals.yml");
@@ -45,7 +56,10 @@ test("canary reuses exact-source proof while stable keeps full verification", ()
   assert.match(canary, /SOURCE_SHA: \$\{\{ github\.sha \}\}/);
   assert.match(canary, /run: node scripts\/cloud-source-verification\.mjs "\$SOURCE_SHA"/);
   assert.doesNotMatch(canary, /release-verify\.yml|continue-on-error|always\(\)/);
-  assert.match(releaseWorkflow, /publish_canary:\n\s+if: github\.event_name == 'push'\n\s+needs: verify_canary/);
+  assert.match(
+    releaseWorkflow,
+    /publish_canary:\n\s+if: github\.repository == 'paperclipai\/paperclip' && github\.event_name == 'push'\n\s+needs: verify_canary/,
+  );
   // The stable lane is gated on the stable channel since the nightly lane
   // was added; a `needs:` line (for example a preflight job) may sit between
   // the gate and the delegation.
@@ -391,7 +405,6 @@ test("Runner eval workflows pin actions and gate paid live execution", () => {
 
   for (const name of [
     "runner-full-stack-e2e.yml",
-    "runner-live-evals.yml",
     "runner-protocol-live-evals.yml",
   ]) {
     const workflow = readWorkflow(name);
@@ -400,6 +413,12 @@ test("Runner eval workflows pin actions and gate paid live execution", () => {
     );
     assert.equal(crons.length, 1, `${name} must have one schedule`);
     assert.match(crons[0], /^\d{1,2} \d{1,2} \* \* 0$/);
+  }
+
+  for (const name of ["runner-chaos-evals.yml", "runner-live-evals.yml"]) {
+    const workflow = readWorkflow(name);
+    assert.doesNotMatch(workflow, /^  schedule:/m, `${name} must not run on a schedule`);
+    assert.match(workflow, /^  workflow_dispatch:/m);
   }
 
   const chaosWorkflow = actionPinWorkflows[2];
@@ -449,8 +468,26 @@ test("direct protocol concurrency override only lowers the configured ceiling", 
   assert.ok(start > 0 && end > start);
   const script = workflow.slice(start, end) + '\nprintf "%s" "$MAX_PARALLEL"\n';
   for (const [requested, expected] of [["", "8"], ["2", "2"], ["8", "8"], ["1", null], ["9", null], ["0", null], ["-1", null], ["2.5", null], ["garbage", null], ["9999999999999999999999", null]]) {
-    const result = spawnSync("bash", ["-eu", "-c", script], {
-      env: { ...process.env, MAX_PARALLEL: "8", REQUESTED_MAX_PARALLEL: requested }, encoding: "utf8",
+    const result = spawnSync(bashExecutable, ["-eu", "-c", script], {
+      env: {
+        ...process.env,
+        ...(process.platform === "win32"
+          ? {
+              PATH: [
+                path.join(
+                  process.env.LOCALAPPDATA ?? "",
+                  "Microsoft",
+                  "WinGet",
+                  "Links",
+                ),
+                process.env.PATH,
+              ].filter(Boolean).join(path.delimiter),
+            }
+          : {}),
+        MAX_PARALLEL: "8",
+        REQUESTED_MAX_PARALLEL: requested,
+      },
+      encoding: "utf8",
     });
     assert.equal(result.status, expected === null ? 1 : 0, requested);
     if (expected !== null) assert.equal(result.stdout, expected);
