@@ -209,23 +209,35 @@ describe("prepareAgyRuntimeMcpConfig", () => {
   it("passes a private Git exclude to AGY when repository metadata cannot be written", async () => {
     const cwd = await makeWorkspace();
     execFileSync("git", ["init", "--quiet"], { cwd });
+    const existingExcludePath = path.join(cwd, "agent-git-excludes");
+    await fs.writeFile(existingExcludePath, "/agent-private-file.txt\n");
     const excludePath = path.join(cwd, ".git", "info", "exclude");
     await fs.unlink(excludePath);
     await fs.mkdir(excludePath);
+    const environment = {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.excludesFile",
+      GIT_CONFIG_VALUE_0: existingExcludePath,
+    };
 
     const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
       { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
-    ]);
+    ], undefined, environment);
 
-    const gitConfigIndex = Number(process.env.GIT_CONFIG_COUNT ?? "0");
-    expect(prepared.environment?.GIT_CONFIG_COUNT).toBe(String(gitConfigIndex + 1));
+    const gitConfigIndex = Number(environment.GIT_CONFIG_COUNT);
+    expect(prepared.environment?.GIT_CONFIG_COUNT).toBe("2");
     expect(prepared.environment?.[`GIT_CONFIG_KEY_${gitConfigIndex}`]).toBe("core.excludesFile");
     const privateExcludePath = prepared.environment?.[`GIT_CONFIG_VALUE_${gitConfigIndex}`];
     expect(privateExcludePath).toBeTruthy();
     execFileSync(
       "git",
       ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"],
-      { cwd, env: { ...process.env, ...prepared.environment }, stdio: "ignore" },
+      { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
+    );
+    execFileSync(
+      "git",
+      ["check-ignore", "--quiet", "--no-index", "--", "agent-private-file.txt"],
+      { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
     );
     await prepared.cleanup();
     await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });

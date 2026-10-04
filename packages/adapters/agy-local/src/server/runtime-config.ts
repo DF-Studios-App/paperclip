@@ -49,9 +49,16 @@ function assertContained(root: string, candidate: string): void {
   }
 }
 
-async function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string; status: number }> {
+async function runGit(
+  cwd: string,
+  args: string[],
+  environment?: NodeJS.ProcessEnv | Record<string, string>,
+): Promise<{ stdout: string; stderr: string; status: number }> {
   try {
-    const result = await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+    const result = await execFileAsync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      env: environment,
+    });
     return { stdout: result.stdout, stderr: "", status: 0 };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -75,6 +82,7 @@ async function ensurePrivateGitPaths(input: {
   configPath: string;
   lockPath: string;
   recoveryPath: string;
+  environment: Record<string, string>;
 }): Promise<{ environment?: Record<string, string>; cleanup: () => Promise<void> }> {
   const noCleanup = async () => {};
   const repoResult = await runGit(input.cwd, ["rev-parse", "--show-toplevel"]);
@@ -147,7 +155,12 @@ async function ensurePrivateGitPaths(input: {
     // Some managed worktrees expose a writable workspace and a read-only Git
     // directory. Pass a private temporary global excludes file to AGY and its
     // Git subprocesses instead of blocking the run or exposing its token.
-    const existingExcludes = await runGit(repoRoot, ["config", "--path", "--get", "core.excludesFile"]);
+    const effectiveEnvironment = { ...process.env, ...input.environment };
+    const existingExcludes = await runGit(
+      repoRoot,
+      ["config", "--path", "--get", "core.excludesFile"],
+      effectiveEnvironment,
+    );
     if (existingExcludes.status !== 0 && existingExcludes.status !== 1) {
       throw new Error("Could not read the workspace's configured Git exclude file.");
     }
@@ -162,7 +175,7 @@ async function ensurePrivateGitPaths(input: {
         }
       }
     }
-    const countText = process.env.GIT_CONFIG_COUNT ?? "0";
+    const countText = effectiveEnvironment.GIT_CONFIG_COUNT ?? "0";
     const count = Number(countText);
     if (!Number.isSafeInteger(count) || count < 0) {
       throw new Error("Could not extend the Git configuration for AGY runtime MCP files.");
@@ -415,6 +428,7 @@ export async function prepareAgyRuntimeMcpConfig(
   cwd: string,
   servers: readonly AdapterRuntimeMcpServer[],
   signal?: AbortSignal,
+  environment: Record<string, string> = process.env as Record<string, string>,
 ): Promise<PreparedAgyRuntimeConfig> {
   if (servers.length === 0) return { serverNames: [], cleanup: async () => {} };
 
@@ -429,7 +443,7 @@ export async function prepareAgyRuntimeMcpConfig(
   const releaseLock = await acquireLock(lockPath, validate, signal);
   let gitExcludeCleanup: () => Promise<void> = async () => {};
   try {
-    const gitExcludes = await ensurePrivateGitPaths({ cwd, agentsDir, configPath, lockPath, recoveryPath });
+    const gitExcludes = await ensurePrivateGitPaths({ cwd, agentsDir, configPath, lockPath, recoveryPath, environment });
     gitExcludeCleanup = gitExcludes.cleanup;
     await restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate });
 
