@@ -13,8 +13,10 @@ material; never push to it or create issues or pull requests there.
 Before creating an issue or pull request, verify the target repository is
 `DF-Studios-App/paperclip`. Use `gh issue create --repo DF-Studios-App/paperclip`
 and `gh pr create --repo DF-Studios-App/paperclip --base master` when using
-GitHub CLI. If the target cannot be verified, stop before creating the item
-and ask the user. See `doc/FORK-OPERATIONS.md`.
+GitHub CLI. The fork currently has GitHub Issues disabled; while it remains
+disabled, record issue reports in a fork PR description or PR comment. Never
+route them to upstream. If the target cannot be verified, stop before creating
+the item and ask the user. See `doc/FORK-OPERATIONS.md`.
 
 ## 1. Purpose
 

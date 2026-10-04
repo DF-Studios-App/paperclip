@@ -101,8 +101,9 @@ git push origin --delete <old-name>
 
 Create pull requests with
 `gh pr create --repo DF-Studios-App/paperclip --base master` and issues with
-`gh issue create --repo DF-Studios-App/paperclip`. Do not push or create work
-items in `upstream`.
+`gh issue create --repo DF-Studios-App/paperclip` when the fork's issue tracker
+is enabled. Until then, record issue reports in a fork PR description or PR
+comment. Do not push or create work items in `upstream`.
 
 ### Model Used (Required)
 
