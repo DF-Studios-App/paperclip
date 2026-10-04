@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,20 @@ const trustedPrWorkflowPath = ".github/workflows/pr-trusted.yml";
 const trustedPrWorkflow = path.join(repoRoot, trustedPrWorkflowPath);
 
 const SHARD_COUNT = 8;
+const windowsGitBashPath = path.join(
+  process.env.ProgramFiles ?? "C:\\Program Files",
+  "Git",
+  "bin",
+  "bash.exe",
+);
+const bashExecutable =
+  process.platform === "win32" && existsSync(windowsGitBashPath)
+    ? windowsGitBashPath
+    : "bash";
+
+function readTextFile(filePath) {
+  return readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+}
 
 function isUpstreamRepository() {
   const githubRepository = process.env.GITHUB_REPOSITORY?.trim().toLowerCase();
@@ -40,7 +54,7 @@ function runShard(args) {
 }
 
 function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8").replace(/\r\n/g, "\n");
+  const caller = readTextFile(prCallerWorkflow);
   if (IS_UPSTREAM_REPOSITORY) {
     assert.match(
       caller,
@@ -54,7 +68,8 @@ function readTrustedPrWorkflow() {
       "fork pr.yml must call its local reusable workflow",
     );
   }
-  return readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
+  // Validate the local reusable workflow used by the fork's PR check.
+  return readTextFile(trustedPrWorkflow);
 }
 
 function readWorkflowJobs(workflow) {
@@ -75,7 +90,7 @@ function readWorkflowJobs(workflow) {
 }
 
 function runStackScope(stack, prBaseRef) {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
+  const workflow = readTextFile(trustedPrWorkflow);
   const match = workflow.match(
     /      - name: Select stacked PR CI scope[\s\S]*?        run: \|\n([\s\S]*?)\n\n  policy:/,
   );
@@ -88,10 +103,23 @@ function runStackScope(stack, prBaseRef) {
   const output = path.join(scratch, "github-output");
 
   try {
-    const result = spawnSync("bash", ["-c", script], {
+    const result = spawnSync(bashExecutable, ["-c", script], {
       encoding: "utf8",
       env: {
         ...process.env,
+        ...(process.platform === "win32"
+          ? {
+              PATH: [
+                path.join(
+                  process.env.LOCALAPPDATA ?? "",
+                  "Microsoft",
+                  "WinGet",
+                  "Links",
+                ),
+                process.env.PATH,
+              ].filter(Boolean).join(path.delimiter),
+            }
+          : {}),
         GITHUB_OUTPUT: output,
         PR_BASE_REF: prBaseRef,
         STACK_JSON: JSON.stringify(stack),
@@ -126,7 +154,7 @@ test("the e2e shards form a complete, non-overlapping partition", () => {
 });
 
 test("the ignored spec list matches playwright.config.ts testIgnore", () => {
-  const config = readFileSync(playwrightConfig, "utf8");
+  const config = readTextFile(playwrightConfig);
   const match = config.match(/testIgnore:\s*\[([^\]]*)\]/);
   assert.ok(match, "expected a testIgnore array in playwright.config.ts");
   const configured = [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
@@ -229,7 +257,7 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
 });
 
 test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
+  const workflow = readTextFile(trustedPrWorkflow);
   const jobs = readWorkflowJobs(workflow);
   const gate = jobs.get("gate");
 
@@ -248,7 +276,9 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   ]) {
     assert.match(
       jobs.get(jobId),
-      /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' \}\}$/m,
+      jobId === "canary_dry_run"
+        ? /^ {4}if: \$\{\{ github\.repository == 'paperclipai\/paperclip' && needs\.gate\.outputs\.full_ci == 'true' \}\}$/m
+        : /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' \}\}$/m,
       `${jobId} must run only when the gate selects full CI`,
     );
   }
@@ -270,7 +300,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity\]$/m,
+    /^ {4}needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build\]$/m,
   );
   assert.match(verify, /POLICY_RESULT: \$\{\{ needs\.policy\.result \}\}/);
   assert.match(verify, /test "\$TYPECHECK_RELEASE_REGISTRY_RESULT" = "skipped"/);
@@ -281,12 +311,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   assert.match(verify, /test "\$RUNNER_VERIFICATION_RESULT" = "success"/);
   assert.match(verify, /test "\$RUNNER_VERIFICATION_RESULT" = "skipped"/);
   assert.match(verify, /test "\$BUILD_RESULT" = "skipped"/);
-  // Both halves of the docker-context lane's gating: the result must be
-  // wired into the aggregate's env AND asserted successful on full CI —
-  // dropping either would let `verify` pass after the lane fails.
-  assert.match(verify, /DOCKER_CONTEXT_INTEGRITY_RESULT: \$\{\{ needs\.docker_context_integrity\.result \}\}/);
-  assert.match(verify, /test "\$DOCKER_CONTEXT_INTEGRITY_RESULT" = "success"/);
-  assert.match(verify, /test "\$DOCKER_CONTEXT_INTEGRITY_RESULT" = "skipped"/);
+  assert.doesNotMatch(verify, /docker_context_integrity|DOCKER_CONTEXT_INTEGRITY_RESULT/);
 
   const e2e = jobs.get("e2e");
   assert.match(e2e, /^ {4}needs: \[gate, policy, e2e_shards\]$/m);
@@ -334,7 +359,7 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
 test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
   // Validate the proposed workflow here. The caller executes the merged master
   // workflow; edits to this workflow take effect after code-owner review and merge.
-  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
+  const workflow = readTextFile(trustedPrWorkflow);
   assert.match(
     workflow,
     /policy:\n    needs: \[gate\][\s\S]{0,160}timeout-minutes: 10/,

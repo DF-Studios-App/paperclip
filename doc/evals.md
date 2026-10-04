@@ -1,5 +1,10 @@
 # Paperclip evaluation guide
 
+> **Internal fork:** scheduled GitHub Runner evaluation campaigns are disabled
+> in `DF-Studios-App/paperclip`. Local evaluation commands and report formats
+> remain available; do not wait for the Actions campaigns. See
+> [Internal Fork Operations](FORK-OPERATIONS.md).
+
 Paperclip has two live eval families with different questions, owners, and
 evidence. Choose the family before selecting a model, profile, or case.
 

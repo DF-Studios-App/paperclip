@@ -150,6 +150,52 @@ test("commitperclip-review.yml skips the review job for fork repositories", () =
   assert.match(review, /Run quality gates/);
 });
 
+test("agent-runtime-images.yml cannot publish images from a fork", () => {
+  const workflow = readWorkflow("agent-runtime-images.yml");
+  assert.match(
+    workflow,
+    /build-and-sign:\n\s+# Internal forks must never publish images to the canonical GHCR namespace\.\n\s+if: github\.repository == 'paperclipai\/paperclip' && github\.repository_id == '1170821064'/,
+  );
+});
+
+test("internal fork omits Docker PR work and recurring eval schedules", () => {
+  const trusted = readWorkflow("pr-trusted.yml");
+  assert.doesNotMatch(trusted, /docker_context_integrity|Docker context integrity/);
+  assert.match(
+    trusted,
+    /needs: \[gate, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build\]/,
+  );
+
+  for (const filename of ["runner-chaos-evals.yml", "runner-live-evals.yml"]) {
+    const workflow = readWorkflow(filename);
+    assert.doesNotMatch(workflow, /^  schedule:/m, `${filename} must not recur`);
+    assert.match(workflow, /^  workflow_dispatch:/m);
+  }
+});
+
+test("Paperclip project guidance routes issues and pull requests to the fork", () => {
+  const agents = readFileSync(new URL("../../../AGENTS.md", import.meta.url), "utf8");
+  const skill = readFileSync(
+    new URL("../../../skills/paperclip/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  const contributing = readFileSync(
+    new URL("../../../CONTRIBUTING.md", import.meta.url),
+    "utf8",
+  );
+  const template = readFileSync(
+    new URL("../../PULL_REQUEST_TEMPLATE.md", import.meta.url),
+    "utf8",
+  );
+
+  for (const guidance of [agents, skill, contributing, template]) {
+    assert.match(guidance, /DF-Studios-App\/paperclip/);
+    assert.match(guidance, /upstream/i);
+  }
+  assert.match(agents, /origin` as the only writable GitHub\s+remote/);
+  assert.match(skill, /use `origin` for pushes/);
+});
+
 test("release.yml publishing jobs are restricted to canonical repository", () => {
   const release = readWorkflow("release.yml");
 

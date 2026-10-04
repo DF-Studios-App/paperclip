@@ -1,12 +1,17 @@
 # Contributing Guide
 
+> **Internal fork routing:** contributions, issues, and pull requests for this
+> project belong in [`DF-Studios-App/paperclip`](https://github.com/DF-Studios-App/paperclip).
+> Push only to `origin`. Treat `paperclipai/paperclip` as read-only reference
+> material. See [Internal Fork Operations](doc/FORK-OPERATIONS.md).
+
 Thanks for wanting to contribute!
 
 We really appreciate both small fixes and thoughtful larger changes.
 
 ## Before You Start: Search First
 
-Before you start work, **search GitHub** for existing PRs and issues that touch the same area:
+Before you start work, **search `DF-Studios-App/paperclip`** for existing PRs and issues that touch the same area. Treat upstream results as read-only background; open new work items only in this fork.
 
 - Look for **duplicate or in-flight PRs**. If something close already exists, prefer helping that PR over the line (see [Helping Other Contributors](#helping-other-contributors)) instead of opening a parallel one.
 - Look for **related open issues**. Link them in your PR body.
@@ -54,19 +59,19 @@ Every pull request **must** follow the PR template at [`.github/PULL_REQUEST_TEM
 
 We do not gate PRs on a pre-existing issue. Two acceptable paths:
 
-1. **Issue exists** — search the [Issues database](https://github.com/paperclipai/paperclip/issues) for anything this PR addresses and tag each one with `Fixes: #123` / `Closes #123` / `Refs #123` so GitHub auto-links them. If there are **duplicate or closely related issues**, link all of them, not just the one you picked. If there are **related PRs** (prior attempts, dependent work, follow-ups, abandoned predecessors), link those too.
+1. **Issue exists** — search the [fork's Issues database](https://github.com/DF-Studios-App/paperclip/issues) for anything this PR addresses and tag each one with `Fixes: #123` / `Closes #123` / `Refs #123` so GitHub auto-links them. If there are **duplicate or closely related issues**, link all of them, not just the one you picked. If there are **related PRs** (prior attempts, dependent work, follow-ups, abandoned predecessors), link those too.
 2. **No issue exists** — describe the problem directly in your PR body, following one of our [issue templates](.github/ISSUE_TEMPLATE/) so a reviewer has the same fields they'd get from a filed issue:
    - **Bug fix:** what happened, expected behavior, steps to reproduce, Paperclip version/commit, deployment mode. See [`bug_report.yml`](.github/ISSUE_TEMPLATE/bug_report.yml).
    - **Feature:** problem/motivation, proposed solution, alternatives considered, roadmap alignment. See [`feature_request.yml`](.github/ISSUE_TEMPLATE/feature_request.yml).
    - **New adapter:** agent or provider, why it's useful, how it's invoked. See [`adapter_request.yml`](.github/ISSUE_TEMPLATE/adapter_request.yml).
 
-Either way, a reviewer should be able to understand the underlying issue without leaving the PR. Commitperclip may check that one of these two paths is satisfied. Only link **public** GitHub issues — see [No Internal Issue References](#no-internal-issue-references) for what to leave out.
+Either way, a reviewer should be able to understand the underlying issue without leaving the PR. Commitperclip may check that one of these two paths is satisfied. Only link issue numbers from this fork — see [No Internal Issue References](#no-internal-issue-references) for what to leave out.
 
 ### No Internal Issue References
 
 Many contributors run their own Paperclip instance to manage their work. Issue ids and links from *your* instance are private — reviewers and other contributors cannot open them, so they show up as clutter or broken links.
 
-In your PR title, description, commits, and comments, **only reference public GitHub issues and PRs** — `#123`, `Fixes #123` / `Closes #123` / `Refs #123`, or full `https://github.com/paperclipai/paperclip/...` URLs.
+In your PR title, description, commits, and comments, **only reference GitHub issues and PRs in this fork** — `#123`, `Fixes #123` / `Closes #123` / `Refs #123`, or full `https://github.com/DF-Studios-App/paperclip/...` URLs. Do not open or link a new upstream issue or PR for this project.
 
 Do **not** include references to internal/instance-local Paperclip work, such as:
 
@@ -93,6 +98,12 @@ git push -u origin <descriptive-name>
 # If your tooling already pushed the old branch, delete it from origin:
 git push origin --delete <old-name>
 ```
+
+Create pull requests with
+`gh pr create --repo DF-Studios-App/paperclip --base master` and issues with
+`gh issue create --repo DF-Studios-App/paperclip` when the fork's issue tracker
+is enabled. Until then, record issue reports in a fork PR description or PR
+comment. Do not push or create work items in `upstream`.
 
 ### Model Used (Required)
 

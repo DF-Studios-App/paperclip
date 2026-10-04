@@ -3,8 +3,6 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-// PR #13470 uses the code-owner-reviewed default branch for this first-party workflow.
-const ordinaryPrTrustedWorkflowRevision = "master";
 const fullStackTestNeeds =
   /needs:\s*\[\s*authorize,\s*target_lock,\s*catalog,\s*daytona_image,\s*build_runner_artifacts,\s*build_remote_provider_pack,?\s*\]/u;
 const buildRunnerNeeds =
@@ -14,7 +12,7 @@ const buildRemoteProviderPackNeeds =
 const everydayOracleImage =
   "python@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285";
 
-describe("public repository paid workflow security", () => {
+describe("fork workflow security", () => {
   it("keeps the manual EC2 image build credential-free and pins the authorized target", async () => {
     const workflow = await readFile(path.join(repositoryRoot, ".github/workflows/docker-runner-check.yml"), "utf8");
     const manual = workflow.slice(workflow.indexOf("  authorize_manual:"));
@@ -30,23 +28,20 @@ describe("public repository paid workflow security", () => {
     expect(manual).toContain('docker logout ghcr.io');
   });
 
-  it("uses the reviewed master branch for the first-party trusted PR workflow", async () => {
+  it("uses the fork-local trusted PR workflow", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
     );
     const trustedWorkflowCalls = [
       ...ordinaryPrWorkflow.matchAll(
-        /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([^\s#]+)$/gmu,
+        /^\s+uses:\s+(\.\/\.github\/workflows\/pr-trusted\.yml)$/gmu,
       ),
     ];
 
     expect(trustedWorkflowCalls).toHaveLength(1);
     expect(trustedWorkflowCalls[0]?.[1]).toBe(
-      "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
-    );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
-      ordinaryPrTrustedWorkflowRevision,
+      "./.github/workflows/pr-trusted.yml",
     );
   });
 
@@ -150,10 +145,10 @@ describe("public repository paid workflow security", () => {
         "e2e.yml",
       ].map(async (name) => ({
         name,
-        contents: await readFile(
+        contents: (await readFile(
           path.join(repositoryRoot, ".github/workflows", name),
           "utf8",
-        ),
+        )).replace(/\r\n/g, "\n"),
       })),
     );
 
@@ -410,7 +405,7 @@ describe("public repository paid workflow security", () => {
       "cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.target_branch != '' && inputs.target_branch != github.event.repository.default_branch }}",
     );
     expect(daytonaImageJob).toMatch(
-      /- if: needs\.catalog\.outputs\.needs_daytona == 'true'\n\s+uses: actions\/checkout@[0-9a-f]{40}/u,
+      /- if: needs\.catalog\.outputs\.needs_daytona == 'true'\r?\n\s+uses: actions\/checkout@[0-9a-f]{40}/u,
     );
     for (const stepName of [
       "Download resolved target lockfile",
@@ -585,22 +580,28 @@ describe("public repository paid workflow security", () => {
     }
   });
 
-  it("runs paid scheduled campaigns only on Sundays", async () => {
-    const workflows = await Promise.all(
-      [
-        "runner-full-stack-e2e.yml",
-        "runner-live-evals.yml",
-        "runner-protocol-live-evals.yml",
-      ].map((name) =>
-        readFile(path.join(repositoryRoot, ".github/workflows", name), "utf8"),
+  it("keeps only retained paid campaign schedules on Sundays", async () => {
+    const scheduledWorkflows = await Promise.all(
+      ["runner-full-stack-e2e.yml", "runner-protocol-live-evals.yml"].map(
+        (name) =>
+          readFile(path.join(repositoryRoot, ".github/workflows", name), "utf8"),
       ),
     );
-    for (const workflow of workflows) {
+    for (const workflow of scheduledWorkflows) {
       const crons = [...workflow.matchAll(/cron:\s*"([^"]+)"/g)].map(
         (match) => match[1]!,
       );
       expect(crons).toHaveLength(1);
       expect(crons[0]).toMatch(/^\d{1,2} \d{1,2} \* \* 0$/);
+      expect(workflow).toContain("workflow_dispatch:");
+    }
+
+    for (const name of ["runner-chaos-evals.yml", "runner-live-evals.yml"]) {
+      const workflow = await readFile(
+        path.join(repositoryRoot, ".github/workflows", name),
+        "utf8",
+      );
+      expect(workflow).not.toMatch(/^  schedule:/m);
       expect(workflow).toContain("workflow_dispatch:");
     }
   });

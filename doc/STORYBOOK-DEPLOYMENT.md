@@ -1,5 +1,10 @@
 # Storybook branch hosting
 
+> **Internal fork:** Storybook publishing is disabled in
+> `DF-Studios-App/paperclip`. The instructions below describe upstream hosting
+> and cannot be completed from this fork. See
+> [Internal Fork Operations](FORK-OPERATIONS.md).
+
 The `Storybook Deploy` workflow publishes public static Storybook builds to the
 existing private S3 bucket behind CloudFront. It does not deploy to GitHub Pages.
 

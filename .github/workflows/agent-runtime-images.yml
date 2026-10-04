@@ -25,6 +25,8 @@ env:
 
 jobs:
   build-and-sign:
+    # Internal forks must never publish images to the canonical GHCR namespace.
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7

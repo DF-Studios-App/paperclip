@@ -1,5 +1,9 @@
 # Preview deployment artifacts
 
+> **Internal fork:** preview artifact publication is disabled in
+> `DF-Studios-App/paperclip`. The instructions below apply to upstream only.
+> See [Internal Fork Operations](FORK-OPERATIONS.md).
+
 The `preview` channel in `.github/workflows/release.yml` builds deployment
 artifacts for one immutable source commit. It does not create a GitHub release,
 move a source branch, or advance any stable, beta, nightly, or canary alias.

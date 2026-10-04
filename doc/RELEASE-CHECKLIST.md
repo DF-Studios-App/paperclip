@@ -1,5 +1,10 @@
 # Release Checklist
 
+> **Internal fork:** release automation and publication workflows are disabled
+> in `DF-Studios-App/paperclip`. This checklist applies to upstream only; do
+> not wait for release or Docker runs in the fork. See
+> [Internal Fork Operations](FORK-OPERATIONS.md).
+
 The release captain's checklist for every lane. The mechanics live in
 [`RELEASING.md`](RELEASING.md); the user-facing channel guide is
 [`CHANNELS.md`](CHANNELS.md).

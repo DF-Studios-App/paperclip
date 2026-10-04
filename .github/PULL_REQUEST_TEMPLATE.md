@@ -25,11 +25,13 @@
       Tag each linked issue with `Fixes: #123`, `Closes #123`, or `Refs #123`.
       Include duplicates and closely related issues too.
 
-  Only reference PUBLIC GitHub issues/PRs here. Do NOT paste internal,
-  instance-local Paperclip references — ticket ids like PAPA-123 / PAP-224,
+  Only reference GitHub issues/PRs in the DF-Studios-App/paperclip fork
+  here. Do NOT paste internal, instance-local Paperclip references — ticket
+  ids like PAPA-123 / PAP-224,
   /PAP/issues/... or agent://... links, or localhost/tailnet URLs. Other
   contributors cannot open them. See CONTRIBUTING.md → "No Internal Issue
-  References".
+  References". Do not open or reference a new issue or pull request in the
+  upstream paperclipai/paperclip repository for work in this fork.
 
   (B) No issue exists — describe the underlying problem here. Follow the issue
       template that fits your change. Open the matching file and copy its field
@@ -97,7 +99,8 @@
 - [ ] I have checked ROADMAP.md and confirmed this PR does not duplicate planned core work
 - [ ] I have searched GitHub for duplicate or related PRs and linked them above
 - [ ] I have either (a) linked existing issues with `Fixes: #` / `Closes #` / `Refs #` OR (b) described the issue in-PR following the relevant issue template
-- [ ] I have not referenced internal/instance-local Paperclip issues or links (only public GitHub `#NNN` / `github.com/paperclipai/paperclip` URLs)
+- [ ] This PR targets `DF-Studios-App/paperclip` and references only issues from that fork
+- [ ] I have not referenced internal/instance-local Paperclip issues or links (only fork `#NNN` / `github.com/DF-Studios-App/paperclip` URLs)
 - [ ] My branch name describes the change (e.g. `docs/...`, `fix/...`) and contains no internal Paperclip ticket id or instance-derived details
 - [ ] I have run tests locally and they pass
 - [ ] I have added or updated tests where applicable
