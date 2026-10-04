@@ -69,6 +69,14 @@ Antigravity `serverUrl` and `headers.Authorization` fields, preserves existing
 workspace servers, and removes its run-scoped entries when the CLI exits.
 Remote execution targets do not receive these runtime MCP servers yet.
 
+For GitHub or other connected-app actions, use the exact tools exposed by the
+Paperclip assigned-tools gateway. Runtime gateway tools use namespaced names;
+resolve legacy names such as a `github` server or `get_me` action to the exact
+tools exposed for the current gateway. Its run-scoped credentials permit only
+the MCP methods `tools/list` and `tools/call`; resource and prompt methods are
+not authorized. The separate Paperclip connections server is only for finding
+or requesting connections.
+
 Paperclip sends one JSON line to stdin in this shape:
 
 ```json

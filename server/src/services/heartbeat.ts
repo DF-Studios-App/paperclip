@@ -226,6 +226,7 @@ import {
   buildNativeExecutionInput,
   buildNativeExecutionWithCheckpoint,
   buildNativeRuntimeContext,
+  supportsNativeRuntimeMcpConnection,
   cancelNativeSession,
   claimNativeRestartRecoveries,
   closeWarmNativeSessionsForEnvironment,
@@ -4689,8 +4690,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
           connection.transportConfig?.sourceTemplateKey === "github")) ||
         connection.credentialPolicy === "per_user" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
-      (connection.transport === "mcp_remote" ||
-        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id)),
+      supportsNativeRuntimeMcpConnection(connection, githubBotConnectionIds),
   );
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),

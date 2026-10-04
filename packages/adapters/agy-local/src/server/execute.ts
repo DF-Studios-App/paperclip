@@ -502,12 +502,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const hasLocalRuntimeMcpServers =
+    !executionTargetIsRemote && (ctx.runtimeMcp?.getServers().length ?? 0) > 0;
   const prompt = prefixAgyGoal(joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
     renderedPrompt,
+    hasLocalRuntimeMcpServers
+      ? [
+          "Paperclip runtime clarification: for GitHub or other connected-app operations, inspect the tool definitions exposed for the Paperclip assigned-tools gateway, then call the exact exposed tool on that gateway. Paperclip gateway tool names are namespaced. If the task refers to a `github` server or raw upstream names such as `get_me`, treat those as the intended provider/action and resolve them to the exact tool names exposed for the assigned gateway. Do not call guessed names. Run-scoped gateway credentials permit only the MCP methods `tools/list` and `tools/call`; do not call `resources/list`, `resources/read`, `prompts/list`, or `prompts/get` on that gateway. The Paperclip connections server only handles connection discovery and requests; provider actions are on the assigned-tools gateway.",
+        ].join("\n")
+      : null,
   ]));
   const promptMetrics = {
     promptChars: prompt.length,

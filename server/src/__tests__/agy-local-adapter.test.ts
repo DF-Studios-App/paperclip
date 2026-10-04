@@ -399,7 +399,7 @@ describe("agy_local execute argument construction & session retry", () => {
         runId: "run-runtime-mcp",
         agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
-        config: { command: "agy", model: "auto", cwd },
+        config: { command: "agy", model: "auto", cwd, promptTemplate: "Use the GitHub server and get_me." },
         context: {},
         runtimeMcp: {
           getServers: () => [
@@ -425,6 +425,28 @@ describe("agy_local execute argument construction & session retry", () => {
           },
         },
       });
+      const processOptions = runProcessSpy.mock.calls[0][4];
+      const stdinMessage = JSON.parse(processOptions.stdin?.trim() ?? "{}") as {
+        message?: { content?: string };
+      };
+      expect(stdinMessage.message?.content).toContain(
+        "inspect the tool definitions exposed for the Paperclip assigned-tools gateway",
+      );
+      expect(stdinMessage.message?.content).toContain(
+        "If the task refers to a `github` server or raw upstream names such as `get_me`",
+      );
+      expect(stdinMessage.message?.content).toContain(
+        "provider actions are on the assigned-tools gateway",
+      );
+      expect(stdinMessage.message?.content).toContain(
+        "Run-scoped gateway credentials permit only the MCP methods `tools/list` and `tools/call`",
+      );
+      expect(stdinMessage.message?.content).toContain(
+        "do not call `resources/list`, `resources/read`, `prompts/list`, or `prompts/get`",
+      );
+      expect(stdinMessage.message?.content.indexOf("Use the GitHub server and get_me.")).toBeLessThan(
+        stdinMessage.message?.content.indexOf("Paperclip runtime clarification:"),
+      );
       await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       runProcessSpy.mockRestore();
