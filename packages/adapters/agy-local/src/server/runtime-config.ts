@@ -144,29 +144,35 @@ async function ensurePrivateGitPaths(input: {
   }
   if (!needsTemporaryExclude && missingRules.length === 0) return { cleanup: noCleanup };
 
-  const excludeResult = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
-  if (excludeResult.status !== 0) throw new Error("Could not locate the workspace's local Git exclude file.");
-  const excludePath = path.resolve(repoRoot, excludeResult.stdout.trim());
-  try {
-    let prefix = "";
+  if (!needsTemporaryExclude) {
+    const excludeResult = await runGit(repoRoot, ["rev-parse", "--git-path", "info/exclude"]);
+    if (excludeResult.status !== 0) throw new Error("Could not locate the workspace's local Git exclude file.");
+    const excludePath = path.resolve(repoRoot, excludeResult.stdout.trim());
     try {
-      const stat = await fs.lstat(excludePath);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error("Workspace Git exclude path must be a regular file, not a symlink.");
+      let prefix = "";
+      try {
+        const stat = await fs.lstat(excludePath);
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+          throw new Error("Workspace Git exclude path must be a regular file, not a symlink.");
+        }
+        prefix = (await fs.readFile(excludePath, "utf8")).endsWith("\n") ? "" : "\n";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      prefix = (await fs.readFile(excludePath, "utf8")).endsWith("\n") ? "" : "\n";
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const handle = await fs.open(excludePath, "a", 0o600);
+      try {
+        await handle.writeFile(`${prefix}# Paperclip run-scoped AGY MCP files\n${missingRules.join("\n")}\n`, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return { cleanup: noCleanup };
+    } catch {
+      needsTemporaryExclude = true;
     }
-    const handle = await fs.open(excludePath, "a", 0o600);
-    try {
-      await handle.writeFile(`${prefix}# Paperclip run-scoped AGY MCP files\n${missingRules.join("\n")}\n`, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    return { cleanup: noCleanup };
-  } catch {
+  }
+
+  if (needsTemporaryExclude) {
     // Some managed worktrees expose a writable workspace and a read-only Git
     // directory. Pass a private temporary global excludes file to AGY and its
     // Git subprocesses instead of blocking the run or exposing its token.
@@ -215,6 +221,8 @@ async function ensurePrivateGitPaths(input: {
       throw error;
     }
   }
+
+  return { cleanup: noCleanup };
 }
 
 async function validateConfigPaths(input: {

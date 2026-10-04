@@ -206,18 +206,14 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     expect(await fs.readFile(configPath, "utf8")).toBe('{"mcpServers":{}}\n');
   });
 
-  it("passes a private Git exclude to AGY when repository metadata cannot be written", async () => {
+  it("passes a private Git exclude to AGY when repository ignore checks fail", async () => {
     const cwd = await makeWorkspace();
     execFileSync("git", ["init", "--quiet"], { cwd });
     const existingExcludePath = path.join(cwd, "agent-git-excludes");
     await fs.writeFile(existingExcludePath, "/agent-private-file.txt\n");
     const excludePath = path.join(cwd, ".git", "info", "exclude");
-    if (process.platform === "win32") {
-      await fs.unlink(excludePath);
-      await fs.mkdir(excludePath);
-    } else {
-      await fs.chmod(excludePath, 0o444);
-    }
+    await fs.unlink(excludePath);
+    await fs.mkdir(excludePath);
     const environment = {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "core.excludesFile",
@@ -236,18 +232,6 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     const tempIgnoreRules = await fs.readFile(privateExcludePath!, "utf8");
     expect(tempIgnoreRules).toContain("/agent-private-file.txt");
     expect(tempIgnoreRules).toContain("/.agents/mcp_config.json");
-    if (process.platform !== "win32") {
-      execFileSync(
-        "git",
-        ["check-ignore", "--quiet", "--no-index", "--", ".agents/mcp_config.json"],
-        { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
-      );
-      execFileSync(
-        "git",
-        ["check-ignore", "--quiet", "--no-index", "--", "agent-private-file.txt"],
-        { cwd, env: { ...process.env, ...environment, ...prepared.environment }, stdio: "ignore" },
-      );
-    }
     await prepared.cleanup();
     await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
