@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareAgyRuntimeMcpConfig } from "@paperclipai/adapter-agy-local/server";
 
@@ -97,5 +98,96 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     const second = await secondPromise;
     expect(second.serverNames).toEqual(["Second"]);
     await second.cleanup();
+  });
+
+  it("preserves a user-edited injected server during cleanup", async () => {
+    const cwd = await makeWorkspace();
+    const configPath = path.join(cwd, ".agents", "mcp_config.json");
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+    ]);
+    const edited = JSON.parse(await fs.readFile(configPath, "utf8"));
+    edited.mcpServers.GitHub = { serverUrl: "https://user-edited.example/mcp" };
+    await fs.writeFile(configPath, JSON.stringify(edited, null, 2));
+
+    await prepared.cleanup();
+
+    const restored = JSON.parse(await fs.readFile(configPath, "utf8"));
+    expect(restored.mcpServers.GitHub).toEqual({ serverUrl: "https://user-edited.example/mcp" });
+    expect(JSON.stringify(restored)).not.toContain("run-token");
+  });
+
+  it("recovers an interrupted run before injecting a new runtime token", async () => {
+    const cwd = await makeWorkspace();
+    const agentsDir = path.join(cwd, ".agents");
+    await fs.mkdir(agentsDir);
+    const configPath = path.join(agentsDir, "mcp_config.json");
+    const injected = {
+      mcpServers: {
+        GitHub: { serverUrl: "http://127.0.0.1:3100/old", headers: { Authorization: "Bearer old-run-token" } },
+      },
+    };
+    await fs.writeFile(configPath, `${JSON.stringify(injected, null, 2)}\n`);
+    await fs.writeFile(path.join(agentsDir, ".paperclip-mcp-config.recovery.json"), JSON.stringify({
+      schemaVersion: 1,
+      injectedContent: `${JSON.stringify(injected, null, 2)}\n`,
+      injectedServers: { GitHub: injected.mcpServers.GitHub },
+      originalBase64: null,
+      originalMode: 0o600,
+    }));
+    await fs.writeFile(path.join(agentsDir, ".paperclip-mcp-config.lock"), "{");
+
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/new", token: "new-run-token", connectionId: "github" },
+    ]);
+
+    const active = await fs.readFile(configPath, "utf8");
+    expect(active).not.toContain("old-run-token");
+    expect(active).toContain("new-run-token");
+    await prepared.cleanup();
+    await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("adds run-scoped MCP files to the repository-local Git exclude", async () => {
+    const cwd = await makeWorkspace();
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+    ]);
+    const configPath = path.join(cwd, ".agents", "mcp_config.json");
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", path.relative(cwd, configPath)], {
+      cwd,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", ".agents/.paperclip-mcp-config.recovery.json"], {
+      cwd,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", ".agents/.paperclip-mcp-config.lock.123.stale"], {
+      cwd,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["check-ignore", "--quiet", "--no-index", "--", ".agents/.paperclip-mcp-test.tmp"], {
+      cwd,
+      stdio: "ignore",
+    });
+    await prepared.cleanup();
+  });
+
+  it("refuses to inject run tokens into a tracked Antigravity config", async () => {
+    const cwd = await makeWorkspace();
+    const agentsDir = path.join(cwd, ".agents");
+    await fs.mkdir(agentsDir);
+    const configPath = path.join(agentsDir, "mcp_config.json");
+    await fs.writeFile(configPath, '{"mcpServers":{}}\n');
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    execFileSync("git", ["add", "--", ".agents/mcp_config.json"], { cwd });
+
+    await expect(
+      prepareAgyRuntimeMcpConfig(cwd, [
+        { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+      ]),
+    ).rejects.toThrow(/Refusing to write run-scoped MCP secrets to tracked file/);
+    expect(await fs.readFile(configPath, "utf8")).toBe('{"mcpServers":{}}\n');
   });
 });
