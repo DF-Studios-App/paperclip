@@ -117,6 +117,21 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     expect(JSON.stringify(restored)).not.toContain("run-token");
   });
 
+  it("preserves a user-deleted config during cleanup", async () => {
+    const cwd = await makeWorkspace();
+    const configPath = path.join(cwd, ".agents", "mcp_config.json");
+    await fs.mkdir(path.dirname(configPath));
+    await fs.writeFile(configPath, '{"mcpServers":{"user":{"serverUrl":"https://user.example"}}}\n');
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+    ]);
+
+    await fs.unlink(configPath);
+    await prepared.cleanup();
+
+    await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("recovers an interrupted run before injecting a new runtime token", async () => {
     const cwd = await makeWorkspace();
     const agentsDir = path.join(cwd, ".agents");

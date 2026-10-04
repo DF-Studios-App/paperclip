@@ -40,14 +40,21 @@ function runShard(args) {
 }
 
 function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
-  assert.match(
-    caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
-  );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
-  return readFileSync(trustedPrWorkflow, "utf8");
+  const caller = readFileSync(prCallerWorkflow, "utf8").replace(/\r\n/g, "\n");
+  if (IS_UPSTREAM_REPOSITORY) {
+    assert.match(
+      caller,
+      /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
+      "upstream pr.yml must call the CODEOWNERS-protected workflow from master",
+    );
+  } else {
+    assert.match(
+      caller,
+      /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m,
+      "fork pr.yml must call its local reusable workflow",
+    );
+  }
+  return readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
 }
 
 function readWorkflowJobs(workflow) {
@@ -68,7 +75,7 @@ function readWorkflowJobs(workflow) {
 }
 
 function runStackScope(stack, prBaseRef) {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
   const match = workflow.match(
     /      - name: Select stacked PR CI scope[\s\S]*?        run: \|\n([\s\S]*?)\n\n  policy:/,
   );
@@ -171,11 +178,11 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
+test("pr.yml calls the repository's trusted PR workflow", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
 });
 
-test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
+test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
   // Branch protection requires a check literally named `e2e`. The shards run
   // as `e2e shard (n/3)`, so the aggregate job below is what keeps the
   // required-check contract intact — same pattern as the `verify` aggregate.
@@ -221,8 +228,8 @@ test("the trusted PR workflow keeps a stable aggregate check named e2e over the 
   }
 });
 
-test("the trusted PR workflow limits full CI to merge-relevant stack layers", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
+  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
   const jobs = readWorkflowJobs(workflow);
   const gate = jobs.get("gate");
 
@@ -237,7 +244,6 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", { 
     "verify_paperclip_runner",
     "build",
     "verify_serialized_server",
-    "canary_dry_run",
     "e2e_shards",
   ]) {
     assert.match(
@@ -245,6 +251,14 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", { 
       /^ {4}if: \$\{\{ needs\.gate\.outputs\.full_ci == 'true' \}\}$/m,
       `${jobId} must run only when the gate selects full CI`,
     );
+  }
+
+  const canary = jobs.get("canary_dry_run");
+  assert.match(canary, /^ {4}if: .*needs\.gate\.outputs\.full_ci == 'true'/m);
+  if (IS_UPSTREAM_REPOSITORY) {
+    assert.doesNotMatch(canary, /github\.repository == 'paperclipai\/paperclip'/);
+  } else {
+    assert.match(canary, /github\.repository == 'paperclipai\/paperclip'/);
   }
 
   assert.doesNotMatch(
@@ -280,7 +294,9 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", { 
   assert.match(e2e, /false\) test "\$E2E_SHARDS_RESULT" = "skipped"/);
 });
 
-test("the stacked PR scope selector runs full CI only where intended", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
+test("the stacked PR scope selector runs full CI only where intended", {
+  skip: process.platform === "win32" ? "the workflow snippet requires bash and jq" : false,
+}, () => {
   assert.equal(runStackScope(null, "master").full_ci, "true");
   assert.equal(
     runStackScope({ position: 11, size: 11, base: { ref: "master" } }, "stack-10").full_ci,
@@ -300,7 +316,7 @@ test("the stacked PR scope selector runs full CI only where intended", { skip: !
   );
 });
 
-test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
+test("the trusted PR workflow passes the shard's spec filter to Playwright without a literal --", () => {
   // `pnpm run test:e2e -- $specs` forwards the literal separator to Playwright,
   // so the specs after it are not applied as file filters.
   const workflow = readTrustedPrWorkflow();
@@ -315,10 +331,10 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
   );
 });
 
-test("the trusted PR workflow regenerates stale stacked lockfiles", { skip: !IS_UPSTREAM_REPOSITORY }, () => {
+test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
   // Validate the proposed workflow here. The caller executes the merged master
   // workflow; edits to this workflow take effect after code-owner review and merge.
-  const workflow = readFileSync(trustedPrWorkflow, "utf8");
+  const workflow = readFileSync(trustedPrWorkflow, "utf8").replace(/\r\n/g, "\n");
   assert.match(
     workflow,
     /policy:\n    needs: \[gate\][\s\S]{0,160}timeout-minutes: 10/,

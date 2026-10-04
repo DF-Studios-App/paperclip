@@ -344,8 +344,6 @@ async function restoreRecoveryJournal(input: {
         input.validate,
       );
     }
-  } else if (original) {
-    await atomicWriteFile(input.agentsDir, input.configPath, original, journal.originalMode, input.validate);
   }
 
   await input.validate();
