@@ -86,10 +86,22 @@ pnpm dev
 
 If using a PostgreSQL server installed on the development machine, set
 `DATABASE_URL` to that server's connection string before starting Paperclip.
-For example: `postgres://<user>:<password>@localhost:5432/<database>`. The
-database and role must already exist and have the required privileges. Keep
-real credentials in a local environment file or shell, never in committed docs
-or source.
+For example, in PowerShell:
+
+```powershell
+$env:DATABASE_URL = "postgres://<user>:<password>@localhost:5432/<database>"
+pnpm dev
+```
+
+In a POSIX shell, use:
+
+```sh
+DATABASE_URL='postgres://<user>:<password>@localhost:5432/<database>' pnpm dev
+```
+
+The database and role must already exist and have the required privileges. Do
+not assume that `pnpm dev` loads a repository-root `.env` file. Keep real
+credentials out of committed docs and source.
 
 ## 5. Core Engineering Rules
 
@@ -211,12 +223,14 @@ If anything cannot be run, explicitly report what was not run and why.
 For API requests made by a Paperclip agent run, use the runtime-provided
 `PAPERCLIP_API_URL` as the source of truth. In this checkout's development
 environment, the Paperclip server and its agents run on this same machine, so
-`http://127.0.0.1:3100` is the local API address when a direct/manual invocation
-has no runtime variable. Do not substitute a LAN IP, another machine name, or a
-guessed port. Do not confuse this with `DATABASE_URL`, which is only the
-server's PostgreSQL connection string. This loopback guidance is specific to
-this same-machine development setup; use the runtime-provided URL in all agent
-runs.
+`http://127.0.0.1:3100` is the local API address for a direct/manual invocation
+when the server uses its default port and no runtime variable is available. If
+`PORT` is customized or startup selects another free port, use the actual URL
+and port reported by the server. Do not substitute a LAN IP, another machine
+name, or a guessed port. Do not confuse this with `DATABASE_URL`, which is only
+the server's PostgreSQL connection string. This loopback guidance is specific
+to this same-machine development setup; use the runtime-provided URL in all
+agent runs.
 
 When adding endpoints:
 
