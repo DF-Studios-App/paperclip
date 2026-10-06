@@ -13,10 +13,9 @@ material; never push to it or create issues or pull requests there.
 Before creating an issue or pull request, verify the target repository is
 `DF-Studios-App/paperclip`. Use `gh issue create --repo DF-Studios-App/paperclip`
 and `gh pr create --repo DF-Studios-App/paperclip --base master` when using
-GitHub CLI. The fork currently has GitHub Issues disabled; while it remains
-disabled, record issue reports in a fork PR description or PR comment. Never
-route them to upstream. If the target cannot be verified, stop before creating
-the item and ask the user. See `doc/FORK-OPERATIONS.md`.
+GitHub CLI. The fork has GitHub Issues enabled. Create new issues in the fork.
+Never route them to upstream. If the target cannot be verified, stop before
+creating the item and ask the user. See `doc/FORK-OPERATIONS.md`.
 
 ## 1. Purpose
 
@@ -57,7 +56,7 @@ submission.
 - `skills/`: Paperclip runtime/operational skills (not part of the app catalog)
 - `doc/`: operational and product docs
 
-## 4. Dev Setup (Auto DB)
+## 4. Dev Setup (Embedded DB by default)
 
 Use embedded PGlite in dev by leaving `DATABASE_URL` unset.
 
@@ -84,6 +83,13 @@ Reset local dev DB:
 rm -rf data/pglite
 pnpm dev
 ```
+
+If using a PostgreSQL server installed on the development machine, set
+`DATABASE_URL` to that server's connection string before starting Paperclip.
+For example: `postgres://<user>:<password>@localhost:5432/<database>`. The
+database and role must already exist and have the required privileges. Keep
+real credentials in a local environment file or shell, never in committed docs
+or source.
 
 ## 5. Core Engineering Rules
 
@@ -201,6 +207,16 @@ If anything cannot be run, explicitly report what was not run and why.
 - Board access is treated as full-control operator context
 - Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
 - Agent keys must not access other companies
+
+For API requests made by a Paperclip agent run, use the runtime-provided
+`PAPERCLIP_API_URL` as the source of truth. In this checkout's development
+environment, the Paperclip server and its agents run on this same machine, so
+`http://127.0.0.1:3100` is the local API address when a direct/manual invocation
+has no runtime variable. Do not substitute a LAN IP, another machine name, or a
+guessed port. Do not confuse this with `DATABASE_URL`, which is only the
+server's PostgreSQL connection string. This loopback guidance is specific to
+this same-machine development setup; use the runtime-provided URL in all agent
+runs.
 
 When adding endpoints:
 
