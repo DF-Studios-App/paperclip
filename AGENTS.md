@@ -220,17 +220,20 @@ If anything cannot be run, explicitly report what was not run and why.
 - Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
 - Agent keys must not access other companies
 
-For API requests made by a Paperclip agent run, use the runtime-provided
-`PAPERCLIP_API_URL` as the source of truth. In this checkout's development
-environment, the Paperclip server and its agents run on this same machine, so
-`http://127.0.0.1:3100` is the local API address for a direct/manual invocation
-when the server uses its default port and no runtime variable is available. If
-`PORT` is customized or startup selects another free port, use the actual URL
-and port reported by the server. Do not substitute a LAN IP, another machine
-name, or a guessed port. Do not confuse this with `DATABASE_URL`, which is only
-the server's PostgreSQL connection string. This loopback guidance is specific
-to this same-machine development setup; use the runtime-provided URL in all
-agent runs.
+When the Paperclip server and agent run on this same machine, use the local API
+host `http://localhost:<port>` (equivalent to `http://127.0.0.1:<port>`). With
+the default development port, that is `http://localhost:3100`. Use the actual
+port reported by the server if `PORT` is customized or startup selects another
+free port. Do not call a LAN address such as `192.168.x.x` or a machine name
+from this same-machine setup; it can point to a stale or different instance.
+
+For Paperclip-managed runs, inspect `PAPERCLIP_API_URL` and confirm it points to
+this same local server before making API requests. If it contains a LAN address
+or another machine name in this setup, replace that host with `localhost` and
+keep the server's actual port. For runs where the agent and server are on
+different machines, use the runtime-provided `PAPERCLIP_API_URL` for that
+deployment. Do not confuse it with `DATABASE_URL`, which is only the server's
+PostgreSQL connection string.
 
 When adding endpoints:
 
