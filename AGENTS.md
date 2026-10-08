@@ -13,10 +13,9 @@ material; never push to it or create issues or pull requests there.
 Before creating an issue or pull request, verify the target repository is
 `DF-Studios-App/paperclip`. Use `gh issue create --repo DF-Studios-App/paperclip`
 and `gh pr create --repo DF-Studios-App/paperclip --base master` when using
-GitHub CLI. The fork currently has GitHub Issues disabled; while it remains
-disabled, record issue reports in a fork PR description or PR comment. Never
-route them to upstream. If the target cannot be verified, stop before creating
-the item and ask the user. See `doc/FORK-OPERATIONS.md`.
+GitHub CLI. The fork has GitHub Issues enabled. Create new issues in the fork.
+Never route them to upstream. If the target cannot be verified, stop before
+creating the item and ask the user. See `doc/FORK-OPERATIONS.md`.
 
 ## 1. Purpose
 
@@ -57,7 +56,7 @@ submission.
 - `skills/`: Paperclip runtime/operational skills (not part of the app catalog)
 - `doc/`: operational and product docs
 
-## 4. Dev Setup (Auto DB)
+## 4. Dev Setup (Embedded DB by default)
 
 Use embedded PGlite in dev by leaving `DATABASE_URL` unset.
 
@@ -84,6 +83,25 @@ Reset local dev DB:
 rm -rf data/pglite
 pnpm dev
 ```
+
+If using a PostgreSQL server installed on the development machine, set
+`DATABASE_URL` to that server's connection string before starting Paperclip.
+For example, in PowerShell:
+
+```powershell
+$env:DATABASE_URL = "postgres://<user>:<password>@localhost:5432/<database>"
+pnpm dev
+```
+
+In a POSIX shell, use:
+
+```sh
+DATABASE_URL='postgres://<user>:<password>@localhost:5432/<database>' pnpm dev
+```
+
+The database and role must already exist and have the required privileges. Do
+not assume that `pnpm dev` loads a repository-root `.env` file. Keep real
+credentials out of committed docs and source.
 
 ## 5. Core Engineering Rules
 
@@ -201,6 +219,21 @@ If anything cannot be run, explicitly report what was not run and why.
 - Board access is treated as full-control operator context
 - Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
 - Agent keys must not access other companies
+
+When the Paperclip server and agent run on this same machine, use the local API
+host `http://localhost:<port>` (equivalent to `http://127.0.0.1:<port>`). With
+the default development port, that is `http://localhost:3100`. Use the actual
+port reported by the server if `PORT` is customized or startup selects another
+free port. Do not call a LAN address such as `192.168.x.x` or a machine name
+from this same-machine setup; it can point to a stale or different instance.
+
+For Paperclip-managed runs, inspect `PAPERCLIP_API_URL` and confirm it points to
+this same local server before making API requests. If it contains a LAN address
+or another machine name in this setup, replace that host with `localhost` and
+keep the server's actual port. For runs where the agent and server are on
+different machines, use the runtime-provided `PAPERCLIP_API_URL` for that
+deployment. Do not confuse it with `DATABASE_URL`, which is only the server's
+PostgreSQL connection string.
 
 When adding endpoints:
 
