@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { prepareAgyRuntimeMcpConfig } from "@paperclipai/adapter-agy-local/server";
 
 const tempDirs: string[] = [];
@@ -249,5 +249,41 @@ describe("prepareAgyRuntimeMcpConfig", () => {
 
     await prepared.cleanup();
     await expect(fs.access(privateExcludePath!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("releases the runtime config lock when temporary Git exclude cleanup fails", async () => {
+    const cwd = await makeWorkspace();
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    const existingExcludePath = path.join(cwd, "agent-git-excludes");
+    await fs.writeFile(existingExcludePath, "/agent-private-file.txt\n");
+    const excludePath = path.join(cwd, ".git", "info", "exclude");
+    await fs.unlink(excludePath);
+    await fs.mkdir(excludePath);
+    const environment = {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.excludesFile",
+      GIT_CONFIG_VALUE_0: existingExcludePath,
+    };
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+      { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" },
+    ], undefined, environment);
+    const privateExcludePath = prepared.environment?.GIT_CONFIG_VALUE_1;
+    expect(privateExcludePath).toBeTruthy();
+    const tempDir = path.dirname(privateExcludePath!);
+    const realRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.resolve(String(target)) === path.resolve(tempDir)) {
+        throw Object.assign(new Error("simulated temporary exclude cleanup failure"), { code: "EACCES" });
+      }
+      return realRm(target, options);
+    });
+    try {
+      await expect(prepared.cleanup()).rejects.toThrow("AGY runtime cleanup was incomplete");
+      await expect(fs.access(path.join(cwd, ".agents", ".paperclip-mcp-config.lock")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      rmSpy.mockRestore();
+      await realRm(tempDir, { recursive: true, force: true });
+    }
   });
 });
