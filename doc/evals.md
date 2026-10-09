@@ -1,7 +1,25 @@
 # Paperclip evaluation guide
 
+The [Slack connector probe catalog](../server/src/services/connectors/slack/evals/README.md)
+organizes eleven manual model acceptance probes and a selector for existing
+deterministic regressions (`pnpm test:slack-connector`). It is not a registered
+model campaign; transport fixtures do not prove that an agent chooses a tool
+or that a real Slack interaction completes.
+
+The explicit-only [live provider connection suite](../tests/runner-e2e/PROVIDER-CONNECTIONS.md)
+is a Product E2E workflow for fresh subscription/API-key/gateway connections,
+with attended login and independent artifact checks against local or staging targets.
+
 Paperclip has two live eval families with different questions, owners, and
 evidence. Choose the family before selecting a model, profile, or case.
+
+The explicit-only [native instruction consolidation comparison](plans/2026-10-03-native-completion-consolidation.md)
+uses six Product E2E cells per source variant. It measures the completion
+constraint reduction separately from the earlier native tool-description
+trial. Provider-free start/resume payload capture is a byte measurement;
+behavioral qualification requires the original paired live outcomes and
+retained content. Neither source admission nor a scripted pass proves model
+behavior.
 
 - **Runner Evals:** real Runner/provider behavior against a seeded mock control
   plane. Definitions live in `paperclip-evals/evals/paperclip-runner`; see the
@@ -28,6 +46,12 @@ checks that production guidance causes a real native agent to name prompt-only
 standard/Ask tasks early, while preserving user-supplied titles. Its oracle
 correlates browser creation, native tool receipts, durable titles, audit ownership,
 and the reloaded task UI; fixture prompts contain no naming instructions.
+
+The explicit-only [native connection guidance suite](../tests/runner-e2e/README.md#native-connection-guidance-explicit-only)
+adds neutral decline prompts, same-task run-attributed explanations, and measured
+no-use controls across three native local profiles. Its fifteen configured cells
+are preparation for future matched instruction comparisons, not a live result.
+Historical Everyday cases and production prompts are preserved.
 
 ## Selecting a family
 
@@ -120,6 +144,13 @@ checks the legacy coordination skill against human authority, missing hiring
 permission, and requester scope decisions through saved browser interactions.
 
 ## Validation ladder
+
+The explicit-only [public MCP suite](../tests/runner-e2e/PUBLIC-MCP.md) evaluates
+paid assistant delegation, later retrieval, feedback, review, uncertain retries
+and permission boundaries. It uses the Product E2E fixtures, launcher, evidence
+packaging and dashboard, with separate external-assistant and team-worker billing.
+The [2026-10-01 results](plans/2026-10-01-public-mcp-paid-eval-results.md) retain
+two complete model matrices, provenance, costs and the earlier failure history.
 
 Start with credential-free checks and a catalog listing. For Product E2E:
 
@@ -360,6 +391,11 @@ The 26 native `first-task` cells exercise onboarding before native selection
 becomes the UI default. Live results and semantic answer reviews must accompany
 any qualification claim; catalog presence alone is not a pass.
 
+The explicit-only [native question/resume qualification](../tests/runner-e2e/README.md#task-continuation)
+separates a completed two-answer user journey from semantic-tool documentation
+qualification. It verifies the exact provider-pause or semantic-response-wake
+binding for each answer and preserves prior grades when the definition changes.
+
 ## Lifecycle behavior baseline
 
 The credential-free [lifecycle baseline](../tests/lifecycle-baseline/README.md)
@@ -398,3 +434,5 @@ ambiguous proposals, and the existing card-click path with native Claude/Codex.
 See the [suite contract](../tests/runner-e2e/README.md#conversational-confirmation-replies-explicit-only).
 
 Hiring notification accounting now also requires exact completed action attribution. Missing native/provider ID mapping is uncomparable evidence; it must not be reported as a model task regression or waived through name/order matching. The fixture waits for both known completion callbacks and settled bracketed observations, including the gap before pending outbox work becomes a wake. Strict action replay and original machine verdicts are retained separately.
+
+The explicit-only [planning guidance utility comparison](../tests/runner-e2e/PLAN-TASK-GUIDANCE.md) measures task decomposition and handoffs with current, short, and disabled skills.
