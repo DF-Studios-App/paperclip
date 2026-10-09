@@ -243,6 +243,7 @@ export async function prepareAgyRuntimeMcpConfig(
     }
 
     const cleanupSkillLinks = async () => {
+      await validate();
       for (const link of [...createdSkillLinks].reverse()) {
         const current = await fs.lstat(link.target).catch((error: NodeJS.ErrnoException) => {
           if (error.code === "ENOENT") return null;
