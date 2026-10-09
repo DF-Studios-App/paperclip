@@ -178,8 +178,58 @@ export async function prepareAgyRuntimeMcpConfig(
   let original: Buffer | null = null;
   let originalMode = 0o600;
   let injectedContent: string | null = null;
+  let configInjected = false;
   const serverNames: string[] = [];
   const createdSkillLinks: Array<{ target: string; source: string }> = [];
+  const cleanupSkillLinks = async () => {
+    await validate();
+    for (const link of [...createdSkillLinks].reverse()) {
+      const current = await fs.lstat(link.target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (!current?.isSymbolicLink()) continue;
+      const linked = await fs.readlink(link.target);
+      if (path.resolve(path.dirname(link.target), linked) === link.source) {
+        await fs.unlink(link.target);
+      }
+    }
+  };
+  const cleanupConfig = async () => {
+    if (!configInjected || injectedContent === null) return;
+    try {
+      await validate();
+      const current = await fs.readFile(configPath, "utf8");
+      const active = parseConfig(current);
+      const activeServers = isObject(active.mcpServers) ? active.mcpServers : {};
+      if (original && current === injectedContent) {
+        await atomicWriteFile(agentsDir, configPath, original, originalMode, validate);
+      } else if (current === injectedContent) {
+        await fs.unlink(configPath);
+      } else {
+        for (const name of serverNames) delete activeServers[name];
+        const restoredServers = { ...activeServers };
+        if (original) {
+          const baseline = parseConfig(original.toString("utf8"));
+          const baselineServers = isObject(baseline.mcpServers) ? baseline.mcpServers : {};
+          active.mcpServers = { ...baselineServers, ...restoredServers };
+          await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, originalMode, validate);
+        } else if (Object.keys(restoredServers).length > 0 || Object.keys(active).length > 1) {
+          active.mcpServers = restoredServers;
+          await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, 0o600, validate);
+        } else {
+          await fs.unlink(configPath);
+        }
+      }
+      configInjected = false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        configInjected = false;
+        return;
+      }
+      throw error;
+    }
+  };
   try {
     if (servers.length > 0) {
       try {
@@ -211,6 +261,7 @@ export async function prepareAgyRuntimeMcpConfig(
       // The config includes run-scoped bearer tokens. Always restrict it while
       // tokens are present, then restore the user's original mode on cleanup.
       await atomicWriteFile(agentsDir, configPath, injectedContent, 0o600, validate);
+      configInjected = true;
     }
 
     if (skills.length > 0) {
@@ -242,52 +293,11 @@ export async function prepareAgyRuntimeMcpConfig(
       }
     }
 
-    const cleanupSkillLinks = async () => {
-      await validate();
-      for (const link of [...createdSkillLinks].reverse()) {
-        const current = await fs.lstat(link.target).catch((error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return null;
-          throw error;
-        });
-        if (!current?.isSymbolicLink()) continue;
-        const linked = await fs.readlink(link.target);
-        if (path.resolve(path.dirname(link.target), linked) === link.source) {
-          await fs.unlink(link.target);
-        }
-      }
-    };
-
     return {
       serverNames,
       cleanup: async () => {
         try {
-          if (servers.length > 0) {
-            await validate();
-            const current = await fs.readFile(configPath, "utf8");
-            const active = parseConfig(current);
-            const activeServers = isObject(active.mcpServers) ? active.mcpServers : {};
-            if (original && current === injectedContent) {
-              await atomicWriteFile(agentsDir, configPath, original, originalMode, validate);
-            } else if (current === injectedContent) {
-              await fs.unlink(configPath);
-            } else {
-              for (const name of serverNames) delete activeServers[name];
-              const restoredServers = { ...activeServers };
-              if (original) {
-                const baseline = parseConfig(original.toString("utf8"));
-                const baselineServers = isObject(baseline.mcpServers) ? baseline.mcpServers : {};
-                active.mcpServers = { ...baselineServers, ...restoredServers };
-                await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, originalMode, validate);
-              } else if (Object.keys(restoredServers).length > 0 || Object.keys(active).length > 1) {
-                active.mcpServers = restoredServers;
-                await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, 0o600, validate);
-              } else {
-                await fs.unlink(configPath);
-              }
-            }
-          }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await cleanupConfig();
         } finally {
           try {
             await cleanupSkillLinks();
@@ -298,21 +308,26 @@ export async function prepareAgyRuntimeMcpConfig(
       },
     };
   } catch (error) {
+    const cleanupErrors: unknown[] = [];
     try {
-      for (const link of [...createdSkillLinks].reverse()) {
-        const current = await fs.lstat(link.target).catch((unlinkError: NodeJS.ErrnoException) => {
-          if (unlinkError.code === "ENOENT") return null;
-          throw unlinkError;
-        });
-        if (current?.isSymbolicLink()) {
-          const linked = await fs.readlink(link.target);
-          if (path.resolve(path.dirname(link.target), linked) === link.source) {
-            await fs.unlink(link.target);
-          }
+      await cleanupConfig();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    } finally {
+      try {
+        await cleanupSkillLinks();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      } finally {
+        try {
+          await releaseLock();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
         }
       }
-    } finally {
-      await releaseLock();
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], "AGY runtime setup failed and cleanup was incomplete.");
     }
     throw error;
   }

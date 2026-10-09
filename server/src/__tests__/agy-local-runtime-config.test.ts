@@ -78,6 +78,49 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     });
   });
 
+  it("restores the original MCP config when selected skill staging fails", async () => {
+    const cwd = await makeWorkspace();
+    const agentsDir = path.join(cwd, ".agents");
+    await fs.mkdir(agentsDir);
+    const configPath = path.join(agentsDir, "mcp_config.json");
+    const originalConfig = '{"mcpServers":{"local":{"command":"server"}}}\n';
+    await fs.writeFile(configPath, originalConfig);
+
+    await expect(
+      prepareAgyRuntimeMcpConfig(
+        cwd,
+        [{ name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" }],
+        undefined,
+        [{ name: "missing-skill", source: path.join(cwd, "missing-skill") }],
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    expect(await fs.readFile(configPath, "utf8")).toBe(originalConfig);
+    await expect(fs.access(path.join(agentsDir, ".paperclip-mcp-config.lock"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("removes the injected MCP config when selected skill staging fails without an original config", async () => {
+    const cwd = await makeWorkspace();
+    const agentsDir = path.join(cwd, ".agents");
+    const configPath = path.join(agentsDir, "mcp_config.json");
+
+    await expect(
+      prepareAgyRuntimeMcpConfig(
+        cwd,
+        [{ name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "run-token", connectionId: "github" }],
+        undefined,
+        [{ name: "missing-skill", source: path.join(cwd, "missing-skill") }],
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    await expect(fs.access(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(path.join(agentsDir, ".paperclip-mcp-config.lock"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it.skipIf(process.platform === "win32")(
     "restricts an existing config while a run token is present and restores its original mode",
     async () => {
