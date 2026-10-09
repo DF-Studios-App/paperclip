@@ -41,12 +41,9 @@ export function supportsNativeRuntimeMcpConnection(
   },
   githubBotConnectionIds: ReadonlySet<string>,
 ): boolean {
-  const isGitHubRestConnection = connection.transport === "rest_api"
-    && (connection.config?.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github");
   return connection.transport === "mcp_remote"
     || connection.transport === "local_stdio"
     || isBrowserUseConnection(connection)
-    || isGitHubRestConnection
     || githubBotConnectionIds.has(connection.id);
 }
 

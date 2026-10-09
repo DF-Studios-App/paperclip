@@ -11,7 +11,7 @@ The `agy_local` adapter allows Paperclip agents to execute tasks through the loc
 - **Adapter Type**: `agy_local`
 - **Execution Mode**: Local CLI sub-process or remote SSH target
 - **Authentication**: Uses the existing AGY account session on the execution host. No Gemini API key field or secret prompt is required.
-- **Skills Directory**: `~/.gemini/skills/`
+- **Skills**: Selected Paperclip skills are staged in the assigned workspace for each local run. Persistent skill inventory links are stored under a company- and agent-scoped Paperclip directory.
 - **Session Continuity**: Multi-turn conversation resumption via `--conversation <id>` with automatic clean retry on unknown/stale sessions.
 
 ## Prerequisites
@@ -110,4 +110,4 @@ When step usage is absent, the adapter falls back to `result.usage`. If previous
 
 ### Remote skills
 
-Remote execution stores managed skill copies in `~/.gemini/.paperclip-agy-skills` and links them into `~/.gemini/skills`. External entries, including name collisions and dangling links, are preserved. Only links pointing to the exact private store entry are refreshed or removed when deselected; the skills directory is never replaced. Symlinked skills/store roots are rejected. Existing unmarked copies from older adapter versions are treated as external and require manual migration if they collide.
+Remote execution stages selected skill copies under the assigned workspace's `.agents` directory and links them into `.agents/skills`; it does not write Paperclip skills to the shared `~/.gemini/skills` directory. External entries, including name collisions and dangling links, are preserved. Only links pointing to the managed workspace copy are refreshed or removed when deselected; the user's home skills directory is never changed. Symlinked skills roots are rejected.

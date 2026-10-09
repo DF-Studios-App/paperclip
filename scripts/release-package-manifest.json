@@ -7,7 +7,7 @@
   {
     "dir": "packages/adapters/agy-local",
     "name": "@paperclipai/adapter-agy-local",
-    "publishFromCi": false
+    "publishFromCi": true
   },
   {
     "dir": "packages/adapters/claude-local",

@@ -57,6 +57,51 @@ describe("prepareAgyRuntimeMcpConfig", () => {
     expect(await fs.readFile(configPath, "utf8")).toBe(userConfigText);
   });
 
+  it("injects selected skills only into the workspace and removes its links during cleanup", async () => {
+    const cwd = await makeWorkspace();
+    const sourceRoot = await makeWorkspace();
+    const source = path.join(sourceRoot, "selected-skill");
+    await fs.mkdir(source);
+    await fs.writeFile(path.join(source, "SKILL.md"), "skill contents");
+
+    const prepared = await prepareAgyRuntimeMcpConfig(cwd, [], undefined, [
+      { name: "selected-skill", source },
+    ]);
+    const skillLink = path.join(cwd, ".agents", "skills", "selected-skill");
+    expect(await fs.realpath(skillLink)).toBe(await fs.realpath(source));
+    expect(prepared.serverNames).toEqual([]);
+
+    await prepared.cleanup();
+    await expect(fs.lstat(skillLink)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(path.join(cwd, ".agents", ".paperclip-mcp-config.lock"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "restricts an existing config while a run token is present and restores its original mode",
+    async () => {
+      const cwd = await makeWorkspace();
+      const agentsDir = path.join(cwd, ".agents");
+      await fs.mkdir(agentsDir);
+      const configPath = path.join(agentsDir, "mcp_config.json");
+      const userConfigText = '{"mcpServers":{"local":{"command":"server"}}}\n';
+      await fs.writeFile(configPath, userConfigText, { mode: 0o644 });
+      await fs.chmod(configPath, 0o644);
+
+      const prepared = await prepareAgyRuntimeMcpConfig(cwd, [
+        { name: "GitHub", url: "http://127.0.0.1:3100/runtime", token: "secret-run-token", connectionId: "github" },
+      ]);
+
+      expect((await fs.stat(configPath)).mode & 0o777).toBe(0o600);
+      expect(await fs.readFile(configPath, "utf8")).toContain("secret-run-token");
+      await prepared.cleanup();
+
+      expect((await fs.stat(configPath)).mode & 0o777).toBe(0o644);
+      expect(await fs.readFile(configPath, "utf8")).toBe(userConfigText);
+    },
+  );
+
   it("does not create configuration when there are no runtime servers", async () => {
     const cwd = await makeWorkspace();
     const prepared = await prepareAgyRuntimeMcpConfig(cwd, []);

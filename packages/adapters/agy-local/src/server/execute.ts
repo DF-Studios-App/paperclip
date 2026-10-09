@@ -31,14 +31,12 @@ import {
   buildRuntimeToolsEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
-  ensurePaperclipSkillSymlink,
   joinPromptSections,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
-  removeMaintainerOnlySkillSymlinks,
   parseObject,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -47,7 +45,6 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { DEFAULT_AGY_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { resolveAgySkillsHome } from "./skills.js";
 import { buildAgyRemoteSkillsCommand } from "./remote-skills.js";
 import { prepareAgyRuntimeMcpConfig } from "./runtime-config.js";
 import {
@@ -84,55 +81,6 @@ function parseCumulativeUsage(value: unknown): UsageSummary | null {
       0,
     ),
   };
-}
-
-async function ensureAgySkillsInjected(
-  onLog: AdapterExecutionContext["onLog"],
-  skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
-  desiredSkillNames?: string[],
-  skillsHome = path.join(os.homedir(), ".gemini", "skills"),
-): Promise<void> {
-  const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
-  const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
-  if (selectedEntries.length === 0) return;
-
-  try {
-    await fs.mkdir(skillsHome, { recursive: true });
-  } catch (err) {
-    await onLog(
-      "stderr",
-      `[paperclip] Failed to prepare Antigravity CLI skills directory ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
-    return;
-  }
-  const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    skillsHome,
-    selectedEntries.map((entry) => entry.runtimeName),
-  );
-  for (const skillName of removedSkills) {
-    await onLog(
-      "stderr",
-      `[paperclip] Removed maintainer-only Antigravity CLI skill "${skillName}" from ${skillsHome}\n`,
-    );
-  }
-
-  for (const entry of selectedEntries) {
-    const target = path.join(skillsHome, entry.runtimeName);
-
-    try {
-      const result = await ensurePaperclipSkillSymlink(entry.source, target);
-      if (result === "skipped") continue;
-      await onLog(
-        "stderr",
-        `[paperclip] ${result === "repaired" ? "Repaired" : "Linked"} Antigravity CLI skill: ${entry.key}\n`,
-      );
-    } catch (err) {
-      await onLog(
-        "stderr",
-        `[paperclip] Failed to link Antigravity CLI skill "${entry.key}": ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-    }
-  }
 }
 
 async function buildAgySkillsDir(config: Record<string, unknown>): Promise<string> {
@@ -187,9 +135,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const agySkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredAgySkillNames = resolveLegacyPaperclipDesiredSkillNames(config, agySkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureAgySkillsInjected(onLog, agySkillEntries, desiredAgySkillNames, resolveAgySkillsHome(config));
-  }
 
   const envConfig = parseObject(config.env);
   const hasExplicitApiKey =
@@ -363,7 +308,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onLog,
       });
       if (remoteHomeDir && preparedExecutionTargetRuntime.assetDirs.skills) {
-        remoteSkillsDir = path.posix.join(remoteHomeDir, ".gemini", "skills");
+        remoteSkillsDir = path.posix.join(effectiveExecutionCwd, ".agents", "skills");
         const skillSync = await runAdapterExecutionTargetShellCommand(
           runId,
           executionTarget,
@@ -780,7 +725,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     const runtimeMcpConfig = executionTargetIsRemote
       ? { serverNames: [] as string[], cleanup: async () => {} }
-      : await prepareAgyRuntimeMcpConfig(effectiveExecutionCwd, runtimeMcpServers, ctx.signal);
+      : await prepareAgyRuntimeMcpConfig(
+          effectiveExecutionCwd,
+          runtimeMcpServers,
+          ctx.signal,
+          agySkillEntries
+            .filter((entry) => desiredAgySkillNames.includes(entry.key))
+            .map((entry) => ({ name: entry.runtimeName, source: entry.source })),
+        );
     try {
       if (runtimeMcpConfig.serverNames.length > 0) {
         await onLog(

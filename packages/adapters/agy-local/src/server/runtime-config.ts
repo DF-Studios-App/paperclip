@@ -8,6 +8,8 @@ type PreparedAgyRuntimeConfig = {
   cleanup: () => Promise<void>;
 };
 
+type AgyWorkspaceSkill = { name: string; source: string };
+
 const LOCK_WAIT_MS = 100;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -41,12 +43,25 @@ async function validateConfigPaths(input: {
   agentsDir: string;
   configPath: string;
   lockPath: string;
+  skillsDir?: string;
 }): Promise<void> {
   const agents = await fs.lstat(input.agentsDir);
   if (!agents.isDirectory() || agents.isSymbolicLink()) {
     throw new Error("Antigravity workspace `.agents` must be a real directory, not a symlink.");
   }
   assertContained(input.root, await fs.realpath(input.agentsDir));
+
+  if (input.skillsDir) {
+    try {
+      const skills = await fs.lstat(input.skillsDir);
+      if (!skills.isDirectory() || skills.isSymbolicLink()) {
+        throw new Error("Antigravity workspace `.agents/skills` must be a real directory, not a symlink.");
+      }
+      assertContained(input.root, await fs.realpath(input.skillsDir));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 
   for (const filePath of [input.configPath, input.lockPath]) {
     try {
@@ -147,97 +162,157 @@ export async function prepareAgyRuntimeMcpConfig(
   cwd: string,
   servers: readonly AdapterRuntimeMcpServer[],
   signal?: AbortSignal,
+  skills: readonly AgyWorkspaceSkill[] = [],
 ): Promise<PreparedAgyRuntimeConfig> {
-  if (servers.length === 0) return { serverNames: [], cleanup: async () => {} };
+  if (servers.length === 0 && skills.length === 0) return { serverNames: [], cleanup: async () => {} };
 
   const agentsDir = path.join(cwd, ".agents");
   const configPath = path.join(agentsDir, "mcp_config.json");
   const lockPath = path.join(agentsDir, ".paperclip-mcp-config.lock");
+  const skillsDir = path.join(agentsDir, "skills");
   const root = await fs.realpath(cwd);
   await fs.mkdir(agentsDir, { recursive: true });
-  const validate = () => validateConfigPaths({ root, agentsDir, configPath, lockPath });
+  const validate = () => validateConfigPaths({ root, agentsDir, configPath, lockPath, skillsDir });
   await validate();
   const releaseLock = await acquireLock(lockPath, validate, signal);
   let original: Buffer | null = null;
   let originalMode = 0o600;
+  let injectedContent: string | null = null;
+  const serverNames: string[] = [];
+  const createdSkillLinks: Array<{ target: string; source: string }> = [];
   try {
-    try {
-      const stat = await fs.lstat(configPath);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error("Antigravity MCP config must be a regular file, not a symlink.");
+    if (servers.length > 0) {
+      try {
+        const stat = await fs.lstat(configPath);
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+          throw new Error("Antigravity MCP config must be a regular file, not a symlink.");
+        }
+        original = await fs.readFile(configPath);
+        originalMode = stat.mode & 0o777;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      original = await fs.readFile(configPath);
-      originalMode = stat.mode & 0o777;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+
+      const existing = original ? parseConfig(original.toString("utf8")) : {};
+      if (existing.mcpServers !== undefined && !isObject(existing.mcpServers)) {
+        throw new Error("Antigravity MCP config property `mcpServers` must be a JSON object.");
+      }
+      const existingServers = isObject(existing.mcpServers) ? existing.mcpServers : {};
+      const mcpServers: Record<string, unknown> = { ...existingServers };
+      for (const server of servers) {
+        const name = uniqueServerName(server.name, server.connectionId, new Set(Object.keys(mcpServers)));
+        serverNames.push(name);
+        mcpServers[name] = {
+          serverUrl: server.url,
+          headers: { Authorization: `Bearer ${server.token}` },
+        };
+      }
+      injectedContent = `${JSON.stringify({ ...existing, mcpServers }, null, 2)}\n`;
+      // The config includes run-scoped bearer tokens. Always restrict it while
+      // tokens are present, then restore the user's original mode on cleanup.
+      await atomicWriteFile(agentsDir, configPath, injectedContent, 0o600, validate);
     }
 
-    const existing = original ? parseConfig(original.toString("utf8")) : {};
-    if (existing.mcpServers !== undefined && !isObject(existing.mcpServers)) {
-      throw new Error("Antigravity MCP config property `mcpServers` must be a JSON object.");
+    if (skills.length > 0) {
+      await fs.mkdir(skillsDir, { recursive: true });
+      await validate();
+      for (const skill of skills) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(skill.name)) {
+          throw new Error(`Invalid Antigravity workspace skill name: ${skill.name}`);
+        }
+        const source = await fs.realpath(skill.source);
+        if (!(await fs.stat(source)).isDirectory()) {
+          throw new Error(`Antigravity skill source is not a directory: ${skill.name}`);
+        }
+        const target = path.join(skillsDir, skill.name);
+        const existing = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (existing) {
+          if (existing.isSymbolicLink()) {
+            const linked = await fs.readlink(target);
+            if (path.resolve(path.dirname(target), linked) === source) continue;
+          }
+          // Preserve user-owned skill directories and links on name collisions.
+          continue;
+        }
+        await fs.symlink(source, target, process.platform === "win32" ? "junction" : "dir");
+        createdSkillLinks.push({ target, source });
+      }
     }
-    const existingServers = isObject(existing.mcpServers) ? existing.mcpServers : {};
-    const mcpServers: Record<string, unknown> = { ...existingServers };
-    const names: string[] = [];
-    for (const server of servers) {
-      const name = uniqueServerName(server.name, server.connectionId, new Set(Object.keys(mcpServers)));
-      names.push(name);
-      mcpServers[name] = {
-        serverUrl: server.url,
-        headers: { Authorization: `Bearer ${server.token}` },
-      };
-    }
-    const injectedContent = `${JSON.stringify({ ...existing, mcpServers }, null, 2)}\n`;
-    await atomicWriteFile(agentsDir, configPath, injectedContent, 0o600, validate);
+
+    const cleanupSkillLinks = async () => {
+      for (const link of [...createdSkillLinks].reverse()) {
+        const current = await fs.lstat(link.target).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (!current?.isSymbolicLink()) continue;
+        const linked = await fs.readlink(link.target);
+        if (path.resolve(path.dirname(link.target), linked) === link.source) {
+          await fs.unlink(link.target);
+        }
+      }
+    };
 
     return {
-      serverNames: names,
+      serverNames,
       cleanup: async () => {
         try {
-          await validate();
-          const current = await fs.readFile(configPath, "utf8");
-          if (current === injectedContent && original) {
-            await atomicWriteFile(agentsDir, configPath, original, originalMode, validate);
-          } else if (current === injectedContent) {
-            await fs.unlink(configPath);
-          } else {
+          if (servers.length > 0) {
+            await validate();
+            const current = await fs.readFile(configPath, "utf8");
             const active = parseConfig(current);
             const activeServers = isObject(active.mcpServers) ? active.mcpServers : {};
-            for (const name of names) delete activeServers[name];
-            const restoredServers = { ...activeServers };
-            if (original) {
-              const baseline = parseConfig(original.toString("utf8"));
-              const baselineServers = isObject(baseline.mcpServers) ? baseline.mcpServers : {};
-              active.mcpServers = { ...baselineServers, ...restoredServers };
-              await atomicWriteFile(
-                agentsDir,
-                configPath,
-                `${JSON.stringify(active, null, 2)}\n`,
-                originalMode,
-                validate,
-              );
-            } else if (Object.keys(restoredServers).length > 0 || Object.keys(active).length > 1) {
-              active.mcpServers = restoredServers;
-              await atomicWriteFile(
-                agentsDir,
-                configPath,
-                `${JSON.stringify(active, null, 2)}\n`,
-                0o600,
-                validate,
-              );
-            } else {
+            if (original && current === injectedContent) {
+              await atomicWriteFile(agentsDir, configPath, original, originalMode, validate);
+            } else if (current === injectedContent) {
               await fs.unlink(configPath);
+            } else {
+              for (const name of serverNames) delete activeServers[name];
+              const restoredServers = { ...activeServers };
+              if (original) {
+                const baseline = parseConfig(original.toString("utf8"));
+                const baselineServers = isObject(baseline.mcpServers) ? baseline.mcpServers : {};
+                active.mcpServers = { ...baselineServers, ...restoredServers };
+                await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, originalMode, validate);
+              } else if (Object.keys(restoredServers).length > 0 || Object.keys(active).length > 1) {
+                active.mcpServers = restoredServers;
+                await atomicWriteFile(agentsDir, configPath, `${JSON.stringify(active, null, 2)}\n`, 0o600, validate);
+              } else {
+                await fs.unlink(configPath);
+              }
             }
           }
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         } finally {
-          await releaseLock();
+          try {
+            await cleanupSkillLinks();
+          } finally {
+            await releaseLock();
+          }
         }
       },
     };
   } catch (error) {
-    await releaseLock();
+    try {
+      for (const link of [...createdSkillLinks].reverse()) {
+        const current = await fs.lstat(link.target).catch((unlinkError: NodeJS.ErrnoException) => {
+          if (unlinkError.code === "ENOENT") return null;
+          throw unlinkError;
+        });
+        if (current?.isSymbolicLink()) {
+          const linked = await fs.readlink(link.target);
+          if (path.resolve(path.dirname(link.target), linked) === link.source) {
+            await fs.unlink(link.target);
+          }
+        }
+      }
+    } finally {
+      await releaseLock();
+    }
     throw error;
   }
 }
