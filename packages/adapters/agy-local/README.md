@@ -1,6 +1,7 @@
 # @paperclipai/adapter-agy-local
 
-> **Note:** AGY is a workspace-only feature in this fork and npm publication from the fork is intentionally disabled.
+This adapter is included in Paperclip's public release set and is published by
+the Paperclip release workflow.
 
 Paperclip built-in adapter for Google Antigravity CLI (`agy`).
 
