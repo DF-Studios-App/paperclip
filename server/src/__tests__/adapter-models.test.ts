@@ -73,6 +73,7 @@ describe("adapter model listing", () => {
     expect(models.some((model) => model.id === "claude-opus-5")).toBe(true);
     expect(models).toContainEqual({ id: "claude-opus-5-5", label: "Claude Opus 5.5" });
     expect(models).toContainEqual({ id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" });
+    expect(models).toContainEqual({ id: "claude-haiku-5-5", label: "Claude Haiku 5.5" });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
