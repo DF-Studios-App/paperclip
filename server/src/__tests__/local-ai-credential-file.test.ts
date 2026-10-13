@@ -11,9 +11,12 @@ describe("isolated credential file safety", () => {
     const filename = path.join(home, "credentials.json");
     await writeFile(filename, "fixture", { mode: 0o600 });
     await expect(readLocalAiCredentialFile(filename)).resolves.toBe("fixture");
-    await chmod(filename, 0o644);
-    await expect(readLocalAiCredentialFile(filename)).rejects.toThrow();
-    await chmod(filename, 0o600);
+    // Windows has no POSIX modes; the Windows branch relies on lstat checks instead.
+    if (process.platform !== "win32") {
+      await chmod(filename, 0o644);
+      await expect(readLocalAiCredentialFile(filename)).rejects.toThrow();
+      await chmod(filename, 0o600);
+    }
     await writeFile(filename, Buffer.alloc(64 * 1024 + 1));
     await expect(readLocalAiCredentialFile(filename)).rejects.toThrow();
     await expect(readLocalAiCredentialFile(home)).rejects.toThrow();
