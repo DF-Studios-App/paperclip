@@ -162,7 +162,7 @@ export function localAiLoginService(db: Db) {
       if (session.connectionMethod !== LOCAL_LOGIN_METHOD || session.status !== "waiting_for_user" ||
           !session.expiresAt || session.expiresAt.getTime() <= Date.now())
         throw unprocessable("This sign-in attempt has expired or was cancelled. Start sign-in again.");
-      const credential = await readVerifiedLocalAiCredential(intent.provider, loginHome(id));
+      const credential = await readVerifiedLocalAiCredential(intent.provider, loginHome(id), { storable: true });
       await tx.update(adapterAuthSessions).set({ status: "promoting", updatedAt: new Date() })
         .where(eq(adapterAuthSessions.id, id));
       // Nested transaction is a savepoint on this same connection. Holding the
