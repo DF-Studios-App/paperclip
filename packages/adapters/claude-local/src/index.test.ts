@@ -19,6 +19,7 @@ describe("Claude model defaults", () => {
     expect(claudeLocalReasoningEffortsForModel("claude-sonnet-4-6")).toEqual(["low", "medium", "high", "max"]);
     expect(claudeLocalReasoningEffortsForModel("claude-sonnet-4-5")).toEqual(["low", "medium", "high"]);
     expect(claudeLocalReasoningEffortsForModel("claude-haiku-4-5")).toEqual([]);
+    expect(claudeLocalReasoningEffortsForModel("claude-haiku-5-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(claudeLocalReasoningEffortsForModel("custom-model")).toEqual(["low", "medium", "high"]);
   });
 
