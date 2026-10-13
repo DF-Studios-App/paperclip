@@ -15,10 +15,71 @@ import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import {
+  claudeSubscriptionNeedsRefresh,
+  parseClaudeSubscriptionCredential,
+  refreshClaudeSubscriptionCredential,
+  serializeClaudeSubscriptionCredential,
+} from "./claude-subscription-credential.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_busy";
+}
+
+type AiConnectionSelection = Parameters<ReturnType<typeof aiConnectionService>["credential"]>[0];
+
+function claudeReconnectRequired() {
+  return unprocessable("Reconnect this AI account", { code: "ai_connection_credential_missing" });
+}
+
+/**
+ * Returns a usable Claude access token. When the stored token is near expiry,
+ * it exchanges the refresh token and stores the rotated record. The secret row
+ * stays locked for the whole exchange, so two runs cannot spend the same refresh token.
+ */
+async function renewClaudeSubscriptionAccessToken(
+  db: Db,
+  companyId: string,
+  selection: AiConnectionSelection,
+  now = Date.now(),
+): Promise<string> {
+  return db.transaction(async (tx) => {
+    const [grant] = await tx
+      .select()
+      .from(connectionGrants)
+      .where(and(eq(connectionGrants.id, selection.grant.id), eq(connectionGrants.companyId, companyId)))
+      .for("update");
+    if (!grant || grant.status !== "active") throw claudeReconnectRequired();
+    const ref = grant.credentialSecretRefs.find((r) => r.configPath === "ai.credential");
+    if (!ref) throw claudeReconnectRequired();
+    await tx
+      .select({ id: companySecrets.id })
+      .from(companySecrets)
+      .where(and(eq(companySecrets.id, ref.secretId), eq(companySecrets.companyId, companyId)))
+      .for("update");
+    const raw = await aiConnectionService(tx as unknown as Db).credential({ ...selection, grant });
+    let current;
+    try {
+      current = parseClaudeSubscriptionCredential(raw);
+    } catch {
+      throw claudeReconnectRequired();
+    }
+    if (!claudeSubscriptionNeedsRefresh(current, now)) return current.accessToken;
+    let renewed;
+    try {
+      renewed = await refreshClaudeSubscriptionCredential(current, now);
+    } catch {
+      // The provider error can carry token material, so it is never surfaced.
+      throw claudeReconnectRequired();
+    }
+    await secretService(tx).rotate(
+      ref.secretId,
+      { value: serializeClaudeSubscriptionCredential(renewed) },
+      { userId: grant.subjectUserId },
+    );
+    return renewed.accessToken;
+  });
 }
 
 // Blank values intentionally override inherited credentials in CLI child environments.
@@ -251,7 +312,11 @@ export async function prepareManagedAiRuntime(
       throw unprocessable(
         "The selected default changed. Retry this execution.",
       );
-    const value = await service.credential(selection);
+    const value =
+      input.binding.provider === "anthropic" &&
+      selection.attribution.method === "subscription"
+        ? await renewClaudeSubscriptionAccessToken(db, input.companyId, selection)
+        : await service.credential(selection);
     home = await mkdtemp(
       path.join(
         os.tmpdir(),
