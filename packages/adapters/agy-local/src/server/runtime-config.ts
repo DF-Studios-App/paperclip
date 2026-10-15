@@ -464,6 +464,19 @@ export async function prepareAgyRuntimeMcpConfig(
   await validate();
   const releaseLock = await acquireLock(lockPath, validate, signal);
   let gitExcludeCleanup: () => Promise<void> = async () => {};
+  const cleanupResources = async (errors: unknown[]) => {
+    for (const cleanup of [
+      () => restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate }),
+      () => gitExcludeCleanup(),
+      () => releaseLock(),
+    ]) {
+      try {
+        await cleanup();
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+      }
+    }
+  };
   try {
     const gitExcludes = await ensurePrivateGitPaths({ cwd, agentsDir, configPath, lockPath, recoveryPath, environment });
     gitExcludeCleanup = gitExcludes.cleanup;
@@ -515,24 +528,19 @@ export async function prepareAgyRuntimeMcpConfig(
       serverNames: names,
       environment: gitExcludes.environment,
       cleanup: async () => {
-        try {
-          await restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate });
-        } finally {
-          await gitExcludeCleanup();
-          await releaseLock();
+        const cleanupErrors: unknown[] = [];
+        await cleanupResources(cleanupErrors);
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(cleanupErrors, "AGY runtime cleanup was incomplete.");
         }
       },
     };
   } catch (error) {
-    let recoveryError: unknown;
-    try {
-      await restoreRecoveryJournal({ agentsDir, configPath, recoveryPath, validate });
-    } catch (caught) {
-      recoveryError = caught;
+    const cleanupErrors: unknown[] = [error];
+    await cleanupResources(cleanupErrors);
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "AGY MCP config setup failed and cleanup was incomplete.");
     }
-    await gitExcludeCleanup();
-    await releaseLock();
-    if (recoveryError) throw new AggregateError([error, recoveryError], "AGY MCP config setup failed and recovery is still required.");
     throw error;
   }
 }
