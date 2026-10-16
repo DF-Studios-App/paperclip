@@ -314,6 +314,13 @@ describe("agy_local cli formatter", () => {
 });
 
 describe("agy_local models catalog", () => {
+  it("includes Gemini 4 Argon model IDs", () => {
+    const modelIds = models.map((m) => m.id);
+    expect(modelIds).toContain("gemini-4-argon-high");
+    expect(modelIds).toContain("gemini-4-argon-medium");
+    expect(modelIds).toContain("gemini-4-argon-low");
+  });
+
   it("includes canonical model IDs such as gemini-3.8-flash-high", () => {
     const modelIds = models.map((m) => m.id);
     expect(modelIds).toContain("auto");

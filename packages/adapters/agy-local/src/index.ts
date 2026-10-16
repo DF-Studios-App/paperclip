@@ -9,6 +9,9 @@ export const DEFAULT_ANTIGRAVITY_LOCAL_MODEL = DEFAULT_AGY_LOCAL_MODEL;
 
 export const models = [
   { id: DEFAULT_AGY_LOCAL_MODEL, label: "Auto" },
+  { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+  { id: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)" },
+  { id: "gemini-4-argon-low", label: "Gemini 4 Argon (Low)" },
   { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
   { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)" },
   { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)" },
@@ -32,7 +35,7 @@ Adapter: agy_local
 Use when:
 - You want Paperclip to run the Antigravity CLI (\`agy\`) locally on the host machine using its authenticated local account.
 - You want Antigravity CLI chat sessions resumed across heartbeats with \`--conversation\`.
-- You want to run canonical model IDs such as \`gemini-3.8-flash-high\`, \`gemini-3.8-flash-medium\`, or \`gemini-3.1-pro-high\` backed by local AGY authentication.
+- You want to run canonical model IDs such as \`gemini-4-argon-high\`, \`gemini-3.8-flash-high\`, \`gemini-3.8-flash-medium\`, or \`gemini-3.1-pro-high\` backed by local AGY authentication.
 - You want Paperclip skills injected locally without polluting the workspace git repository.
 
 Don't use when:
@@ -45,7 +48,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible).
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file (e.g. AGENTS.md) prepended to the run prompt.
 - promptTemplate (string, optional): run prompt template.
-- model (string, optional): canonical CLI model ID (e.g. \`gemini-3.8-flash-high\`, \`gemini-3.8-flash-medium\`, \`gemini-3.8-flash-low\`, \`gemini-3.7-flash-high\`, \`gemini-3.1-pro-high\`, \`claude-sonnet-4-6\`). Defaults to \`auto\` (lets \`agy\` use its default model). Custom model IDs are also supported.
+- model (string, optional): canonical CLI model ID (e.g. \`gemini-4-argon-high\`, \`gemini-3.8-flash-high\`, \`gemini-3.8-flash-medium\`, \`gemini-3.8-flash-low\`, \`gemini-3.7-flash-high\`, \`gemini-3.1-pro-high\`, \`claude-sonnet-4-6\`). Defaults to \`auto\` (lets \`agy\` use its default model). Custom model IDs are also supported.
 - dangerouslySkipPermissions (boolean, optional): pass \`--dangerously-skip-permissions\` to auto-approve AGY tool actions. Defaults to false; enable only when unattended tool execution is intended.
 - sandbox (boolean, optional): run in sandbox mode (default: true, passes \`--sandbox\`).
 - command (string, optional): CLI command override, defaults to "agy".
