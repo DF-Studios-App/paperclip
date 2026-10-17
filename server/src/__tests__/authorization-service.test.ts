@@ -1749,6 +1749,26 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows manager agents to wake agents in their reporting subtree only", async () => {
+    const company = await createCompany(db, "ManagerWake");
+    const lead = await createAgent(db, company.id);
+    const report = await createAgent(db, company.id, { reportsTo: lead.id });
+    const grandReport = await createAgent(db, company.id, { reportsTo: report.id });
+    const peer = await createAgent(db, company.id);
+    const auth = authorizationService(db);
+    const wake = (actorAgentId: string, targetAgentId: string) => auth.decide({
+      actor: { type: "agent", agentId: actorAgentId, companyId: company.id },
+      action: "agent:wake",
+      resource: { type: "agent", companyId: company.id, agentId: targetAgentId },
+    });
+
+    expect(await wake(lead.id, report.id)).toMatchObject({ allowed: true, reason: "allow_manager_chain" });
+    expect(await wake(lead.id, grandReport.id)).toMatchObject({ allowed: true, reason: "allow_manager_chain" });
+    expect(await wake(report.id, lead.id)).toMatchObject({ allowed: false });
+    expect(await wake(lead.id, peer.id)).toMatchObject({ allowed: false });
+    expect(await wake(peer.id, report.id)).toMatchObject({ allowed: false });
+  });
+
   it.each(["session", "cloud_tenant"] as const)("allows %s operators to start agents, without granting hiring rights", async (source) => {
     const company = await createCompany(db, "wake");
     const agent = await createAgent(db, company.id);

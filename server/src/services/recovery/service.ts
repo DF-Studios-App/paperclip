@@ -862,7 +862,8 @@ function isOperatorCancelledRun(
   const result = parseObject(latestRun.resultJson);
   return (
     result.cancelledByActorType === "user" ||
-    result.cancelledByActorType === "board"
+    result.cancelledByActorType === "board" ||
+    (result.cancelledByActorType === "agent" && typeof result.cancelledByAgentId === "string")
   );
 }
 
