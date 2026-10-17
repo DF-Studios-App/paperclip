@@ -2185,6 +2185,22 @@ export function authorizationService(db: Db | DbTransaction) {
       });
     }
 
+    // Managers can wake (and, via the run-cancel route, stop) agents in their
+    // reporting subtree so a lead can restart stuck work without the board.
+    if (
+      input.action === "agent:wake" &&
+      input.resource.type === "agent" &&
+      input.resource.agentId &&
+      isSimpleAssignableAgentStatus(actorAgent.status) &&
+      await isManagerOf(companyId, actorAgentId, input.resource.agentId)
+    ) {
+      return allow({
+        action: input.action,
+        reason: "allow_manager_chain",
+        explanation: "Allowed because the actor manages the target agent in the reporting chain.",
+      });
+    }
+
     if (input.action === "tasks:assign") {
       if (!isSimpleAssignableAgentStatus(actorAgent.status)) {
         return deny({

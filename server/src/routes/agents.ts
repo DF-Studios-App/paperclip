@@ -1790,6 +1790,23 @@ export function agentRoutes(
     if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  // Agents may always wake themselves; waking another agent goes through the
+  // `agent:wake` decision, which allows managers over their reporting subtree.
+  async function assertAgentCanWakeAgent(req: Request, agent: { id: string; companyId: string }) {
+    if (req.actor.type !== "agent") throw forbidden("Agent access required");
+    if (req.actor.agentId === agent.id) return;
+    const decision = await access.decide({
+      actor: req.actor, action: "agent:wake",
+      resource: { type: "agent", companyId: agent.companyId, agentId: agent.id },
+    });
+    if (!decision.allowed) {
+      throw forbidden(
+        "Agent can only invoke itself or agents in its reporting chain",
+        authorizationDeniedDetails(decision),
+      );
+    }
+  }
+
   // The single owner-authorization helper for the three adapter login routes. It
   // requires a board actor, company access, and the same configuration
   // permission as the adapter Test route (`agents:create`). It returns the
@@ -5970,10 +5987,7 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
-        return;
-      }
+      await assertAgentCanWakeAgent(req, agent);
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
@@ -6221,10 +6235,7 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
-        return;
-      }
+      await assertAgentCanWakeAgent(req, agent);
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
@@ -7015,25 +7026,41 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") assertBoard(req);
     const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    // Stamp the cancellation as operator-initiated (this route is board-only).
-    // Recovery reads this to stand down instead of classifying the cancelled
-    // run as agent stranding and re-waking the agent the operator just stopped.
-    const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-      resultJson: {
-        cancelledByActorType: "user",
-        cancelledByUserId: req.actor.userId ?? null,
+    // Agents may cancel runs of agents they manage (never their own run): the
+    // lead restarting stuck subordinate work is the intended use.
+    const managerAgentId = req.actor.type === "agent" ? req.actor.agentId ?? null : null;
+    if (req.actor.type === "agent") {
+      if (!managerAgentId || existing.agentId === managerAgentId) {
+        throw forbidden("Agent can only cancel runs of agents in its reporting chain");
+      }
+      await assertAgentCanWakeAgent(req, { id: existing.agentId, companyId: existing.companyId });
+    }
+    // Stamp the cancellation as operator-initiated. Recovery reads this to
+    // stand down instead of classifying the cancelled run as agent stranding
+    // and re-waking the agent the operator (or its manager) just stopped.
+    const run = await heartbeat.cancelRun(
+      runId,
+      managerAgentId ? "Cancelled by a manager agent" : "Cancelled by a board operator",
+      {
+        resultJson: managerAgentId
+          ? { cancelledByActorType: "agent", cancelledByAgentId: managerAgentId }
+          : { cancelledByActorType: "user", cancelledByUserId: req.actor.userId ?? null },
       },
-    });
+    );
 
     if (run) {
+      const actor = getActorInfo(req);
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,

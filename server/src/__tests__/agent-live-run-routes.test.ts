@@ -17,6 +17,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  cancelRun: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -459,7 +460,7 @@ describe("agent live run routes", () => {
     it("keeps board and instance-admin checks ahead of malformed-ID validation", async () => {
       const app = await createApp({}, { type: "agent", companyId: "company-1", agentId: routeAgentId });
       for (const [method, suffix] of routes.filter(([, suffix]) =>
-        suffix === "/cancel" || suffix === "/runtime-requests/approval-1/resolve" || suffix.startsWith("/provider-trace"),
+        suffix === "/runtime-requests/approval-1/resolve" || suffix.startsWith("/provider-trace"),
       )) {
         const response = await requestApp(app, (url) =>
           request(url)[method](`/api/heartbeat-runs/undefined${suffix}`).send({}),
@@ -964,6 +965,68 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(202);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "agent:wake" }));
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId, expect.objectContaining({ manualUserWake: true }));
+  });
+
+  describe("manager agent run control", () => {
+    const managerAgentId = "55555555-5555-4555-8555-555555555555";
+    const runId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const managerActor = { type: "agent", companyId: "company-1", agentId: managerAgentId };
+
+    it.each(["wakeup", "heartbeat/invoke"])("lets a manager agent wake a report via %s", async (endpoint) => {
+      const res = await requestApp(await createApp(undefined, managerActor), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/${endpoint}`).send({}),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent:wake",
+        resource: expect.objectContaining({ type: "agent", agentId: "agent-1" }),
+      }));
+    });
+
+    it("rejects an agent waking an agent outside its reporting chain", async () => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false, action: "agent:wake", reason: "deny_missing_grant", explanation: "No mapping",
+      });
+      const res = await requestApp(await createApp(undefined, managerActor), (url) =>
+        request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({}),
+      );
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("reporting chain");
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("lets a manager agent cancel a report's run and stamps the agent as canceller", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({ id: runId, companyId: "company-1", agentId: routeAgentId });
+      mockHeartbeatService.cancelRun.mockResolvedValue({ id: runId, companyId: "company-1", agentId: routeAgentId });
+      const res = await requestApp(await createApp(undefined, managerActor), (url) =>
+        request(url).post(`/api/heartbeat-runs/${runId}/cancel`).send({}),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(runId, "Cancelled by a manager agent", {
+        resultJson: { cancelledByActorType: "agent", cancelledByAgentId: managerAgentId },
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "heartbeat.cancelled", actorType: "agent", actorId: managerAgentId,
+      }));
+    });
+
+    it("rejects an agent cancelling its own run or a non-report's run", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({ id: runId, companyId: "company-1", agentId: managerAgentId });
+      const own = await requestApp(await createApp(undefined, managerActor), (url) =>
+        request(url).post(`/api/heartbeat-runs/${runId}/cancel`).send({}),
+      );
+      expect(own.status).toBe(403);
+
+      mockHeartbeatService.getRun.mockResolvedValue({ id: runId, companyId: "company-1", agentId: routeAgentId });
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false, action: "agent:wake", reason: "deny_missing_grant", explanation: "No mapping",
+      });
+      const peer = await requestApp(await createApp(undefined, managerActor), (url) =>
+        request(url).post(`/api/heartbeat-runs/${runId}/cancel`).send({}),
+      );
+      expect(peer.status).toBe(403);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
   });
 
   describe("exact failed chat run retry", () => {
