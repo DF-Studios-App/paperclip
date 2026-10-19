@@ -1,2 +1,5 @@
-* text=auto eol=lf
 patches/*.patch whitespace=-space-before-tab text eol=lf
+# The Runner build checks generated files, the acpx patch hash and the skill
+# inventory byte for byte, so keep those inputs LF on Windows checkouts.
+packages/paperclip-runner/** text=auto eol=lf
+skills/** text=auto eol=lf
