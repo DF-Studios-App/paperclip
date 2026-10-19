@@ -454,6 +454,17 @@ impl VerifiedProcessLaunch {
         }
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn spawn_stdio(
+        &self,
+        _environment: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Child, LocalRunnerError> {
+        Err(LocalRunnerError::invalid(
+            "verified stdio MCP servers are supported only on Linux and macOS",
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn spawn_stdio(
         &self,
         environment: &std::collections::BTreeMap<String, String>,
