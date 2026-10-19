@@ -1,7 +1,7 @@
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { readClaudeToken, readIsolatedClaudeKeychainToken, fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
+import { readIsolatedClaudeKeychainToken } from "@paperclipai/adapter-claude-local/server";
 import { readCodexAuthInfo, fetchCodexQuota } from "@paperclipai/adapter-codex-local/server";
 import { parseGrokAuthPayload, hasUsableGrokAuthValue } from "@paperclipai/adapter-grok-local/server";
 import type { AiProvider } from "@paperclipai/shared";
@@ -13,9 +13,9 @@ import {
 } from "./claude-subscription-credential.js";
 
 /**
- * Read an owned login home, or an explicitly authorized local-operator import.
- * `storable` returns the Claude record with its refresh token, so the caller can
- * save a connection that Paperclip can renew.
+ * Read and verify a connection-specific login home. `storable` returns the
+ * Claude record with its refresh token, so the caller can save a connection
+ * that Paperclip can renew.
  */
 export async function readVerifiedLocalAiCredential(
   provider: AiProvider,
@@ -23,36 +23,35 @@ export async function readVerifiedLocalAiCredential(
   options: { storable?: boolean } = {},
 ): Promise<string> {
   if (provider === "openrouter") throw unprocessable("OpenRouter requires an API key.");
-  if ((provider === "openai" || provider === "xai") && !loginHome)
-    throw unprocessable("Start a separate local sign-in for this connection before connecting.");
+  if (!loginHome) throw unprocessable(provider === "xai"
+    ? "Start local sign-in for this connection before connecting."
+    : "Start browser sign-in for this connection before connecting.");
   try {
     if (provider === "anthropic") {
       // Never change process.env or fall back to the server account when an
       // authenticated user's isolated login is missing or invalid.
       let record: ClaudeSubscriptionCredential | null = null;
-      if (loginHome) {
-        for (const name of [".credentials.json", "credentials.json"]) {
-          const raw = await readLocalAiCredentialFile(path.join(loginHome, name)).catch(() => null);
-          if (!raw) continue;
-          let parsed;
-          try { parsed = JSON.parse(raw); } catch { continue; }
-          const value = parsed?.claudeAiOauth?.accessToken;
-          if (typeof value === "string" && value.length) { record = parseClaudeSubscriptionCredential(raw); break; }
-        }
-        // On macOS the CLI stores the isolated login in the auth home's own
-        // suffixed Keychain item rather than a credentials file. The helper
-        // never consults the unsuffixed operator item.
-        if (!record) {
-          const token = await readIsolatedClaudeKeychainToken(loginHome);
-          if (token) record = { accessToken: token };
-        }
-      } else {
-        const token = await readClaudeToken({ allowKeychain: true });
+      for (const name of [".credentials.json", "credentials.json"]) {
+        const raw = await readLocalAiCredentialFile(path.join(loginHome, name)).catch(() => null);
+        if (!raw) continue;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { continue; }
+        const value = parsed?.claudeAiOauth?.accessToken;
+        if (typeof value === "string" && value.length) { record = parseClaudeSubscriptionCredential(raw); break; }
+      }
+      // On macOS the CLI stores the isolated login in the auth home's own
+      // suffixed Keychain item rather than a credentials file. The helper
+      // never consults the unsuffixed operator item.
+      if (!record) {
+        const token = await readIsolatedClaudeKeychainToken(loginHome);
         if (token) record = { accessToken: token };
       }
       if (!record) throw new Error("Missing login");
-      await fetchClaudeQuota(record.accessToken);
-      // Keychain and host imports carry no refresh token, so they stay plain tokens.
+      // Claude's setup-token OAuth flow requests user:inference. The usage API
+      // requires user:profile and returns 403 for that valid token, so it cannot
+      // serve as a sign-in check. This isolated credential is written only after
+      // the provider CLI completes the code exchange successfully.
+      // Keychain imports carry no refresh token, so they stay plain tokens.
       if (options.storable && record.refreshToken) return serializeClaudeSubscriptionCredential(record);
       return record.accessToken;
     }
@@ -74,8 +73,8 @@ export async function readVerifiedLocalAiCredential(
     return raw;
   } catch {
     // Provider/CLI errors may contain credential material; never return them.
-    throw unprocessable(provider === "anthropic" && !loginHome
-      ? "Could not verify the local subscription. Run claude auth login in a terminal on the machine running Paperclip, then try Connect again."
-      : "Could not verify the local subscription. Run the sign-in command shown for this connection, finish signing in, then try Connect again.");
+    throw unprocessable(provider === "xai"
+      ? "Could not verify the local subscription. Run the sign-in command shown for this connection, finish signing in, then try Connect again."
+      : "Could not verify the local subscription. Finish browser sign-in for this connection, then try Connect again.");
   }
 }

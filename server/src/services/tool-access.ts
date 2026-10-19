@@ -1,4 +1,20 @@
+import { stableHash, descriptorHash } from "./tool-catalog-hash.js";
+import { assertProfileEntryInputs, assertProfileEntryShape } from "./tool-profile-entry-validation.js";
+import { DAYTONA_TOOLS, daytonaClient, daytonaRisk, isDaytonaConnection, isDaytonaToolName } from "./daytona.js";
+import { chatCredentialMutationLease } from "./chat-credential-mutation-lease.js";
+import { notifyChatEndpointWork } from "./chat-work-notifications.js";
+import { removeSlackRegistration } from "./chat-slack-registration-cleanup.js";
+import { chatEndpoints } from "@paperclipai/db";
+import { AGGREGATOR_NAMES, isAppAggregator, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "@paperclipai/shared/aggregator-apps";
+import { resolveAggregatorApp, type AppCatalogAggregator } from "@paperclipai/shared/aggregator-app-catalog";
+import { AggregatorDiscoveryUnavailableError, discoverArcadeApps, discoverExecutorApps, type DiscoveredApp } from "./aggregator-app-discovery.js";
+import { COMPOSIO_APP_TOOLKITS, findComposioCatalogApp } from "@paperclipai/shared/aggregator-app-catalog";
+import type { ComposioAppAccount, ComposioAppAccountInput, ComposioAppSetupInput, ComposioAppSetupResult, ComposioAppSnapshot, ComposioAppsResponse } from "@paperclipai/shared";
+import { composioAppAccounts, composioAppSetupResult } from "./composio-app-setup.js";
+import { honchoManagedArguments } from "./honcho-connection.js";
+import { defaultConnectionAgentInstructions } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
+import { mcpDiscoveryHttpFailure, retainMcpConnectionFailure, withMcpConnectionFailure } from "./mcp-connection-failure.js";
 import { ASANA_CONNECTOR_SCOPES, isAsanaConnectorProfileId, type AsanaConnectorProfileId } from "@paperclipai/shared";
 import { BROWSER_USE_TOOLS } from "@paperclipai/shared";
 import { browserUseClient, isBrowserUseConnection } from "./browser-use-client.js";
@@ -58,6 +74,8 @@ import {
   toolActionRequests,
   toolCatalogEntries,
   toolConnectionInstalls,
+  toolConnectionAppSnapshots,
+  toolConnectionAppSyncs,
   toolConnections,
   toolOauthStates,
   toolStdioCommandTemplates,
@@ -238,6 +256,7 @@ import {
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
 import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription, googleChatToolInputSchema } from "./google-chat-tool-policy.js";
+import { gmailArchiveToolDescription, gmailArchiveToolInputSchema } from "./gmail-archive-tool-policy.js";
 import {
   recordToolRuntimeAuditWriteFailure,
   TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC,
@@ -278,6 +297,7 @@ type ActorInfo = {
     | "board_key"
     | "agent_key"
     | "agent_jwt"
+    | "mcp_oauth"
     | "cloud_tenant";
 };
 
@@ -495,6 +515,8 @@ export function oauthClientIdMetadataDocument(input: {
 type OAuthProviderEndpoints = {
   provider: string;
   scopes: string[];
+  /** Refresh permission belongs to authorization-server metadata, not MCP tool scopes. */
+  offlineAccessSupported?: boolean;
   authorizationUrl: string;
   tokenUrl: string;
   registrationUrl?: string | null;
@@ -655,6 +677,8 @@ type ToolAccessServiceOptions = {
   remoteHttpEndpointLookup?: RemoteHttpEndpointLookup;
   /** Test seam for protocol fixtures. Production uses the DNS-pinned transport. */
   remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
+  /** Smaller reviewed catalog for deterministic discovery fixtures. */
+  composioAppToolkits?: readonly string[];
   /** Test seam for the centrally registered Gmail OAuth broker. */
   paperclipCloudConnector?: PaperclipCloudConnector | null;
   /** @deprecated Use paperclipCloudConnector. */
@@ -1196,10 +1220,14 @@ export function projectedConnectionHeaders(
   const headers: Record<string, string> = {};
   if (app) {
     const method = connectionMethodForConnection(app, connection);
-    Object.assign(headers, normalizeConnectionMethodConfig(
-      method,
-      asRecord(connection.config.methodConfig),
-    ).headers);
+    // Non-transport settings do not participate in header projection. In
+    // particular, legacy connections can lack a newly introduced setting.
+    if ([...(method.tenantFields ?? []), ...(method.extensionFields ?? [])].some((field) => field.transport?.location === "header")) {
+      Object.assign(headers, normalizeConnectionMethodConfig(
+        method,
+        asRecord(connection.config.methodConfig),
+      ).headers);
+    }
   }
   if (
     connection.transport === "mcp_remote" &&
@@ -1292,7 +1320,10 @@ export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
   toolName: string,
+  inputSchema: Record<string, unknown> = {},
 ): Record<string, unknown> {
+  const managed = honchoManagedArguments(connection, inputSchema);
+  if (managed) parameters = mergeManagedToolArguments(asRecord(parameters), managed);
   assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
@@ -1313,7 +1344,10 @@ export function projectedConnectionToolInputSchema(
   inputSchema: Record<string, unknown>,
   toolName: string,
 ): Record<string, unknown> {
+  const managed = honchoManagedArguments(connection, inputSchema);
+  if (managed) inputSchema = stripManagedToolArgumentSchema(inputSchema, managed);
   inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
+  inputSchema = gmailArchiveToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1611,6 +1645,7 @@ function toConnection(row: typeof toolConnections.$inferSelect): ToolConnection 
     credentialPolicy: row.credentialPolicy,
     status: row.status,
     enabled: row.enabled && !retired,
+    agentInstructions: row.agentInstructions ?? null,
     config: row.config ?? {},
     transportConfig: row.transportConfig ?? {},
     credentialRefs: row.credentialRefs ?? [],
@@ -1707,7 +1742,11 @@ function toCatalogEntryForConnection(
       rawCatalogEntry.inputSchema ?? {},
       row.toolName,
     ),
-    description: googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
+    description: gmailArchiveToolDescription(
+      connection,
+      row.toolName,
+      googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
+    ),
   };
   if (
     connection.transport === "local_stdio" &&
@@ -2030,9 +2069,30 @@ function toPolicy(row: typeof toolPolicies.$inferSelect): ToolPolicy {
   };
 }
 
+// Profile summaries and new-tool counts never read schemas, annotations, or
+// provider metadata. Keep those large fields out of these repeated reads.
+const profileCatalogColumns = {
+  id: toolCatalogEntries.id,
+  applicationId: toolCatalogEntries.applicationId,
+  connectionId: toolCatalogEntries.connectionId,
+  toolName: toolCatalogEntries.toolName,
+  riskLevel: toolCatalogEntries.riskLevel,
+  status: toolCatalogEntries.status,
+  firstSeenAt: toolCatalogEntries.firstSeenAt,
+};
+const profileReviewCatalogColumns = {
+  ...profileCatalogColumns,
+  title: toolCatalogEntries.title,
+  description: toolCatalogEntries.description,
+};
+type ProfileCatalogEntry = Pick<typeof toolCatalogEntries.$inferSelect, keyof typeof profileCatalogColumns>
+  & Partial<Pick<typeof toolCatalogEntries.$inferSelect, "title" | "description">>;
+type ProfileApplication = Pick<typeof toolApplications.$inferSelect, "id" | "name">;
+type ProfileConnection = Pick<typeof toolConnections.$inferSelect, "id" | "name">;
+
 function profileEntryMatchesCatalog(
   entry: typeof toolProfileEntries.$inferSelect,
-  catalogEntry: typeof toolCatalogEntries.$inferSelect,
+  catalogEntry: ProfileCatalogEntry,
 ): boolean {
   if (entry.selectorType === "application")
     return entry.applicationId === catalogEntry.applicationId;
@@ -2051,7 +2111,7 @@ function summarizeProfile(input: {
   profile: typeof toolProfiles.$inferSelect;
   entries: Array<typeof toolProfileEntries.$inferSelect>;
   bindings: Array<typeof toolProfileBindings.$inferSelect>;
-  catalog: Array<typeof toolCatalogEntries.$inferSelect>;
+  catalog: ProfileCatalogEntry[];
   agentIds: string[];
 }): ToolProfileSummary {
   const includes = input.entries.filter((entry) => entry.effect === "include");
@@ -2111,8 +2171,8 @@ function summarizeProfile(input: {
 
 function profileCoversCatalogScope(input: {
   entry: typeof toolProfileEntries.$inferSelect;
-  catalogEntry: typeof toolCatalogEntries.$inferSelect;
-  catalogById: Map<string, typeof toolCatalogEntries.$inferSelect>;
+  catalogEntry: ProfileCatalogEntry;
+  catalogById: Map<string, ProfileCatalogEntry>;
 }): boolean {
   if (input.entry.effect !== "include") return false;
   if (input.entry.selectorType === "application")
@@ -2136,9 +2196,9 @@ function profileCoversCatalogScope(input: {
 function pendingNewToolsForProfile(input: {
   profile: typeof toolProfiles.$inferSelect;
   entries: Array<typeof toolProfileEntries.$inferSelect>;
-  catalog: Array<typeof toolCatalogEntries.$inferSelect>;
-  applicationsById?: Map<string, typeof toolApplications.$inferSelect>;
-  connectionsById?: Map<string, typeof toolConnections.$inferSelect>;
+  catalog: ProfileCatalogEntry[];
+  applicationsById?: Map<string, ProfileApplication>;
+  connectionsById?: Map<string, ProfileConnection>;
 }): ToolProfileNewToolReviewItem[] {
   if (
     input.profile.status !== "active" ||
@@ -2185,8 +2245,8 @@ function pendingNewToolsForProfile(input: {
       connectionName:
         input.connectionsById?.get(catalogEntry.connectionId)?.name ?? null,
       toolName: catalogEntry.toolName,
-      title: catalogEntry.title,
-      description: catalogEntry.description,
+      title: catalogEntry.title ?? null,
+      description: catalogEntry.description ?? null,
       capability: catalogEntry.riskLevel,
       riskLevel: catalogEntry.riskLevel,
       addedAt: catalogEntry.firstSeenAt,
@@ -2198,10 +2258,10 @@ function buildProfileDetails(input: {
   profile: typeof toolProfiles.$inferSelect;
   entries: Array<typeof toolProfileEntries.$inferSelect>;
   bindings: Array<typeof toolProfileBindings.$inferSelect>;
-  catalog: Array<typeof toolCatalogEntries.$inferSelect>;
+  catalog: ProfileCatalogEntry[];
   agentIds: string[];
-  applicationsById?: Map<string, typeof toolApplications.$inferSelect>;
-  connectionsById?: Map<string, typeof toolConnections.$inferSelect>;
+  applicationsById?: Map<string, ProfileApplication>;
+  connectionsById?: Map<string, ProfileConnection>;
 }): ToolProfileWithDetails {
   const pendingNewTools = pendingNewToolsForProfile({
     profile: input.profile,
@@ -2219,11 +2279,6 @@ function buildProfileDetails(input: {
   };
 }
 
-function stableHash(value: unknown): string {
-  return createHash("sha256")
-    .update(JSON.stringify(value, Object.keys(flattenKeys(value)).sort()))
-    .digest("hex");
-}
 
 function connectionSetupMutationFingerprint(
   row: typeof toolConnections.$inferSelect,
@@ -2233,6 +2288,7 @@ function connectionSetupMutationFingerprint(
     transport: row.transport,
     status: row.status,
     enabled: row.enabled,
+    agentInstructions: row.agentInstructions,
     config: row.config,
     transportConfig: row.transportConfig,
     credentialRefs: row.credentialRefs,
@@ -2243,20 +2299,6 @@ function connectionSetupMutationFingerprint(
   });
 }
 
-function flattenKeys(
-  value: unknown,
-  keys: Record<string, true> = {},
-): Record<string, true> {
-  if (value && typeof value === "object") {
-    for (const [key, nested] of Object.entries(
-      value as Record<string, unknown>,
-    )) {
-      keys[key] = true;
-      flattenKeys(nested, keys);
-    }
-  }
-  return keys;
-}
 
 function normalizeToolDescriptor(tool: unknown): McpToolDescriptor | null {
   const record = asRecord(tool);
@@ -2364,6 +2406,7 @@ export function classifyRisk(
   if (sourceTemplateKey === "browser-use-cloud") {
     return BROWSER_USE_TOOLS.find(t => t.name === tool.name)?.annotations.readOnlyHint ? "read" : "destructive";
   }
+  if (sourceTemplateKey === "daytona") return daytonaRisk(tool.name);
   if (sourceTemplateKey === "railway") {
     const reviewed = railwayRisk(normalizedToolName);
     return reviewed === "read" && (annotations.readOnlyHint === false || annotations.writeHint === true) ? "write" : reviewed;
@@ -2373,8 +2416,26 @@ export function classifyRisk(
   if (sourceTemplateKey === "fireflies" && [
     "fireflies-share-meeting", "fireflies-revoke-meeting-access", "fireflies-move-meeting",
   ].includes(normalizedToolName)) return "write";
+  // Enterpret's run_graph_query self-reports readOnlyHint: true, but Cypher is
+  // not a read-only language and live validation never established the tool as
+  // safe. Treat it as write so Ask-first defaults can restrict it.
+  if (sourceTemplateKey === "enterpret" && normalizedToolName === "run-graph-query")
+    return "write";
+  // Gmail archive removes a system label. Keep it behind the archive method's
+  // destructive Ask-first default even when the preview provider omits hints.
+  if (sourceTemplateKey === "gmail" && normalizedToolName === "unlabel-thread")
+    return "destructive";
   if (sourceTemplateKey === "posthog" && normalizedToolName === "exec")
     return "destructive";
+  // Superagent mirrors its REST API, and several mutations use verbs the
+  // generic classifier reads as reads: billable triage_finding, scans,
+  // restore_agent_builtin_rule, and credential-revoking revoke_agent_client.
+  // Only list/get tools and tools the provider marks read-only are reads.
+  if (sourceTemplateKey === "superagent") {
+    if (verbMatches(tool.name, "delete|remove|destroy|revoke")) return "destructive";
+    if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+    return /^(list|get)-/.test(normalizedToolName) || annotations.readOnlyHint === true ? "read" : "write";
+  }
   if (
     sourceTemplateKey === "shopify" &&
     SHOPIFY_DESTRUCTIVE_TOOLS.has(normalizedToolName)
@@ -2415,6 +2476,7 @@ export function classifyRisk(
 export function isGmailToolPermanentlyBlocked(
   tool: McpToolDescriptor,
 ): boolean {
+  if (googleWorkspaceToolLeafName(tool.name) === "unlabel-thread") return false;
   const riskLevel = classifyRisk(tool, "gmail");
   return (
     verbMatches(
@@ -2519,6 +2581,12 @@ function managedConnectorProfile(value: string | undefined): {
   return null;
 }
 
+function gitHubRepositoryOwnerType(repository: Record<string, unknown>) {
+  const type = recordValue(repository.owner) ? repository.owner.type : undefined;
+  return type === "Organization" ? "organization" as const
+    : type === "User" ? "personal" as const : undefined;
+}
+
 export async function loadGitHubTokenRepositories(
   headers: Record<string, string>,
   request: typeof fetch = fetch,
@@ -2526,6 +2594,7 @@ export async function loadGitHubTokenRepositories(
   const repositories: Array<{
     id: string;
     fullName: string;
+    ownerType?: "personal" | "organization";
     private?: boolean;
   }> = [];
   for (let page = 1; ; page += 1) {
@@ -2562,6 +2631,7 @@ export async function loadGitHubTokenRepositories(
       repositories.push({
         id: githubId(row.id)!,
         fullName: row.full_name,
+        ...(gitHubRepositoryOwnerType(row) ? { ownerType: gitHubRepositoryOwnerType(row) } : {}),
         ...(typeof row.private === "boolean" ? { private: row.private } : {}),
       });
     }
@@ -2588,6 +2658,7 @@ export async function loadGitHubGrantMetadata(
     id: string;
     fullName: string;
     installationId: string;
+    ownerType?: "personal" | "organization";
     private?: boolean;
   }>;
   installationUrl: string;
@@ -2669,7 +2740,7 @@ export async function loadGitHubGrantMetadata(
   const managementUrls = new Set<string>();
   const repositories = new Map<
     string,
-    { id: string; fullName: string; installationId: string; private?: boolean }
+    { id: string; fullName: string; installationId: string; ownerType?: "personal" | "organization"; private?: boolean }
   >();
   for (const installation of installations) {
     const installationId = githubId(installation.id);
@@ -2719,6 +2790,7 @@ export async function loadGitHubGrantMetadata(
         id,
         fullName,
         installationId,
+        ...(gitHubRepositoryOwnerType(repository) ? { ownerType: gitHubRepositoryOwnerType(repository) } : {}),
         ...(typeof repository.private === "boolean"
           ? { private: repository.private }
           : {}),
@@ -2800,19 +2872,6 @@ function recordValue(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function descriptorHash(
-  tool: McpToolDescriptor,
-  riskLevel: ToolRiskLevel,
-): string {
-  return stableHash({
-    name: tool.name,
-    title: tool.title ?? null,
-    description: tool.description ?? null,
-    inputSchema: tool.inputSchema ?? {},
-    annotations: tool.annotations ?? {},
-    riskLevel,
-  });
-}
 
 /**
  * Did this error come from the OAuth endpoint gate (PAP-17099)? Such a refusal
@@ -2842,6 +2901,7 @@ function healthFailureHttpStatus(failure: {
   if (failure.code === "oauth_challenge") return 422;
   if (failure.code === "oauth_refresh_missing") return 422;
   if (failure.code === "oauth_reauthorization_required") return 422;
+  if (failure.code === "oauth_insufficient_scope") return 422;
   if (failure.code === "slack_mcp_access_disabled") return 422;
   if (failure.code === "user_authorization_required") return 422;
   if (failure.code === "composio_broker_retired") return 422;
@@ -3026,11 +3086,45 @@ async function gitHubReadGrantAccess(db: Db, companyId: string, connectionId: st
   return { connection, allowed, legacyShared };
 }
 
+async function lockManagedAppPolicies(client: ToolAccessMutationDb, companyId: string, connectionId: string) {
+  await client.select({ id: toolPolicies.id }).from(toolPolicies).where(and(
+    eq(toolPolicies.companyId, companyId), eq(toolPolicies.policyType, "require_approval"),
+    sql`${toolPolicies.config}->>'source' = 'app_gallery_finish'`,
+    sql`${toolPolicies.config}->>'connectionId' = ${connectionId}`,
+  )).orderBy(toolPolicies.id).for("no key update");
+}
+
+async function lockToolAssignmentAgents(client: ToolAccessMutationDb, companyId: string, targets: ReadonlyArray<{ targetType: string; targetId: string }>) {
+  const allAgents = targets.some(target => target.targetType === "company" && target.targetId === companyId);
+  const ids = targets.filter(target => target.targetType === "agent").map(target => target.targetId);
+  if (!allAgents && !ids.length) return;
+  await client.select({ id: agents.id }).from(agents)
+    .where(and(eq(agents.companyId, companyId), sql`${agents.status} NOT IN ('pending_approval', 'terminated')`,
+      allAgents ? undefined : inArray(agents.id, ids)))
+    .orderBy(agents.id).for("no key update");
+}
+
+export async function lockToolConnectionRuntimeInputs(client: ToolAccessMutationDb, companyId: string, connectionId: string) {
+  await client.select({ id: toolApplications.id }).from(toolApplications)
+    .innerJoin(toolConnections, and(eq(toolConnections.applicationId, toolApplications.id), eq(toolConnections.companyId, toolApplications.companyId)))
+    .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId)))
+    .for("update", { of: toolApplications });
+  await client.select({ id: toolConnections.id }).from(toolConnections)
+    .where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId))).for("update");
+  await client.select({ id: toolProfiles.id }).from(toolProfiles)
+    .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${connectionId}`)))
+    .for("no key update");
+  await lockManagedAppPolicies(client, companyId, connectionId);
+}
+
 export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
 ) {
   const secrets = secretService(db);
+  const composioSyncJobs = new Map<string, Promise<void>>();
+  const composioSyncTtlMs = 5 * 60_000;
+  const composioSyncLeaseMs = 4 * 60_000;
 
   async function resolvedRemoteEndpoint(
     connection: typeof toolConnections.$inferSelect,
@@ -3618,13 +3712,367 @@ export function toolAccessService(
   function shouldQuarantineNewEntries(
     connection: typeof toolConnections.$inferSelect,
   ): boolean {
-    return asRecord(connection.config).quarantineNewEntries === true;
+    return isDaytonaConnection(connection) || asRecord(connection.config).quarantineNewEntries === true;
   }
 
   function isAttentionHealthStatus(
     status: ToolConnectionHealthStatus,
   ): boolean {
     return isToolConnectionAttentionHealth(status);
+  }
+
+  async function composioCredentialKey(connection: typeof toolConnections.$inferSelect, actor: ActorInfo) {
+    const usesConnectionRefs = ["arcade", "executor"].includes(String(connection.config.sourceTemplateKey)) && connection.authKind !== "oauth" && connection.credentialPolicy === "shared";
+    const grant = usesConnectionRefs ? null : await vaultGrantForConnection(connection, actor);
+    const refs = grant?.credentialSecretRefs ?? connection.credentialSecretRefs;
+    const discovery = asRecord(asRecord(connection.config.aggregatorDiscovery)[actor.actorId!]);
+    const ids = [...new Set([...refs.map(ref => ref.secretId), ...(typeof discovery.secretId === "string" ? [discovery.secretId] : [])])].sort();
+    const versions = ids.length ? await db.select({ id: companySecrets.id, version: companySecrets.latestVersion }).from(companySecrets)
+      .where(and(eq(companySecrets.companyId, connection.companyId), inArray(companySecrets.id, ids))).orderBy(asc(companySecrets.id)) : [];
+    return createHash("sha256").update(JSON.stringify({ grant: grant?.id, refs, versions,
+      ...(Object.keys(discovery).length ? { discovery } : {}),
+      ...(connection.config.sourceTemplateKey === "arcade" || connection.config.sourceTemplateKey === "executor"
+        ? { headers: projectedConnectionHeaders(connection), managementUrl: connection.config.managementUrl } : {}), endpoint: remoteEndpoint(connection.config), policy: connection.credentialPolicy, connectedAt: asRecord(connection.config.oauth)?.connectedAt })).digest("hex");
+  }
+
+  async function cachedComposioApps(connection: typeof toolConnections.$inferSelect, actor: ActorInfo): Promise<ComposioAppSnapshot[]> {
+    const credentialKey = await composioCredentialKey(connection, actor);
+    const rows = await db.select().from(toolConnectionAppSnapshots).where(and(
+      eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connection.id),
+      eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey),
+    ));
+    return rows.map(row => ({ connectionId: row.connectionId, toolkit: row.toolkit, status: row.status, accounts: row.accounts,
+      checkedAt: row.checkedAt.toISOString(), errorAt: row.errorAt?.toISOString() ?? null }));
+  }
+
+  async function composioAppsResponse(connection: typeof toolConnections.$inferSelect, actor: ActorInfo): Promise<ComposioAppsResponse> {
+    const credentialKey = await composioCredentialKey(connection, actor);
+    const [sync] = await db.select().from(toolConnectionAppSyncs).where(and(
+      eq(toolConnectionAppSyncs.companyId, connection.companyId), eq(toolConnectionAppSyncs.connectionId, connection.id),
+      eq(toolConnectionAppSyncs.userId, actor.actorId!), eq(toolConnectionAppSyncs.credentialKey, credentialKey),
+    ));
+    const interrupted = sync?.status === "syncing" && sync.updatedAt.getTime() < Date.now() - composioSyncLeaseMs;
+    return { apps: await cachedComposioApps(connection, actor), sync: {
+      status: interrupted || sync?.status === "unsupported" ? "error" : sync?.status ?? "idle", coverage: "supported_catalog",
+      checked: sync?.checked ?? 0, total: sync?.total ?? 0, failed: sync?.failed ?? 0,
+      lastCompletedAt: sync?.lastCompletedAt?.toISOString() ?? null,
+      error: interrupted ? "App checks were interrupted. Refresh to try again."
+        : (sync?.status === "error" || sync?.status === "unsupported") ? "Couldn’t finish checking Composio apps. Refresh to try again." : null,
+    } };
+  }
+
+  async function openComposioGateway(connectionId: string, actor: ActorInfo) {
+    const connection = await getConnectionRow(connectionId);
+    if (actor.actorType !== "user" || !actor.actorId) throw forbidden("A human connection manager must configure this app");
+    if (connection.config.sourceTemplateKey !== "composio" || connection.transport !== "mcp_remote"
+      || connection.status !== "active" || !connection.enabled) throw unprocessable("Connect your Composio gateway first");
+    const catalog = await db.select().from(toolCatalogEntries).where(and(
+      eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id),
+    ));
+    if (!catalog.some(tool => tool.toolName === "COMPOSIO_MANAGE_CONNECTIONS" && tool.status === "active")) {
+      throw unprocessable("Refresh your Composio gateway's actions before configuring this app");
+    }
+    const endpoint = await resolvedRemoteEndpoint(connection, actor);
+    const headers = { ...projectedConnectionHeaders(connection), ...(await resolveCredentialHeaders(connection, actor)) };
+    const credentialKey = await composioCredentialKey(await getConnectionRow(connectionId), actor);
+    const send = (init: RequestInit) => requestRemoteHttpEndpoint(new URL(endpoint), { ...init, signal: AbortSignal.timeout(30_000) });
+    let sessionHeaders = connection.config.mcpSessionRequired === true
+      ? await getMcpHttpSession({ send, headers, scope: `${connection.id}:app-setup:${actor.actorId}`, requestId: "paperclip-app-setup" }) : headers;
+    async function manage(toolkits: { name: string; action: "list" | "add" | "rename" | "remove"; account_id?: string; alias?: string }[], tolerateToolkitErrors = false) {
+      const checkedAt = new Date();
+      const id = `paperclip-app-setup-${randomUUID()}`;
+      const request = () => send({ method: "POST", headers: mcpHttpRequestHeaders(sessionHeaders), body: JSON.stringify({
+        jsonrpc: "2.0", id, method: "tools/call", params: { name: "COMPOSIO_MANAGE_CONNECTIONS", arguments: { toolkits } },
+      }) });
+      const markFailed = async () => {
+        const names = toolkits.filter(tool => tool.action === "list").map(tool => tool.name);
+        if (names.length) await db.update(toolConnectionAppSnapshots).set({ errorAt: checkedAt }).where(and(
+          eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connectionId),
+          eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey),
+          inArray(toolConnectionAppSnapshots.toolkit, names), lte(toolConnectionAppSnapshots.checkedAt, checkedAt),
+        ));
+      };
+      try {
+      let response = await request();
+      // Only reads retry. An uncertain account mutation must never repeat automatically.
+      if (toolkits.every(tool => tool.action === "list") && (response.status === 400 || response.status === 404)) {
+        await response.body?.cancel();
+        sessionHeaders = await initializeMcpHttpSession({ send, headers, requestId: id });
+        response = await request();
+      }
+      if (!response.ok) throw new HttpError(502, toolkits.every(tool => tool.action === "list")
+        ? "Composio could not check this app. Reconnect the gateway if its sign-in expired."
+        : "Composio has not confirmed this change. Refresh the accounts before trying again.", { code: "composio_app_setup_failed", status: response.status });
+      const payload = await readMcpHttpResponse(response, id);
+      if (await composioCredentialKey(await getConnectionRow(connectionId), actor) !== credentialKey) {
+        throw conflict("The Composio account changed while checking apps. Refresh to check the current account.");
+      }
+      const failedToolkits: string[] = [];
+      for (const tool of toolkits.filter(tool => tool.action === "list")) {
+        let accounts: ComposioAppAccount[];
+        try {
+          composioAppSetupResult(payload, tool.name);
+          const parsed = composioAppAccounts(payload, tool.name);
+          if (!parsed) throw unprocessable("Composio did not return a complete account list. Refresh the accounts before trying again.");
+          accounts = parsed;
+        } catch (error) {
+          await db.update(toolConnectionAppSnapshots).set({ errorAt: checkedAt }).where(and(
+            eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connectionId),
+            eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey),
+            eq(toolConnectionAppSnapshots.toolkit, tool.name), lte(toolConnectionAppSnapshots.checkedAt, checkedAt),
+          ));
+          if (!tolerateToolkitErrors) throw error;
+          failedToolkits.push(tool.name);
+          continue;
+        }
+        const status = accounts.some(account => account.status === "ACTIVE") ? "connected" as const : "not_connected" as const;
+        await db.insert(toolConnectionAppSnapshots).values({ companyId: connection.companyId, connectionId, userId: actor.actorId!,
+          credentialKey, toolkit: tool.name, accounts, status, checkedAt, errorAt: null,
+        }).onConflictDoUpdate({ target: [toolConnectionAppSnapshots.companyId, toolConnectionAppSnapshots.connectionId, toolConnectionAppSnapshots.userId, toolConnectionAppSnapshots.toolkit],
+          set: { accounts, status, checkedAt, credentialKey, errorAt: null }, setWhere: lte(toolConnectionAppSnapshots.checkedAt, checkedAt) });
+      }
+      return { payload, failedToolkits };
+      } catch (error) { await markFailed(); throw error; }
+    }
+    return { connection, catalog, credentialKey, manage: async (...args: Parameters<typeof manage>) => (await manage(...args)).payload, checkBatch: manage };
+  }
+
+  async function startComposioAppSync(connectionId: string, force: boolean, actor: ActorInfo) {
+    const opened = await openComposioGateway(connectionId, actor);
+    const { connection, credentialKey } = opened;
+    const existing = await cachedComposioApps(connection, actor);
+    const catalog = options.composioAppToolkits ?? COMPOSIO_APP_TOOLKITS;
+    const toolkits = [...new Set([...existing.filter(app => app.accounts.length > 0).map(app => app.toolkit), ...catalog])];
+    const leaseId = randomUUID();
+    const startedAt = new Date();
+    const [lease] = await db.insert(toolConnectionAppSyncs).values({ companyId: connection.companyId, connectionId,
+      userId: actor.actorId!, credentialKey, leaseId, status: "syncing", total: toolkits.length, updatedAt: startedAt,
+    }).onConflictDoUpdate({ target: [toolConnectionAppSyncs.companyId, toolConnectionAppSyncs.connectionId, toolConnectionAppSyncs.userId, toolConnectionAppSyncs.credentialKey],
+      set: { leaseId, status: "syncing", checked: 0, total: toolkits.length, failed: 0, updatedAt: startedAt },
+      setWhere: and(
+        or(ne(toolConnectionAppSyncs.status, "syncing"), lt(toolConnectionAppSyncs.updatedAt, new Date(Date.now() - composioSyncLeaseMs))),
+        force ? sql`true` : or(ne(toolConnectionAppSyncs.status, "ready"), isNull(toolConnectionAppSyncs.lastCompletedAt),
+          lt(toolConnectionAppSyncs.lastCompletedAt, new Date(Date.now() - composioSyncTtlMs))),
+      ),
+    }).returning();
+    if (lease) {
+      const updateLease = async (values: Partial<typeof toolConnectionAppSyncs.$inferInsert>) => {
+        const updated = await db.update(toolConnectionAppSyncs).set({ ...values, updatedAt: new Date() })
+          .where(and(eq(toolConnectionAppSyncs.id, lease.id), eq(toolConnectionAppSyncs.leaseId, leaseId))).returning({ id: toolConnectionAppSyncs.id });
+        if (!updated.length) throw conflict("App checks were replaced by a newer sync.");
+      };
+      const job = (async () => {
+        let failed = 0;
+        try {
+          for (let start = 0; start < toolkits.length; start += 32) {
+            if (Date.now() - startedAt.getTime() > composioSyncLeaseMs) throw new Error("Sync deadline exceeded");
+            await updateLease({});
+            const current = start === 0 ? opened : await openComposioGateway(connectionId, actor);
+            if (current.credentialKey !== credentialKey) throw conflict("Composio credentials changed during sync.");
+            const batch = toolkits.slice(start, start + 32);
+            const result = await current.checkBatch(batch.map(name => ({ name, action: "list" })), true);
+            failed += result.failedToolkits.length;
+            await updateLease({ checked: start + batch.length, failed });
+          }
+          await updateLease({ status: failed > 0 ? "error" : "ready", lastCompletedAt: new Date(), failed });
+        } catch {
+          const [activeLease] = await db.select({ id: toolConnectionAppSyncs.id }).from(toolConnectionAppSyncs)
+            .where(and(eq(toolConnectionAppSyncs.id, lease.id), eq(toolConnectionAppSyncs.leaseId, leaseId)));
+          if (!activeLease) return;
+          // Preserve observations, but never present a failed check as current authorization.
+          await db.update(toolConnectionAppSnapshots).set({ errorAt: new Date() }).where(and(
+            eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connectionId),
+            eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey),
+            lte(toolConnectionAppSnapshots.checkedAt, startedAt),
+          ));
+          await updateLease({ status: "error", failed }).catch(() => undefined);
+        }
+      })();
+      composioSyncJobs.set(leaseId, job);
+      void job.finally(() => composioSyncJobs.delete(leaseId)).catch(() => undefined);
+    }
+    return composioAppsResponse(await getConnectionRow(connectionId), actor);
+  }
+
+  function aggregatorProvider(connection: typeof toolConnections.$inferSelect): AppCatalogAggregator {
+    const provider = connection.config.sourceTemplateKey;
+    if (!isAppAggregator(provider) || connection.transport !== "mcp_remote") throw notFound("Aggregator gateway not found");
+    return provider;
+  }
+
+  function assertDiscoveryActor(actor: ActorInfo) {
+    if (actor.actorType !== "user" || !actor.actorId) throw forbidden("A human connection manager must check accounts");
+  }
+
+  async function aggregatorDiscoveryState(connection: typeof toolConnections.$inferSelect, actor: ActorInfo, retryUnsupported = false): Promise<AggregatorAppsResponse["discovery"]> {
+    const provider = aggregatorProvider(connection);
+    if (connection.status !== "active" || !connection.enabled) return { availability: "disabled", message: "Restore this gateway to check its accounts." };
+    if (provider === "arcade") {
+      const discovery = asRecord(asRecord(connection.config.aggregatorDiscovery)[actor.actorId!]);
+      const headers = projectedConnectionHeaders(connection);
+      const grant = connection.authKind === "oauth" || connection.credentialPolicy !== "shared" ? await vaultGrantForConnection(connection, actor) : null;
+      const refs = grant?.credentialSecretRefs ?? connection.credentialSecretRefs;
+      const hasUserId = Boolean(Object.entries(headers).find(([key]) => key.toLowerCase() === "arcade-user-id")?.[1])
+        || refs.some(ref => ref.configPath.toLowerCase() === "headers.arcade-user-id");
+      if ((!discovery.secretId || !discovery.userId) && !(hasUserId && connection.authKind === "api_key")) {
+        return { availability: "setup_required", message: "Set up account sync to see your Arcade apps here." };
+      }
+    }
+    const catalog = await db.select({ name: toolCatalogEntries.toolName }).from(toolCatalogEntries).where(and(
+      eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id), eq(toolCatalogEntries.status, "active"),
+    ));
+    if ((provider === "executor" && !catalog.some(tool => ["integrations", "execute"].includes(tool.name)))
+      || (provider === "composio" && !catalog.some(tool => tool.name === "COMPOSIO_MANAGE_CONNECTIONS"))) {
+      return { availability: "unsupported", message: `${AGGREGATOR_NAMES[provider]} account discovery is unavailable on this gateway. Refresh its actions or check its setup.` };
+    }
+    if (!retryUnsupported && provider === "executor") {
+      const credentialKey = await composioCredentialKey(connection, actor);
+      const [sync] = await db.select({ status: toolConnectionAppSyncs.status }).from(toolConnectionAppSyncs).where(and(
+        eq(toolConnectionAppSyncs.companyId, connection.companyId), eq(toolConnectionAppSyncs.connectionId, connection.id),
+        eq(toolConnectionAppSyncs.userId, actor.actorId!), eq(toolConnectionAppSyncs.credentialKey, credentialKey),
+      ));
+      if (sync?.status === "unsupported") return { availability: "unsupported", message: "Executor account discovery is unavailable on this server. You can still use the gateway’s actions." };
+    }
+    return { availability: "available", message: null };
+  }
+
+  async function aggregatorAppsResponse(connection: typeof toolConnections.$inferSelect, actor: ActorInfo): Promise<AggregatorAppsResponse> {
+    assertDiscoveryActor(actor);
+    const provider = aggregatorProvider(connection);
+    const result = await composioAppsResponse(connection, actor);
+    const discovery = await aggregatorDiscoveryState(connection, actor);
+    return { provider, discovery, apps: result.apps.map(snapshot => {
+      const app = resolveAggregatorApp(provider, snapshot.toolkit, snapshot.accounts[0]?.appName);
+      return { ...snapshot, provider, freshness: discovery.availability !== "available" || snapshot.errorAt || result.sync.status === "error" || connection.status !== "active" || !connection.enabled || Date.now() - new Date(snapshot.checkedAt).getTime() > composioSyncTtlMs ? "stale" as const : "fresh" as const, appSlug: app.slug.startsWith(`${provider}:`) ? `${provider}:${connection.id}:${snapshot.toolkit}` : snapshot.accounts[0]?.appSlug ?? app.slug, appName: snapshot.accounts[0]?.appName ?? app.name };
+    }), sync: { ...result.sync, coverage: provider === "composio" ? "supported_catalog" : provider === "arcade" ? "gateway_tools" : "visible_accounts",
+      error: result.sync.error ? `Couldn’t finish checking ${AGGREGATOR_NAMES[provider]} apps. Refresh to try again.` : null,
+    } };
+  }
+
+  async function discoverAggregatorInventory(connection: typeof toolConnections.$inferSelect, actor: ActorInfo): Promise<DiscoveredApp[]> {
+    const provider = aggregatorProvider(connection);
+    const tools = await remoteTools(connection, undefined, actor);
+    connection = await getConnectionRow(connection.id);
+    const headers = { ...projectedConnectionHeaders(connection), ...(await resolveCredentialHeaders(connection, actor)) };
+    const endpoint = new URL(await resolvedRemoteEndpoint(connection, actor));
+    if (provider === "arcade") {
+      // The extra project credential never joins invocation headers or tool grants.
+      if (endpoint.hostname !== "api.arcade.dev" || endpoint.protocol !== "https:") throw unprocessable("Account sync requires an Arcade Cloud gateway");
+      const discovery = asRecord(asRecord(connection.config.aggregatorDiscovery)[actor.actorId!]);
+      let key: string | undefined;
+      let userId: string | undefined;
+      if (typeof discovery.secretId === "string" && typeof discovery.userId === "string") {
+        const [secret] = await db.select().from(companySecrets).where(and(eq(companySecrets.id, discovery.secretId), eq(companySecrets.companyId, connection.companyId), eq(companySecrets.ownerUserId, actor.actorId!)));
+        if (!secret?.userSecretDefinitionId) throw forbidden("Your Arcade discovery credential is unavailable");
+        const resolved = await secrets.resolveUserSecretValue(connection.companyId, { definitionId: secret.userSecretDefinitionId, responsibleUserId: actor.actorId!, required: true }, {
+          actorType: "user", actorId: actor.actorId!, consumerType: "tool_connection", consumerId: connection.id, responsibleUserId: actor.actorId!,
+        });
+        key = resolved?.value;
+        userId = discovery.userId;
+      } else {
+        userId = Object.entries(headers).find(([name]) => name.toLowerCase() === "arcade-user-id")?.[1];
+        if (connection.authKind === "api_key") key = Object.entries(headers).find(([name]) => name.toLowerCase() === "authorization")?.[1].replace(/^Bearer\s+/i, "");
+      }
+      if (!key || !userId) throw unprocessable("Set up Arcade account sync first");
+      return discoverArcadeApps({ userId, gatewayTools: tools.map(tool => tool.name), request: async path => {
+        const response = await requestRemoteHttpEndpoint(new URL(path, endpoint.origin), { method: "GET", headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(30_000) });
+        if (!response.ok) { await response.body?.cancel(); throw new HttpError(502, "Arcade could not list your accounts. Check the project API key and Arcade user ID."); }
+        return response.json();
+      } });
+    }
+    const send = (init: RequestInit) => requestRemoteHttpEndpoint(endpoint, { ...init, signal: AbortSignal.timeout(30_000) });
+    let sessionHeaders = connection.config.mcpSessionRequired === true ? await getMcpHttpSession({ send, headers, scope: `${connection.id}:inventory:${actor.actorId}`, requestId: "paperclip-account-inventory" }) : headers;
+    return discoverExecutorApps({ toolNames: tools.map(tool => tool.name), managementUrl: typeof connection.config.managementUrl === "string" ? connection.config.managementUrl : null,
+      call: async (name, args) => {
+        const id = `paperclip-account-inventory-${randomUUID()}`;
+        const request = () => send({ method: "POST", headers: mcpHttpRequestHeaders(sessionHeaders), body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) });
+        let response = await request();
+        if (response.status === 400 || response.status === 404) {
+          await response.body?.cancel(); sessionHeaders = await initializeMcpHttpSession({ send, headers, requestId: id }); response = await request();
+        }
+        if (!response.ok) { await response.body?.cancel(); throw new HttpError(502, "Executor could not list your accounts. Reconnect if sign-in expired."); }
+        return readMcpHttpResponse(response, id);
+      },
+    });
+  }
+
+  async function syncAggregatorApps(connectionId: string, force: boolean, actor: ActorInfo): Promise<AggregatorAppsResponse> {
+    assertDiscoveryActor(actor);
+    let connection = await getConnectionRow(connectionId);
+    const provider = aggregatorProvider(connection);
+    const discovery = await aggregatorDiscoveryState(connection, actor, force);
+    if (discovery.availability !== "available") return aggregatorAppsResponse(connection, actor);
+    if (provider === "composio") {
+      await startComposioAppSync(connectionId, force, actor);
+      return aggregatorAppsResponse(await getConnectionRow(connectionId), actor);
+    }
+    // Resolve/refresh the caller's gateway credentials before fingerprinting the lease.
+    await resolveCredentialHeaders(connection, actor);
+    connection = await getConnectionRow(connectionId);
+    const credentialKey = await composioCredentialKey(connection, actor);
+    const leaseId = randomUUID();
+    const startedAt = new Date();
+    const [lease] = await db.insert(toolConnectionAppSyncs).values({ companyId: connection.companyId, connectionId, userId: actor.actorId!, credentialKey, leaseId, status: "syncing", updatedAt: startedAt })
+      .onConflictDoUpdate({ target: [toolConnectionAppSyncs.companyId, toolConnectionAppSyncs.connectionId, toolConnectionAppSyncs.userId, toolConnectionAppSyncs.credentialKey],
+        set: { leaseId, status: "syncing", checked: 0, total: 0, failed: 0, updatedAt: startedAt },
+        setWhere: and(or(ne(toolConnectionAppSyncs.status, "syncing"), lt(toolConnectionAppSyncs.updatedAt, new Date(Date.now() - composioSyncLeaseMs))),
+          force ? sql`true` : or(ne(toolConnectionAppSyncs.status, "ready"), isNull(toolConnectionAppSyncs.lastCompletedAt), lt(toolConnectionAppSyncs.lastCompletedAt, new Date(Date.now() - composioSyncTtlMs)))),
+      }).returning();
+    if (lease) {
+      const job = (async () => {
+        try {
+          const apps = await discoverAggregatorInventory(connection, actor);
+          await db.transaction(async tx => {
+            const [current] = await tx.select().from(toolConnections).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, connection.companyId))).for("update");
+            const [active] = await tx.select().from(toolConnectionAppSyncs).where(and(eq(toolConnectionAppSyncs.id, lease.id), eq(toolConnectionAppSyncs.leaseId, leaseId))).for("update");
+            if (!current || !active || current.status !== "active" || !current.enabled || Date.now() - startedAt.getTime() > composioSyncLeaseMs
+              || await composioCredentialKey(current, actor) !== credentialKey) throw conflict("The gateway changed during account discovery");
+            const checkedAt = new Date();
+            // Commit the entire enumeration at once; a failed later page cannot delete accounts.
+            await tx.update(toolConnectionAppSnapshots).set({ accounts: [], status: "not_connected", checkedAt, errorAt: null }).where(and(
+              eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connectionId), eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey),
+            ));
+            for (const app of apps) await tx.insert(toolConnectionAppSnapshots).values({ companyId: connection.companyId, connectionId, userId: actor.actorId!, credentialKey,
+              toolkit: app.toolkit, accounts: app.accounts, status: app.accounts.some(account => account.status === "ACTIVE") ? "connected" : "not_connected", checkedAt,
+            }).onConflictDoUpdate({ target: [toolConnectionAppSnapshots.companyId, toolConnectionAppSnapshots.connectionId, toolConnectionAppSnapshots.userId, toolConnectionAppSnapshots.toolkit],
+              set: { accounts: app.accounts, status: app.accounts.some(account => account.status === "ACTIVE") ? "connected" : "not_connected", checkedAt, errorAt: null, credentialKey },
+            });
+            await tx.update(toolConnectionAppSyncs).set({ status: "ready", checked: apps.length, total: apps.length, failed: 0, updatedAt: checkedAt, lastCompletedAt: checkedAt }).where(eq(toolConnectionAppSyncs.id, lease.id));
+          });
+        } catch (error) {
+          await db.transaction(async tx => {
+            const [active] = await tx.select().from(toolConnectionAppSyncs).where(and(eq(toolConnectionAppSyncs.id, lease.id), eq(toolConnectionAppSyncs.leaseId, leaseId))).for("update");
+            if (!active) return;
+            await tx.update(toolConnectionAppSnapshots).set({ errorAt: new Date() }).where(and(eq(toolConnectionAppSnapshots.companyId, connection.companyId), eq(toolConnectionAppSnapshots.connectionId, connectionId), eq(toolConnectionAppSnapshots.userId, actor.actorId!), eq(toolConnectionAppSnapshots.credentialKey, credentialKey)));
+            await tx.update(toolConnectionAppSyncs).set({ status: error instanceof AggregatorDiscoveryUnavailableError ? "unsupported" : "error", failed: 1, updatedAt: new Date() }).where(eq(toolConnectionAppSyncs.id, lease.id));
+          });
+        }
+      })();
+      composioSyncJobs.set(leaseId, job);
+      void job.finally(() => composioSyncJobs.delete(leaseId)).catch(() => undefined);
+    }
+    return aggregatorAppsResponse(await getConnectionRow(connectionId), actor);
+  }
+
+  async function configureArcadeDiscovery(connectionId: string, input: ArcadeDiscoverySetupInput, actor: ActorInfo) {
+    assertDiscoveryActor(actor);
+    const companyId = (await getConnectionRow(connectionId)).companyId;
+    await db.transaction(async tx => {
+      const [connection] = await tx.select().from(toolConnections).where(eq(toolConnections.id, connectionId)).for("update");
+      if (!connection || aggregatorProvider(connection) !== "arcade" || connection.status === "archived") throw notFound("Arcade gateway not found");
+      const all = asRecord(connection.config.aggregatorDiscovery);
+      const before = asRecord(all[actor.actorId!]);
+      const { secret } = await writeConnectionCredential(tx, {
+        companyId: connection.companyId, connectionName: connection.name, configPath: "aggregatorDiscovery.apiKey", label: "Arcade account sync API key",
+        value: input.apiKey, ownerUserId: actor.actorId!, actor: actorForSecret(actor),
+        existingRef: typeof before.secretId === "string" ? { secretId: before.secretId, configPath: "aggregatorDiscovery.apiKey", versionSelector: "latest" } : undefined,
+        definitionKey: `arcade_discovery.${connection.id}`,
+      });
+      const config = { ...connection.config, aggregatorDiscovery: { ...all, [actor.actorId!]: { userId: input.userId, secretId: secret.id } } };
+      await tx.update(toolConnections).set({ config, transportConfig: config, updatedAt: new Date() }).where(eq(toolConnections.id, connectionId));
+    });
+    await logActivity(db, { companyId, actorType: "user", actorId: actor.actorId!, action: "tool_connection.account_sync_configured", entityType: "tool_connection", entityId: connectionId, details: { provider: "arcade" } });
+    return syncAggregatorApps(connectionId, true, actor);
   }
 
   async function audit(input: {
@@ -5091,6 +5539,7 @@ export function toolAccessService(
     companyId: string,
     targetType: CreateToolProfileBindingForProfile["targetType"],
     targetId: string,
+    dbClient: ToolAccessMutationDb = db,
   ) {
     if (targetType === "company") {
       if (targetId !== companyId)
@@ -5100,7 +5549,7 @@ export function toolAccessService(
       return;
     }
     if (targetType === "agent") {
-      const [row] = await db
+      const [row] = await dbClient
         .select({ id: agents.id })
         .from(agents)
         .where(and(eq(agents.id, targetId), eq(agents.companyId, companyId)));
@@ -5111,7 +5560,7 @@ export function toolAccessService(
       return;
     }
     if (targetType === "project") {
-      const [row] = await db
+      const [row] = await dbClient
         .select({ id: projects.id })
         .from(projects)
         .where(
@@ -5124,7 +5573,7 @@ export function toolAccessService(
       return;
     }
     if (targetType === "routine") {
-      const [row] = await db
+      const [row] = await dbClient
         .select({ id: routines.id })
         .from(routines)
         .where(
@@ -5137,7 +5586,7 @@ export function toolAccessService(
       return;
     }
     if (targetType === "issue") {
-      const [row] = await db
+      const [row] = await dbClient
         .select({ id: issues.id })
         .from(issues)
         .where(and(eq(issues.id, targetId), eq(issues.companyId, companyId)));
@@ -5148,7 +5597,7 @@ export function toolAccessService(
       return;
     }
     if (targetType === "gateway") {
-      const [row] = await db
+      const [row] = await dbClient
         .select({ id: toolMcpGateways.id })
         .from(toolMcpGateways)
         .where(
@@ -5233,7 +5682,7 @@ export function toolAccessService(
     activeCatalogEntryIds: string[];
     restoreDraftDefaults?: boolean;
     actor?: ActorInfo;
-  }) {
+  }, dbClient: ToolAccessMutationDb = db) {
     // Catalog discovery also runs while the setup wizard is still a draft.
     // Access is not granted until the operator finishes that wizard, so a
     // draft refresh must never manufacture a profile or company-wide binding.
@@ -5244,7 +5693,7 @@ export function toolAccessService(
     if (input.connection.status !== "active" && !input.restoreDraftDefaults)
       return;
     const profileKey = `app:${input.connection.id}`;
-    let [profile] = await db
+    let [profile] = await dbClient
       .select()
       .from(toolProfiles)
       .where(
@@ -5253,11 +5702,13 @@ export function toolAccessService(
           eq(toolProfiles.profileKey, profileKey),
         ),
       )
-      .limit(1);
+      .limit(1).for("no key update");
+    await lockManagedAppPolicies(dbClient, input.connection.companyId, input.connection.id);
     const createdProfile = !profile;
     const resetToRecommendedDefaults = !profile || profile.status !== "active";
+    if (resetToRecommendedDefaults) await lockToolAssignmentAgents(dbClient, input.connection.companyId, [{ targetType: "company", targetId: input.connection.companyId }]);
     if (!profile) {
-      const [sameName] = await db
+      const [sameName] = await dbClient
         .select({ id: toolProfiles.id })
         .from(toolProfiles)
         .where(
@@ -5270,7 +5721,7 @@ export function toolAccessService(
       const profileName = sameName
         ? `${input.connection.name} (${input.connection.id.replace(/-/g, "").slice(0, 8)})`
         : input.connection.name;
-      [profile] = await db
+      [profile] = await dbClient
         .insert(toolProfiles)
         .values({
           companyId: input.connection.companyId,
@@ -5285,7 +5736,7 @@ export function toolAccessService(
           },
         })
         .returning();
-      await db.insert(toolProfileBindings).values({
+      await dbClient.insert(toolProfileBindings).values({
         companyId: input.connection.companyId,
         profileId: profile.id,
         targetType: "company",
@@ -5306,7 +5757,7 @@ export function toolAccessService(
       // references it (for example, an MCP gateway). Reconnecting revives the
       // same connection id, so restore that retained profile as a fresh
       // all-agents assignment instead of leaving every read action Off.
-      [profile] = await db
+      [profile] = await dbClient
         .update(toolProfiles)
         .set({
           name: input.connection.name,
@@ -5321,7 +5772,7 @@ export function toolAccessService(
         })
         .where(eq(toolProfiles.id, profile.id))
         .returning();
-      await db
+      await dbClient
         .delete(toolProfileBindings)
         .where(
           and(
@@ -5329,7 +5780,7 @@ export function toolAccessService(
             eq(toolProfileBindings.profileId, profile.id),
           ),
         );
-      await db
+      await dbClient
         .delete(toolProfileEntries)
         .where(
           and(
@@ -5337,7 +5788,7 @@ export function toolAccessService(
             eq(toolProfileEntries.profileId, profile.id),
           ),
         );
-      await db.insert(toolProfileBindings).values({
+      await dbClient.insert(toolProfileBindings).values({
         companyId: input.connection.companyId,
         profileId: profile.id,
         targetType: "company",
@@ -5365,7 +5816,7 @@ export function toolAccessService(
         connection: input.connection,
         askFirstEntries: [],
         actor: input.actor,
-      });
+      }, dbClient);
     }
 
     // A new or revived connection starts with every discovered action enabled.
@@ -5379,7 +5830,7 @@ export function toolAccessService(
       ),
     ];
     if (candidateIds.length === 0) return;
-    const existingEntries = await db
+    const existingEntries = await dbClient
       .select({ catalogEntryId: toolProfileEntries.catalogEntryId })
       .from(toolProfileEntries)
       .where(
@@ -5396,7 +5847,7 @@ export function toolAccessService(
     );
     const entryIds = candidateIds.filter((id) => !configuredIds.has(id));
     if (entryIds.length === 0) return;
-    await db.insert(toolProfileEntries).values(
+    await dbClient.insert(toolProfileEntries).values(
       entryIds.map((catalogEntryId) => ({
         companyId: input.connection.companyId,
         profileId: profile.id,
@@ -5474,21 +5925,7 @@ export function toolAccessService(
     companyId: string,
     input: CreateToolProfileEntryForProfile,
   ) {
-    if (input.selectorType === "application" && !input.applicationId) {
-      throw badRequest("Application profile entries require applicationId");
-    }
-    if (input.selectorType === "connection" && !input.connectionId) {
-      throw badRequest("Connection profile entries require connectionId");
-    }
-    if (input.selectorType === "catalog_entry" && !input.catalogEntryId) {
-      throw badRequest("Catalog-entry profile entries require catalogEntryId");
-    }
-    if (input.selectorType === "tool_name" && !input.toolName) {
-      throw badRequest("Tool-name profile entries require toolName");
-    }
-    if (input.selectorType === "risk_level" && !input.riskLevel) {
-      throw badRequest("Risk-level profile entries require riskLevel");
-    }
+    assertProfileEntryShape(input);
     if (input.applicationId)
       await assertApplication(companyId, input.applicationId);
     if (input.connectionId)
@@ -5519,7 +5956,38 @@ export function toolAccessService(
       previous: typeof connectionGrants.$inferSelect | null;
       current: typeof connectionGrants.$inferSelect;
     }) => void,
+    /**
+     * Scope provenance from the authorization that just completed, for the callers that have
+     * one. The default organization grant is created before OAuth has issued any credentials,
+     * so without this the grants API reads back a shared identity whose scope has no source
+     * and no over-grant warning — while the connection record carries both.
+     *
+     * Deliberately scope fields only. The shared grant takes its credential lifecycle from the
+     * connection, and writing `accessTokenExpiresAt` here would make an expired connection
+     * look fresh to the refresh-due check and skip the reconnect prompt.
+     */
+    oauthProvenance?: {
+      scopes: string[];
+      scopeSource: "provider" | "requested_fallback";
+      unrequestedScopes: string[];
+      requestedScopes: string[];
+    },
   ) {
+    const providerTenantWithOauth = (
+      current: (typeof connectionGrants.$inferSelect)["providerTenant"],
+    ) =>
+      oauthProvenance
+        ? {
+            ...(current ?? {}),
+            oauth: {
+              ...(current?.oauth ?? {}),
+              scopes: oauthProvenance.scopes,
+              scopeSource: oauthProvenance.scopeSource,
+              unrequestedScopes: oauthProvenance.unrequestedScopes,
+              requestedScopes: oauthProvenance.requestedScopes,
+            },
+          }
+        : current;
     const [existing] = await dbClient
       .select()
       .from(connectionGrants)
@@ -5546,6 +6014,9 @@ export function toolAccessService(
           credentialSecretRefs: isRailwayConnection(connection)
             ? [...connection.credentialSecretRefs, ...existing.credentialSecretRefs.filter((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH && !connection.credentialSecretRefs.some((candidate) => candidate.configPath === ref.configPath))]
             : connection.credentialSecretRefs,
+          ...(oauthProvenance
+            ? { providerTenant: providerTenantWithOauth(existing.providerTenant) }
+            : {}),
           status: "active",
           revokedAt: null,
           revokedByAgentId: null,
@@ -5566,6 +6037,9 @@ export function toolAccessService(
         connectionId: connection.id,
         kind: "organization",
         credentialSecretRefs: connection.credentialSecretRefs,
+        ...(oauthProvenance
+          ? { providerTenant: providerTenantWithOauth(null) }
+          : {}),
         status: "active",
         isDefault: true,
       })
@@ -5575,14 +6049,14 @@ export function toolAccessService(
     return created;
   }
 
-  async function getProfileRow(profileId: string, companyId?: string) {
+  async function getProfileRow(profileId: string, companyId?: string, dbClient: ToolAccessMutationDb = db) {
     const where = companyId
       ? and(
           eq(toolProfiles.id, profileId),
           eq(toolProfiles.companyId, companyId),
         )
       : eq(toolProfiles.id, profileId);
-    const [row] = await db.select().from(toolProfiles).where(where);
+    const [row] = await dbClient.select().from(toolProfiles).where(where);
     if (!row) throw notFound("Tool profile not found");
     return row;
   }
@@ -5590,8 +6064,9 @@ export function toolAccessService(
   async function profileDetails(
     profileId: string,
     companyId?: string,
+    dbClient: ToolAccessMutationDb = db,
   ): Promise<ToolProfileWithDetails> {
-    const profile = await getProfileRow(profileId, companyId);
+    const profile = await getProfileRow(profileId, companyId, dbClient);
     const [
       entries,
       bindings,
@@ -5600,7 +6075,7 @@ export function toolAccessService(
       applications,
       connections,
     ] = await Promise.all([
-      db
+      dbClient
         .select()
         .from(toolProfileEntries)
         .where(
@@ -5610,7 +6085,7 @@ export function toolAccessService(
           ),
         )
         .orderBy(asc(toolProfileEntries.createdAt)),
-      db
+      dbClient
         .select()
         .from(toolProfileBindings)
         .where(
@@ -5623,8 +6098,8 @@ export function toolAccessService(
           asc(toolProfileBindings.priority),
           asc(toolProfileBindings.createdAt),
         ),
-      db
-        .select()
+      dbClient
+        .select(profileCatalogColumns)
         .from(toolCatalogEntries)
         .where(
           and(
@@ -5632,16 +6107,16 @@ export function toolAccessService(
             eq(toolCatalogEntries.status, "active"),
           ),
         ),
-      db
+      dbClient
         .select({ id: agents.id })
         .from(agents)
         .where(eq(agents.companyId, profile.companyId)),
-      db
-        .select()
+      dbClient
+        .select({ id: toolApplications.id, name: toolApplications.name })
         .from(toolApplications)
         .where(eq(toolApplications.companyId, profile.companyId)),
-      db
-        .select()
+      dbClient
+        .select({ id: toolConnections.id, name: toolConnections.name })
         .from(toolConnections)
         .where(eq(toolConnections.companyId, profile.companyId)),
     ]);
@@ -5677,7 +6152,7 @@ export function toolAccessService(
         )
         .orderBy(asc(toolProfileEntries.createdAt)),
       db
-        .select()
+        .select(profileReviewCatalogColumns)
         .from(toolCatalogEntries)
         .where(
           and(
@@ -5687,11 +6162,11 @@ export function toolAccessService(
         )
         .orderBy(asc(toolCatalogEntries.toolName)),
       db
-        .select()
+        .select({ id: toolApplications.id, name: toolApplications.name })
         .from(toolApplications)
         .where(eq(toolApplications.companyId, profile.companyId)),
       db
-        .select()
+        .select({ id: toolConnections.id, name: toolConnections.name })
         .from(toolConnections)
         .where(eq(toolConnections.companyId, profile.companyId)),
     ]);
@@ -5805,9 +6280,7 @@ export function toolAccessService(
     profileId: string,
     entries: CreateToolProfileEntryForProfile[],
   ) {
-    for (const entry of entries) {
-      await assertProfileEntryInput(companyId, entry);
-    }
+    await assertProfileEntryInputs(db, companyId, entries);
     if (entries.length === 0) return;
     await db.insert(toolProfileEntries).values(
       entries.map((entry) => ({
@@ -5830,9 +6303,7 @@ export function toolAccessService(
     profileId: string,
     entries: CreateToolProfileEntryForProfile[],
   ) {
-    for (const entry of entries) {
-      await assertProfileEntryInput(companyId, entry);
-    }
+    await assertProfileEntryInputs(db, companyId, entries);
     await db
       .delete(toolProfileEntries)
       .where(
@@ -6006,6 +6477,21 @@ export function toolAccessService(
     companyId?: string,
     actor?: ActorInfo,
   ): Promise<ToolConnectionRemovalResult> {
+    const connection = await getConnectionRow(connectionId, companyId);
+    const [endpoint] = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.connectionId, connection.id), eq(chatEndpoints.companyId, connection.companyId), eq(chatEndpoints.provider, "slack")));
+    if (!endpoint) return removeConnectionUnlocked(connectionId, companyId, actor);
+    return chatCredentialMutationLease(db)(endpoint, async lease => {
+      await db.transaction(async tx => {
+        await lease.assertOwned(tx);
+        await tx.update(chatEndpoints).set({ status: "archived", updatedAt: new Date() }).where(eq(chatEndpoints.id, endpoint.id));
+        await tx.update(toolConnections).set({ status: "archived", enabled: false, updatedAt: new Date() }).where(eq(toolConnections.id, connection.id));
+      });
+      await removeSlackRegistration(db, endpoint.id, lease);
+      return removeConnectionUnlocked(connectionId, companyId, actor);
+    });
+  }
+
+  async function removeConnectionUnlocked(connectionId: string, companyId?: string, actor?: ActorInfo): Promise<ToolConnectionRemovalResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     forgetMcpHttpSessions(connection.id);
     const now = new Date();
@@ -6302,6 +6788,9 @@ export function toolAccessService(
       .returning({ id: connectionTokenIssuances.id });
 
     const archived = await db.transaction(async (tx) => {
+      await tx.select({ id: toolApplications.id }).from(toolApplications)
+        .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, connection.companyId)))
+        .for("update");
       const [updatedConnection] = await tx
         .update(toolConnections)
         .set({ status: "archived", enabled: false, updatedAt: now })
@@ -6350,6 +6839,7 @@ export function toolAccessService(
     // provider error leaves an unresolvable secret and a resumable removal
     // rather than a half-open app.
     const candidateSecretIds = [
+      ...Object.values(asRecord(connection.config.aggregatorDiscovery)).flatMap(value => typeof asRecord(value).secretId === "string" ? [asRecord(value).secretId as string] : []),
       ...connection.credentialRefs.map((ref) => ref.secretId),
       ...connection.credentialSecretRefs.map((ref) => ref.secretId),
       ...grantRows.flatMap((grant) =>
@@ -6688,13 +7178,26 @@ export function toolAccessService(
     // PAP-17098 closed for the OAuth endpoints.
     let listRequestId = "paperclip-catalog-refresh";
     let sessionHeaders = headers;
-    const sendRemote = (init: RequestInit) => requestRemoteHttpEndpoint(new URL(endpoint), init);
+    const sendRemote = (init: RequestInit) => withMcpConnectionFailure(() => requestRemoteHttpEndpoint(new URL(endpoint), init));
     const sendToolsList = (requestHeaders: Record<string, string>, cursor?: string) => {
       sessionHeaders = requestHeaders;
       return sendRemote({ method: "POST", headers: mcpHttpRequestHeaders(requestHeaders),
         body: JSON.stringify({ jsonrpc: "2.0", id: listRequestId, method: "tools/list", params: cursor ? { cursor } : {} }) });
     };
-    let usedInitializedSession = connection.config.mcpSessionRequired === true;
+    const connectionConfig = asRecord(connection.config);
+    const sourceTemplateKey = typeof connectionConfig?.sourceTemplateKey === "string"
+      ? connectionConfig.sourceTemplateKey
+      : null;
+    const connectionMethodKey = typeof connectionConfig?.connectionMethodKey === "string"
+      ? connectionConfig.connectionMethodKey
+      : null;
+    const curatedMethodRequiresMcpSession = Boolean(
+      sourceTemplateKey && connectionMethodKey &&
+      getConnectableAppDefinition(sourceTemplateKey)?.methods.some((method) =>
+        method.key === connectionMethodKey && method.defaults?.mcpSessionRequired === true
+      ),
+    );
+    let usedInitializedSession = connectionConfig?.mcpSessionRequired === true || curatedMethodRequiresMcpSession;
     let response: Response;
     if (usedInitializedSession) {
       try {
@@ -6739,7 +7242,7 @@ export function toolAccessService(
     }
     if (
       usedInitializedSession &&
-      connection.config.mcpSessionRequired !== true
+      connectionConfig?.mcpSessionRequired !== true
     ) {
       const nextConfig = { ...connection.config, mcpSessionRequired: true };
       await db
@@ -6876,14 +7379,12 @@ export function toolAccessService(
           oauthSupported: Boolean(endpoints),
         });
       }
-      throw new HttpError(502, `Remote app returned HTTP ${response.status}`, {
-        status: response.status,
-      });
+      throw mcpDiscoveryHttpFailure(response, `Remote app returned HTTP ${response.status}`);
     }
     const descriptors: McpToolDescriptor[] = [];
     const seenCursors = new Set<string>();
     for (let page = 0; ; page += 1) {
-      const payload = await readMcpHttpResponse(response, listRequestId);
+      const payload = await withMcpConnectionFailure(() => readMcpHttpResponse(response, listRequestId));
       const record = asRecord(payload);
       if (record.error) throw new HttpError(502, "Remote MCP tool discovery failed", { code: "mcp_catalog_error" });
       const result = asRecord(record.result);
@@ -6895,7 +7396,7 @@ export function toolAccessService(
       seenCursors.add(cursor);
       listRequestId = `paperclip-catalog-refresh-${page + 1}`;
       response = await sendToolsList(sessionHeaders, cursor);
-      if (!response.ok) throw new HttpError(502, "Remote MCP catalog page could not be read", { status: response.status });
+      if (!response.ok) throw mcpDiscoveryHttpFailure(response, "Remote MCP catalog page could not be read");
     }
     if (!isRailwayConnection(connection)) return descriptors;
     if (descriptors.some((tool) => normalizeRailwayToolName(tool.name).startsWith(RAILWAY_TOOL_PREFIX))) {
@@ -7014,6 +7515,11 @@ export function toolAccessService(
   ): Promise<McpToolDescriptor[]> {
     assertSupportedConnection(connection);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections provide runtime authentication, not tool actions");
+    if (isDaytonaConnection(connection)) {
+      const headers = credentialHeaders ?? await resolveCredentialHeaders(connection, actor);
+      await daytonaClient(headers, (url, init) => requestRemoteHttpEndpoint(new URL(url), init), asRecord(connection.config.methodConfig).organizationId).probe();
+      return DAYTONA_TOOLS;
+    }
     if (isBrowserUseConnection(connection)) {
       const headers = credentialHeaders ?? await resolveCredentialHeaders(connection, actor);
       await browserUseClient(headers, (url, init) => requestRemoteHttpEndpoint(new URL(url), init), connection.id).probe();
@@ -7169,7 +7675,7 @@ export function toolAccessService(
           });
         for (const grant of grantsToCheck)
           await refreshManagedGitHubGrantAccess(connection, grant, actor);
-      } else if (isBrowserUseConnection(connection)) {
+      } else if (isBrowserUseConnection(connection) || isDaytonaConnection(connection)) {
         await discoverTools(connection, undefined, actor);
       } else if (isAgentMailConnection(connection)) {
         await validateAgentMailConnection(connection);
@@ -7203,6 +7709,8 @@ export function toolAccessService(
         config.sourceTemplateKey === "github" &&
           oauth.connectorProfile === "github.code"
           ? "GitHub account, installation, and repository access are available."
+          : isDaytonaConnection(connection)
+            ? "Daytona API access is connected."
           : isBrowserUseConnection(connection)
             ? "Browser Use API key is connected."
           : isAgentMailConnection(connection)
@@ -7246,13 +7754,13 @@ export function toolAccessService(
         actor,
         details: { status: failure.status, transport: connection.transport },
       });
-      throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
+      throw retainMcpConnectionFailure(error, new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
         connection: toConnection(updated),
         runtimeSlot,
         setupUrl: connectionSetupUrl(connection),
         reconnectUrl: connectionReconnectUrl(connection),
-      });
+      }));
     }
   }
 
@@ -7299,13 +7807,23 @@ export function toolAccessService(
         details: { status: failure.status },
         actor,
       });
-      throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
+      throw retainMcpConnectionFailure(error, new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
         setupUrl: connectionSetupUrl(connection),
         reconnectUrl: connectionReconnectUrl(connection),
-      });
+      }));
     }
 
+    const publish = <T>(write: (client: ToolAccessMutationDb) => Promise<T>): Promise<T> => db.transaction(async tx => {
+      await tx.select({ id: toolApplications.id }).from(toolApplications)
+        .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, connection.companyId)))
+        .for("update");
+      await tx.select({ id: toolConnections.id }).from(toolConnections)
+        .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
+        .for("update");
+      return write(tx);
+    });
+    descriptors = [...new Map(descriptors.map(descriptor => [descriptor.name, descriptor])).values()];
     const existingRows = await db
       .select()
       .from(toolCatalogEntries)
@@ -7313,12 +7831,14 @@ export function toolAccessService(
     const existingByName = new Map(
       existingRows.map((entry) => [entry.toolName, entry]),
     );
-    if (isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
+    const nativeDaytona = isDaytonaConnection(connection);
+    if (nativeDaytona || isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
       const discoveredNames = new Set(descriptors.map((descriptor) => descriptor.name));
-      const removedIds = existingRows.filter((entry) => !discoveredNames.has(entry.toolName) && entry.status !== "disabled").map((entry) => entry.id);
-      if (removedIds.length) await db.update(toolCatalogEntries)
-        .set({ status: "disabled", quarantineReason: "mcp_tool_removed", updatedAt: refreshedAt })
-        .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, removedIds)));
+      const removedStatus = nativeDaytona ? "removed" : "disabled";
+      const removedIds = existingRows.filter((entry) => !discoveredNames.has(entry.toolName) && entry.status !== removedStatus).map((entry) => entry.id);
+      if (removedIds.length) await publish(tx => tx.update(toolCatalogEntries)
+        .set({ status: removedStatus, quarantineReason: nativeDaytona ? "provider_tool_removed" : "mcp_tool_removed", updatedAt: refreshedAt })
+        .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, removedIds))));
     }
     // Retired native actions are absent from discovery, but old catalog rows
     // still need to show as disabled. Gateway denial also applies before refresh.
@@ -7326,10 +7846,10 @@ export function toolAccessService(
       ? existingRows.filter((entry) => isRailwayToolBlocked(entry.toolName)).map((entry) => entry.id)
       : [];
     if (blockedRailwayEntryIds.length > 0) {
-      await db.update(toolCatalogEntries).set({ status: "disabled", updatedAt: refreshedAt })
-        .where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, blockedRailwayEntryIds)));
+      await publish(tx => tx.update(toolCatalogEntries).set({ status: "disabled", updatedAt: refreshedAt })
+        .where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, blockedRailwayEntryIds))));
     }
-    const updatedEntries: ToolCatalogEntry[] = [];
+    const catalogValues: Array<typeof toolCatalogEntries.$inferInsert> = [];
     let quarantinedCount = 0;
     const sourceTemplateKey =
       typeof asRecord(connection.config).sourceTemplateKey === "string"
@@ -7354,11 +7874,14 @@ export function toolAccessService(
       isGoogleWorkspaceConnectorProfileId(googleProfileValue)
         ? googleProfileValue
         : null;
+    const preserveReviewedCatalog =
+      (isRailwayEndpoint(connection.config.url) || sourceTemplateKey === "enterpret" || isDaytonaConnection(connection)) &&
+      existingRows.length > 0;
     const quarantineOnRefresh =
-      (!refreshOptions.enableAllByDefault || (isRailwayEndpoint(connection.config.url) && existingRows.length > 0)) &&
+      (!refreshOptions.enableAllByDefault || preserveReviewedCatalog) &&
       shouldQuarantineNewEntries(connection) &&
       (connection.status === "active" ||
-        (isRailwayEndpoint(connection.config.url) && existingRows.length > 0) ||
+        preserveReviewedCatalog ||
         sourceTemplateKey === "posthog" ||
         refreshOptions.quarantineManagedOAuthDraft === true);
     const safeDefault = asRecord(connection.config).safeDefault === true;
@@ -7374,7 +7897,7 @@ export function toolAccessService(
         quarantineOnRefresh &&
         (!existing || changed) &&
         existing?.status !== "disabled" &&
-        (!safeDefault || riskLevel !== "read");
+        (!safeDefault || riskLevel !== "read" || nativeDaytona);
       const providerPermanentlyBlocked = Boolean(
         googleProfile &&
         !isGoogleWorkspaceToolAllowed(googleProfile, descriptor),
@@ -7390,76 +7913,54 @@ export function toolAccessService(
               : "active";
       if (shouldQuarantine && !providerPermanentlyBlocked) quarantinedCount += 1;
 
-      if (existing) {
-        const [updated] = await db
-          .update(toolCatalogEntries)
-          .set({
-            title: descriptor.title ?? null,
-            description: descriptor.description ?? null,
-            inputSchema: descriptor.inputSchema ?? {},
-            annotations: descriptor.annotations ?? {},
-            riskLevel,
-            isReadOnly: riskLevel === "read",
-            isWrite: riskLevel === "write",
-            isDestructive: riskLevel === "destructive",
-            status,
-            versionHash: hash,
-            schemaHash,
-            lastSeenAt: refreshedAt,
-            quarantinedAt:
-              status === "quarantined"
-                ? shouldQuarantine
-                  ? refreshedAt
-                  : existing.quarantinedAt
-                : null,
-            quarantineReason:
-              status === "quarantined"
-                ? shouldQuarantine
-                  ? "pending_review"
-                  : existing.quarantineReason
-                : null,
-            updatedAt: refreshedAt,
-          })
-          .where(eq(toolCatalogEntries.id, existing.id))
-          .returning();
-        updatedEntries.push(toCatalogEntry(updated));
-      } else {
-        const [created] = await db
-          .insert(toolCatalogEntries)
-          .values({
-            companyId: connection.companyId,
-            applicationId: connection.applicationId,
-            connectionId: connection.id,
-            name: descriptor.name,
-            toolName: descriptor.name,
-            entryKind: "tool",
-            title: descriptor.title ?? null,
-            description: descriptor.description ?? null,
-            inputSchema: descriptor.inputSchema ?? {},
-            annotations: descriptor.annotations ?? {},
-            riskLevel,
-            isReadOnly: riskLevel === "read",
-            isWrite: riskLevel === "write",
-            isDestructive: riskLevel === "destructive",
-            status,
-            versionHash: hash,
-            schemaHash,
-            firstSeenAt: refreshedAt,
-            lastSeenAt: refreshedAt,
-            quarantinedAt: shouldQuarantine ? refreshedAt : null,
-            quarantineReason: shouldQuarantine ? "pending_review" : null,
-          })
-          .returning();
-        updatedEntries.push(toCatalogEntry(created));
-      }
+      catalogValues.push({
+        id: existing?.id, companyId: connection.companyId, applicationId: connection.applicationId,
+        connectionId: connection.id, name: existing?.name ?? descriptor.name, toolName: descriptor.name, entryKind: "tool",
+        title: descriptor.title ?? null, description: descriptor.description ?? null,
+        inputSchema: descriptor.inputSchema ?? {}, annotations: descriptor.annotations ?? {}, riskLevel,
+        isReadOnly: riskLevel === "read", isWrite: riskLevel === "write", isDestructive: riskLevel === "destructive",
+        status, versionHash: hash, schemaHash, firstSeenAt: existing?.firstSeenAt ?? refreshedAt, lastSeenAt: refreshedAt,
+        quarantinedAt: existing
+          ? status === "quarantined" ? shouldQuarantine ? refreshedAt : existing.quarantinedAt : null
+          : shouldQuarantine ? refreshedAt : null,
+        quarantineReason: existing
+          ? status === "quarantined" ? shouldQuarantine ? "pending_review" : existing.quarantineReason : null
+          : shouldQuarantine ? "pending_review" : null,
+        updatedAt: existing ? refreshedAt : new Date(),
+      });
     }
+    const catalogRows: Array<typeof toolCatalogEntries.$inferSelect> = [];
+    const newCatalogEntryIds = new Set<string>();
+    for (let index = 0; index < catalogValues.length; index += 500) {
+      const chunk = catalogValues.slice(index, index + 500);
+      catalogRows.push(...await publish(async tx => {
+        const current = await tx.select({ name: toolCatalogEntries.name, status: toolCatalogEntries.status })
+          .from(toolCatalogEntries).where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.name, chunk.map(entry => entry.name))));
+        const existingNonQuarantinedNames = new Set(current.filter(entry => entry.status !== "quarantined").map(entry => entry.name));
+        const rows = await tx.insert(toolCatalogEntries).values(chunk)
+          .onConflictDoUpdate({ target: [toolCatalogEntries.connectionId, toolCatalogEntries.name], set: {
+            title: sql`excluded.title`, description: sql`excluded.description`, inputSchema: sql`excluded.input_schema`,
+            annotations: sql`excluded.annotations`, riskLevel: sql`excluded.risk_level`, isReadOnly: sql`excluded.is_read_only`,
+            isWrite: sql`excluded.is_write`, isDestructive: sql`excluded.is_destructive`,
+            status: sql`CASE WHEN ${toolCatalogEntries.status} = 'disabled' AND ${toolCatalogEntries.quarantineReason} IS DISTINCT FROM 'mcp_tool_removed' THEN 'disabled' ELSE excluded.status END`,
+            versionHash: sql`excluded.version_hash`, schemaHash: sql`excluded.schema_hash`, lastSeenAt: sql`excluded.last_seen_at`,
+            quarantinedAt: sql`excluded.quarantined_at`, quarantineReason: sql`excluded.quarantine_reason`, updatedAt: sql`excluded.updated_at`,
+          } }).returning();
+        for (const row of rows) if (!existingNonQuarantinedNames.has(row.name)) newCatalogEntryIds.add(row.id);
+        return rows;
+      }));
+    }
+    const catalogByName = new Map(catalogRows.map(row => [row.toolName, row]));
+    const updatedEntries = descriptors.map(descriptor => toCatalogEntry(catalogByName.get(descriptor.name)!));
 
-    const normalizedConfig = isRailwayEndpoint(connection.config.url)
+    const preserveQuarantine =
+      isRailwayEndpoint(connection.config.url) || sourceTemplateKey === "enterpret" || isDaytonaConnection(connection);
+    const normalizedConfig = preserveQuarantine
       ? { ...connection.config, quarantineNewEntries: true }
       : refreshOptions.enableAllByDefault
       ? { ...connection.config, quarantineNewEntries: false }
       : connection.config;
-    const normalizedTransportConfig = isRailwayEndpoint(connection.config.url)
+    const normalizedTransportConfig = preserveQuarantine
       ? { ...connection.transportConfig, quarantineNewEntries: true }
       : refreshOptions.enableAllByDefault
       ? { ...connection.transportConfig, quarantineNewEntries: false }
@@ -7501,20 +8002,17 @@ export function toolAccessService(
     const preserveMcpAccess = connection.config.mcpPreserveAccess === true
       && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
     if (!refreshOptions.skipDefaultProfileSync || preserveMcpAccess) {
-      await enableCatalogEntriesByDefault({
+      await publish(tx => enableCatalogEntriesByDefault({
         connection: updatedConnection,
         // Discovery must not re-enable actions the operator turned Off,
         // including curated MCP connections during API-key replacement.
         newCatalogEntryIds: activeEntries
-          .filter((entry) => {
-            const previous = existingByName.get(entry.toolName);
-            return !previous || previous.status === "quarantined";
-          })
+          .filter((entry) => newCatalogEntryIds.has(entry.id))
           .map((entry) => entry.id),
         activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
         restoreDraftDefaults: refreshOptions.restoreDraftDefaults || preserveMcpAccess,
         actor,
-      });
+      }, tx));
     }
     await audit({
       companyId: connection.companyId,
@@ -7556,7 +8054,7 @@ export function toolAccessService(
           ),
         ),
       db
-        .select()
+        .select({ connectionId: toolCatalogEntries.connectionId })
         .from(toolCatalogEntries)
         .where(
           and(
@@ -7565,7 +8063,7 @@ export function toolAccessService(
           ),
         ),
       db
-        .select()
+        .select({ invocationId: toolActionRequests.invocationId })
         .from(toolActionRequests)
         .where(
           and(
@@ -7575,7 +8073,7 @@ export function toolAccessService(
           ),
         ),
       db
-        .select()
+        .select({ id: toolInvocations.id, connectionId: toolInvocations.connectionId })
         .from(toolInvocations)
         .where(eq(toolInvocations.companyId, companyId)),
       db
@@ -7587,7 +8085,7 @@ export function toolAccessService(
         .from(toolProfileEntries)
         .where(eq(toolProfileEntries.companyId, companyId)),
       db
-        .select()
+        .select(profileCatalogColumns)
         .from(toolCatalogEntries)
         .where(
           and(
@@ -8583,6 +9081,74 @@ export function toolAccessService(
     return [];
   }
 
+  /**
+   * Decide what a token grant actually carries, keeping the provider's assertion separate from
+   * our own request.
+   *
+   * RFC 6749 §5.1 permits a provider to omit `scope` only when the grant is identical to the
+   * request, so reading the request as the grant is the specified fallback. A provider that
+   * over-grants *and* omits `scope` breaks that contract, and recording the request unmarked
+   * turns what we asked for into a confident-looking record of what we got. `scopeSource` keeps
+   * the two readable apart so nothing downstream can mistake an inference for an assertion.
+   *
+   * `unrequestedScopes` is only meaningful when we asked for something specific; with no
+   * requested scopes there is no baseline to compare against, so it stays empty rather than
+   * flagging every scope on connections that keep their scopes in provider-side app config.
+   *
+   * `previous` is the provenance already recorded for this grant. A refresh response that omits
+   * `scope` asserts nothing at all — least of all that a permission was taken away — so the
+   * earlier record is carried forward verbatim instead of being overwritten with a clean-looking
+   * inference. Only a fresh provider assertion replaces a recorded over-grant.
+   */
+  function resolveGrantedOauthScopes(input: {
+    tokenScope: unknown;
+    requestedScopes: unknown;
+    previous?: {
+      scopes?: unknown;
+      scopeSource?: unknown;
+      unrequestedScopes?: unknown;
+    };
+  }): {
+    scopes: string[];
+    scopeSource: "provider" | "requested_fallback";
+    unrequestedScopes: string[];
+  } {
+    const requested = normalizeOauthScopes(input.requestedScopes);
+    const asserted =
+      input.tokenScope === undefined || input.tokenScope === null
+        ? []
+        : normalizeOauthScopes(input.tokenScope);
+    if (asserted.length === 0) {
+      const previousScopes = normalizeOauthScopes(input.previous?.scopes);
+      const previousUnrequested = normalizeOauthScopes(
+        input.previous?.unrequestedScopes,
+      );
+      if (previousScopes.length > 0) {
+        return {
+          scopes: previousScopes,
+          scopeSource:
+            input.previous?.scopeSource === "provider"
+              ? "provider"
+              : "requested_fallback",
+          unrequestedScopes: previousUnrequested,
+        };
+      }
+      return {
+        scopes: requested,
+        scopeSource: "requested_fallback",
+        unrequestedScopes: previousUnrequested,
+      };
+    }
+    return {
+      scopes: asserted,
+      scopeSource: "provider",
+      unrequestedScopes:
+        requested.length === 0
+          ? []
+          : asserted.filter((scope) => !requested.includes(scope)),
+    };
+  }
+
   function isSmokeLabOAuthUrl(value: string | null | undefined) {
     if (!value) return false;
     try {
@@ -8752,6 +9318,9 @@ export function toolAccessService(
       firstPartyOrigin,
     );
     let scopes = normalizeOauthScopes(metadata.scopes_supported);
+    let offlineAccessSupported = Boolean(
+      authorizationUrl && scopes.includes("offline_access"),
+    );
     let codeChallengeMethodsSupported = normalizeOauthScopes(
       metadata.code_challenge_methods_supported,
     );
@@ -8804,6 +9373,15 @@ export function toolAccessService(
         !sameOAuthIssuer(advertisedIssuer, candidate.issuer)
       )
         continue;
+      // A document can carry its own endpoints and also list other servers.
+      // Adopt capabilities only from metadata bound to the selected endpoints
+      // and issuer; otherwise offline access could break an unrelated sign-in.
+      if (
+        (authorizationUrl && candidateAuthorizationUrl !== authorizationUrl) ||
+        (tokenUrl && candidateTokenUrl !== tokenUrl) ||
+        (issuer && !sameOAuthIssuer(issuer, advertisedIssuer ?? candidate.issuer))
+      )
+        continue;
       authorizationUrl = authorizationUrl ?? candidateAuthorizationUrl;
       tokenUrl = tokenUrl ?? candidateTokenUrl;
       registrationUrl =
@@ -8815,6 +9393,8 @@ export function toolAccessService(
           firstPartyOrigin,
         );
       issuer = issuer ?? advertisedIssuer ?? candidate.issuer;
+      offlineAccessSupported = offlineAccessSupported ||
+        normalizeOauthScopes(authMetadata.scopes_supported).includes("offline_access");
       if (scopes.length === 0)
         scopes = normalizeOauthScopes(authMetadata.scopes_supported);
       if (codeChallengeMethodsSupported.length === 0) {
@@ -8842,6 +9422,7 @@ export function toolAccessService(
     return {
       provider: oauthProviderForConnection(connection, metadataUrl),
       scopes,
+      offlineAccessSupported,
       authorizationUrl,
       tokenUrl,
       registrationUrl,
@@ -8908,9 +9489,31 @@ export function toolAccessService(
         ? oauth.resource.trim()
         : canonicalResourceIndicator(remoteEndpoint(connection.config));
     if (configuredAuthorizationUrl && configuredTokenUrl) {
+      // Pre-existing generic connections cached endpoints before refresh-scope
+      // support was recorded. Recover that capability from their bound metadata
+      // without adopting a different issuer or changing their requested tool scopes.
+      let refreshMetadata: OAuthProviderEndpoints | null = null;
+      if (
+        !connection.config.sourceTemplateKey &&
+        typeof oauth.offlineAccessSupported !== "boolean" &&
+        typeof oauth.metadataUrl === "string"
+      ) {
+        const discovered = await endpointsFromMetadataUrl(
+          connection, oauth.metadataUrl, rejections, firstPartyOrigin,
+        );
+        if (
+          discovered?.authorizationUrl === configuredAuthorizationUrl &&
+          discovered.tokenUrl === configuredTokenUrl &&
+          (typeof oauth.issuer !== "string" ||
+            (discovered.issuer && sameOAuthIssuer(discovered.issuer, oauth.issuer)))
+        ) refreshMetadata = discovered;
+      }
       return {
         provider,
         scopes,
+        offlineAccessSupported: typeof oauth.offlineAccessSupported === "boolean"
+          ? oauth.offlineAccessSupported
+          : refreshMetadata?.offlineAccessSupported,
         authorizationUrl: configuredAuthorizationUrl,
         tokenUrl: configuredTokenUrl,
         registrationUrl: safeOAuthEndpointUrl(
@@ -8925,6 +9528,9 @@ export function toolAccessService(
         tokenEndpointAuthMethodsSupported: normalizeOauthScopes(
           oauth.tokenEndpointAuthMethodsSupported,
         ),
+        grantTypesSupported: Array.isArray(oauth.grantTypesSupported)
+          ? normalizeOauthScopes(oauth.grantTypesSupported)
+          : refreshMetadata?.grantTypesSupported,
         grantType,
         metadataUrl:
           typeof oauth.metadataUrl === "string"
@@ -9388,8 +9994,15 @@ export function toolAccessService(
     );
 
     const host = new URL(input.redirectUri).host;
+    const clientNameHost = host
+      .replace(/[^A-Za-z0-9-]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
     const requestedMetadata = {
-      client_name: `Paperclip (${host})`,
+      // Some DCR servers restrict client_name to alphanumeric characters,
+      // hyphens and spaces. Keep the deployment host recognizable without
+      // sending punctuation such as dots, colons or parentheses.
+      client_name: `Paperclip ${clientNameHost}`,
       redirect_uris: [input.redirectUri],
       grant_types: [
         "authorization_code",
@@ -9541,6 +10154,8 @@ export function toolAccessService(
         registrationUrl: input.endpoints.registrationUrl,
         metadataUrl: input.endpoints.metadataUrl ?? null,
         scopes: input.endpoints.scopes,
+        offlineAccessSupported: input.endpoints.offlineAccessSupported,
+        grantTypesSupported: input.endpoints.grantTypesSupported ?? [],
         codeChallengeMethodsSupported:
           input.endpoints.codeChallengeMethodsSupported ?? [],
         tokenEndpointAuthMethodsSupported:
@@ -9607,6 +10222,8 @@ export function toolAccessService(
         registrationUrl: input.endpoints.registrationUrl ?? null,
         metadataUrl: input.endpoints.metadataUrl ?? null,
         scopes: input.endpoints.scopes,
+        offlineAccessSupported: input.endpoints.offlineAccessSupported,
+        grantTypesSupported: input.endpoints.grantTypesSupported ?? [],
         codeChallengeMethodsSupported:
           input.endpoints.codeChallengeMethodsSupported ?? [],
         tokenEndpointAuthMethodsSupported:
@@ -9857,7 +10474,14 @@ export function toolAccessService(
         source: "preconfigured" as const,
       };
     }
-    const metadataDocumentUrl = input.endpoints
+    const method = input.galleryEntry
+      ? connectionMethodForConnection(input.galleryEntry, input.connection)
+      : null;
+    const dcrRequired = method?.oauthClientRegistration === "dcr";
+    // A reviewed provider compatibility choice may require DCR even when the
+    // server also advertises CIMD. Do not resolve/adopt a metadata URL for that
+    // method; the default for every other method remains CIMD-first.
+    const metadataDocumentUrl = !dcrRequired && input.endpoints
       .clientIdMetadataDocumentSupported
       ? await resolveOAuthClientIdMetadataDocumentUrl(
           input.redirectUri,
@@ -9916,6 +10540,12 @@ export function toolAccessService(
         },
       );
     }
+    if (dcrRequired && !input.endpoints.registrationUrl) {
+      throw unprocessable(
+        "This provider requires dynamic client registration, but its authorization server did not advertise a registration endpoint.",
+        { code: "oauth_dcr_not_supported" },
+      );
+    }
 
     const key = `${input.connection.id}:${input.redirectUri}`;
     return singleFlight(oauthRegistrationFlights, key, async () => {
@@ -9957,8 +10587,9 @@ export function toolAccessService(
           source: storedOAuthClientRegistrationSource(bound),
         };
       }
-      // 3. Client ID Metadata Documents: no registration call at all, so prefer
-      //    them over DCR when the authorization server advertises support.
+      // 3. By default, Client ID Metadata Documents need no registration call,
+      //    so prefer them over DCR when the authorization server advertises
+      //    support. Curated DCR opt-ins leave metadataDocumentUrl null above.
       if (metadataDocumentUrl) {
         const adopted = await adoptClientIdMetadataDocument({
           connection: latest,
@@ -10060,6 +10691,8 @@ export function toolAccessService(
     });
     const headers: Record<string, string> = {
       "content-type": "application/x-www-form-urlencoded",
+      // Some providers otherwise return a legacy form-encoded token response.
+      accept: "application/json",
     };
     if (tokenEndpointAuthMethod === "client_secret_basic") {
       if (!input.clientSecret) {
@@ -10335,6 +10968,7 @@ export function toolAccessService(
         | "board_key"
         | "agent_key"
         | "agent_jwt"
+        | "mcp_oauth"
         | "cloud_tenant";
       issueId?: string | null;
       heartbeatRunId?: string | null;
@@ -11218,6 +11852,27 @@ export function toolAccessService(
         const expiresAt = token.expiresIn
           ? new Date(Date.now() + token.expiresIn * 1000).toISOString()
           : null;
+        // A refresh carries no fresh authorization request, so the baseline stays what
+        // Paperclip asked for when *this* grant was authorized. Judging the response against
+        // the grant's own scopes instead would let an over-grant that the provider re-asserts
+        // on every refresh read back as clean, because the widened grant would have become
+        // its own baseline. The connection-level list is only a fallback for grants created
+        // before the per-grant baseline existed — it is whichever callback ran last, so on a
+        // connection two users authorized with different scopes it is the wrong baseline for
+        // at least one of them.
+        const refreshed = resolveGrantedOauthScopes({
+          tokenScope: token.scope,
+          requestedScopes:
+            grantOauth.requestedScopes ??
+            oauth.scopes ??
+            oauth.scope ??
+            grantOauth.scopes,
+          previous: {
+            scopes: grantOauth.scopes,
+            scopeSource: grantOauth.scopeSource,
+            unrequestedScopes: grantOauth.unrequestedScopes,
+          },
+        });
         const providerTenant = {
           ...(grant.providerTenant ?? {}),
           oauth: {
@@ -11227,9 +11882,9 @@ export function toolAccessService(
                 ? grantOauth.strategy
                 : "direct_oauth",
             accessTokenExpiresAt: expiresAt ?? undefined,
-            scopes: normalizeOauthScopes(
-              token.scope ?? grantOauth.scopes ?? oauth.scopes ?? oauth.scope,
-            ),
+            scopes: refreshed.scopes,
+            scopeSource: refreshed.scopeSource,
+            unrequestedScopes: refreshed.unrequestedScopes,
             tokenType: token.tokenType,
             refreshedAt: now().toISOString(),
           },
@@ -11280,6 +11935,11 @@ export function toolAccessService(
               oauth: {
                 expiresAt,
                 scope: token.scope ?? latestOauth.scope ?? null,
+                // Carry the same provenance the grant just recorded. Without it a connection
+                // read reverts to a bare scope with no source and no over-grant warning after
+                // the first ordinary refresh, while the grant read still has both.
+                scopeSource: refreshed.scopeSource,
+                unrequestedScopes: refreshed.unrequestedScopes,
                 tokenType: token.tokenType,
               },
             },
@@ -11348,6 +12008,7 @@ export function toolAccessService(
         | "board_key"
         | "agent_key"
         | "agent_jwt"
+        | "mcp_oauth"
         | "cloud_tenant";
       issueId?: string | null;
       heartbeatRunId?: string | null;
@@ -12150,7 +12811,7 @@ export function toolAccessService(
     const normalizedMethodConfig =
       isGoogleSheetsRobotMethod || !method
         ? null
-        : normalizeConnectionMethodConfig(method, input.configValues);
+        : normalizeConnectionMethodConfig(method, input.configValues ?? asRecord(asRecord(retainedConnection?.config).methodConfig));
     const remoteUrlCredential =
       transport === "mcp_remote" && input.link
         ? splitRemoteUrlCredential(input.link)
@@ -12173,16 +12834,32 @@ export function toolAccessService(
           sourceTemplateKey: galleryEntry.slug,
           connectionMethodKey: method?.key,
           methodConfig: normalizedMethodConfig?.values ?? {},
+          ...(method?.defaults?.mcpSessionRequired === true
+            ? { mcpSessionRequired: true }
+            : {}),
           // Grant-backed setup keeps the full discovered catalog selectable;
           // the wizard projects the app's action defaults into policies at
           // finish time instead of using catalog quarantine as access state.
-          quarantineNewEntries: galleryEntry.slug === "railway",
+          quarantineNewEntries: ["railway", "enterpret", "daytona"].includes(galleryEntry.slug),
           ...(remoteMcpConnector ? {
             mcpSessionRequired: true,
             mcpAuthMode: input.authMode ?? "auto",
             mcpPreserveAccess: Boolean(retainedConnection && (retainedConnection.status === "active" || asRecord(retainedConnection.config).mcpPreserveAccess === true)),
           } : {}),
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
+          // Telem.AI attributes each search to the Paperclip company, agent,
+          // run and issue, so its catalog connection forwards those context
+          // headers by default (the gateway still drops empty values). A
+          // reconnect keeps the policy the operator saved on the connection.
+          ...(galleryEntry.slug === "telem"
+            ? {
+                headerPolicy: asRecord(retainedConnection?.config).headerPolicy ?? {
+                  metadata: {
+                    forward: ["company_id", "issue_id", "agent_id", "run_id", "project_id", "correlation_id"],
+                  },
+                },
+              }
+            : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
     if (method && isPaperclipCloudConnectorStrategy(method.oauthStrategy)) {
@@ -12491,7 +13168,7 @@ export function toolAccessService(
                 applicationKey: `app-gallery:${galleryEntry?.slug ?? "link"}:${randomUUID()}`,
                 name: applicationName,
                 description: safeApplicationDescription,
-                type: transport === "rest_api" && galleryEntry?.slug === "browser-use-cloud" ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
+                type: transport === "rest_api" && ["browser-use-cloud", "daytona"].includes(galleryEntry?.slug ?? "") ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
                 status: "draft",
                 metadata: galleryEntry
                   ? {
@@ -12548,6 +13225,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
+            agentInstructions: input.agentInstructions !== undefined
+              ? input.agentInstructions
+              : retainedConnection ? retainedConnection.agentInstructions
+              : defaultConnectionAgentInstructions(galleryEntry?.agentInstructions),
             config,
             transportConfig: config,
             credentialRefs,
@@ -12581,6 +13262,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
+            agentInstructions: input.agentInstructions !== undefined
+              ? input.agentInstructions
+              : retainedConnection ? retainedConnection.agentInstructions
+              : defaultConnectionAgentInstructions(galleryEntry?.agentInstructions),
             config,
             transportConfig: config,
             credentialRefs,
@@ -12977,6 +13662,7 @@ export function toolAccessService(
               await tx
                 .update(toolConnections)
                 .set({
+                  agentInstructions: revivedConnectionPrevious.agentInstructions,
                   name: revivedConnectionPrevious.name,
                   transport: revivedConnectionPrevious.transport,
                   status: revivedConnectionPrevious.status,
@@ -13286,7 +13972,10 @@ export function toolAccessService(
       const config = { ...connection.config };
       delete config.mcpPreserveAccess;
       const updated = await db.transaction(async (tx) => {
-        const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, updatedAt: new Date() })
+        await tx.select({ id: toolApplications.id }).from(toolApplications)
+          .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)))
+          .for("update");
+        const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
           .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId))).returning();
         await tx.update(toolApplications).set({ status: "active", updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
         return row;
@@ -13377,8 +14066,11 @@ export function toolAccessService(
             metadata: { source: "app_gallery_finish" },
           }));
     const transactionResult = await db.transaction(async (tx) => {
-      await tx
-        .select({ id: toolConnections.id })
+      await tx.select({ id: toolApplications.id }).from(toolApplications)
+        .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)))
+        .for("update");
+      const [lockedConnection] = await tx
+        .select({ id: toolConnections.id, status: toolConnections.status, enabled: toolConnections.enabled })
         .from(toolConnections)
         .where(
           and(
@@ -13387,6 +14079,7 @@ export function toolAccessService(
           ),
         )
         .for("update");
+      if (!lockedConnection) throw notFound("Tool connection not found");
       const [existingProfile] = await tx
         .select()
         .from(toolProfiles)
@@ -13396,7 +14089,15 @@ export function toolAccessService(
             eq(toolProfiles.profileKey, profileKey),
           ),
         )
-        .limit(1);
+        .limit(1).for("no key update");
+      await lockManagedAppPolicies(tx, companyId, connection.id);
+      const existingBindings = existingProfile ? await tx.select().from(toolProfileBindings)
+        .where(and(eq(toolProfileBindings.companyId, companyId), eq(toolProfileBindings.profileId, existingProfile.id))) : [];
+      const existingInstalls = await tx.select().from(toolConnectionInstalls)
+        .where(and(eq(toolConnectionInstalls.companyId, companyId), eq(toolConnectionInstalls.connectionId, connection.id)));
+      const companyTargets = lockedConnection.status !== "active" || !lockedConnection.enabled || (existingProfile && existingProfile.status !== "active")
+        ? [{ targetType: "company", targetId: companyId }] : [];
+      await lockToolAssignmentAgents(tx, companyId, [...existingBindings, ...bindingInputs, ...existingInstalls, ...companyTargets]);
       // A renamed connection can leave its old profile name in use. Resolve
       // names against profiles too, including when finalizing an installed draft.
       const otherProfiles = await tx
@@ -13413,11 +14114,7 @@ export function toolAccessService(
       let profileId: string;
       if (existingProfile) {
         if (input.preserveExistingAccess) {
-          const priorBindings = await tx
-            .select()
-            .from(toolProfileBindings)
-            .where(eq(toolProfileBindings.profileId, existingProfile.id));
-          for (const prior of priorBindings)
+          for (const prior of existingBindings)
             if (
               !bindingInputs.some(
                 (binding) =>
@@ -13541,9 +14238,6 @@ export function toolAccessService(
       // These connectors expose one agent-access choice. Commit installation
       // reach and permission bindings together, including an empty selection.
       if (isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
-        const existingInstalls = await tx.select().from(toolConnectionInstalls).where(and(
-          eq(toolConnectionInstalls.companyId, companyId), eq(toolConnectionInstalls.connectionId, connection.id),
-        ));
         const desired = new Map(bindingInputs.flatMap((binding) => binding.targetType === "company" || binding.targetType === "agent"
           ? [[`${binding.targetType}:${binding.targetId}`, { targetType: binding.targetType, targetId: binding.targetId }] as const] : []));
         const removed = existingInstalls.filter((install) => !desired.has(`${install.targetType}:${install.targetId}`));
@@ -13639,7 +14333,7 @@ export function toolAccessService(
       );
       const [updatedConnection] = await tx
         .update(toolConnections)
-        .set({ status: "active", enabled: true, updatedAt: new Date() })
+        .set({ status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
         .where(eq(toolConnections.id, connection.id))
         .returning();
       await tx
@@ -14242,6 +14936,17 @@ export function toolAccessService(
         `OAuth client id is not configured for ${endpoints.provider}`,
       );
 
+    const authorizationScopes = normalizeOauthScopes(
+      galleryMethod ? (requestedScopes ?? []) : (input.scopes ?? endpoints.scopes),
+    );
+    if (
+      !galleryMethod &&
+      endpoints.offlineAccessSupported &&
+      (!endpoints.grantTypesSupported?.length ||
+        endpoints.grantTypesSupported.includes("refresh_token")) &&
+      !authorizationScopes.includes("offline_access")
+    ) authorizationScopes.push("offline_access");
+
     await db
       .delete(toolOauthStates)
       .where(lt(toolOauthStates.expiresAt, new Date()));
@@ -14262,7 +14967,7 @@ export function toolAccessService(
       createdByActorId: binding.actorId,
       createdBySessionId: binding.sessionId,
       subjectUserId: authorizationSubjectUserId,
-      requestedScopes: requestedScopes ?? undefined,
+      requestedScopes: authorizationScopes,
       returnTo: input.returnTo,
       issueId: intentLink?.issueId ?? input.issueId,
       interactionId: intentLink?.id,
@@ -14298,9 +15003,6 @@ export function toolAccessService(
     // method either sends its reviewed hint or omits scope entirely. Generic
     // MCP URLs retain discovery-first behavior because Paperclip has no manifest
     // against which it could safely judge the caller's requested scope.
-    const authorizationScopes = galleryMethod
-      ? (requestedScopes ?? [])
-      : (input.scopes ?? endpoints.scopes);
     if (authorizationScopes.length > 0)
       authorizationUrl.searchParams.set("scope", authorizationScopes.join(" "));
     const reviewedAuthorizationParams =
@@ -14315,6 +15017,10 @@ export function toolAccessService(
         "prompt",
         reviewedAuthorizationParams.prompt,
       );
+    else if (!galleryMethod && authorizationScopes.includes("offline_access"))
+      // OIDC offline access requires consent unless the provider has another
+      // established basis for granting it. A generic server has no reviewed override.
+      authorizationUrl.searchParams.set("prompt", "consent");
 
     if (
       authorizationSubjectUserId &&
@@ -14442,7 +15148,9 @@ export function toolAccessService(
         // Curated apps persist only the reviewed scopes attached to this OAuth
         // state. Discovery metadata can advertise a provider's entire scope
         // universe and must never silently become Paperclip's requested set.
-        scopes: galleryMethod ? (requestedScopes ?? []) : endpoints.scopes,
+        scopes: authorizationScopes,
+        offlineAccessSupported: endpoints.offlineAccessSupported,
+        grantTypesSupported: endpoints.grantTypesSupported ?? [],
         codeChallengeMethodsSupported:
           endpoints.codeChallengeMethodsSupported ?? [],
         tokenEndpointAuthMethodsSupported:
@@ -14677,7 +15385,13 @@ export function toolAccessService(
         : suggestedAgentIds.length > 0
           ? { agentIds: suggestedAgentIds }
           : "all_agents";
-    const remoteMcpAccess = isRemoteMcpConnectorMethod(input.connection.config.sourceTemplateKey, input.connection.config.connectionMethodKey);
+    // An explicitly saved empty Access selection means no agents. A missing
+    // selection must still use managed OAuth's subject/recommended defaults.
+    const remoteMcpAccess = isRemoteMcpConnectorMethod(
+      input.connection.config.sourceTemplateKey,
+      input.connection.config.connectionMethodKey,
+    ) || (input.connection.transport === "mcp_remote"
+      && input.connection.config.mcpAgentAccessConfigured === true);
     const access: FinishToolApp["access"] = deferTaskAccess
       ? { agentIds: [] }
       : installs.length === 0
@@ -14961,6 +15675,12 @@ export function toolAccessService(
           ),
         )
         .limit(1);
+      await tx.select({ id: toolApplications.id }).from(toolApplications)
+        .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, connection.companyId)))
+        .for("update");
+      await tx.select({ id: toolConnections.id }).from(toolConnections)
+        .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
+        .for("update");
       const existingRefs =
         existingCredentialGrant?.credentialSecretRefs ??
         (personalCredential || agentCredential
@@ -15509,6 +16229,11 @@ export function toolAccessService(
       input.redirectUri,
     );
     assertOAuthCallbackIssuer(connection, endpoints, input.iss);
+    // Generic states created before requested scopes were persisted may still
+    // complete after an upgrade. Keep their original cached/discovered scope set.
+    const authorizedScopes = normalizeOauthScopes(
+      stateRow.requestedScopes ?? (galleryEntry ? [] : endpoints.scopes),
+    );
     const client = await oauthClientForConnection(
       connection,
       endpoints.provider,
@@ -15576,6 +16301,12 @@ export function toolAccessService(
             ),
           )
           .limit(1);
+        await tx.select({ id: toolApplications.id }).from(toolApplications)
+          .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, connection.companyId)))
+          .for("update");
+        await tx.select({ id: toolConnections.id }).from(toolConnections)
+          .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
+          .for("update");
         const subjectCredentialSecretRefs =
           existingUserGrant?.credentialSecretRefs ?? [];
         const accessRef = await createOrRotateOAuthSecret(
@@ -15623,6 +16354,10 @@ export function toolAccessService(
             nextCredentialSecretRefs.push(existingRefreshRef);
         }
 
+        const grantedScopes = resolveGrantedOauthScopes({
+          tokenScope: token.scope,
+          requestedScopes: authorizedScopes,
+        });
         const grantValues = {
           providerTenant: {
             ...(existingUserGrant?.providerTenant ?? {}),
@@ -15630,9 +16365,13 @@ export function toolAccessService(
               ...asRecord(asRecord(existingUserGrant?.providerTenant).oauth),
               strategy: "direct_oauth",
               accessTokenExpiresAt: expiresAt ?? undefined,
-              scopes: normalizeOauthScopes(
-                token.scope ?? stateRow.requestedScopes,
-              ),
+              scopes: grantedScopes.scopes,
+              scopeSource: grantedScopes.scopeSource,
+              unrequestedScopes: grantedScopes.unrequestedScopes,
+              // Per-grant, because two users can authorize the same connection with
+              // different scopes. The connection-level list is whichever callback ran last,
+              // so it is the wrong baseline for anyone else's refresh.
+              requestedScopes: authorizedScopes,
               tokenType: token.tokenType,
               refreshedAt: connectedAt.toISOString(),
             },
@@ -15669,9 +16408,7 @@ export function toolAccessService(
             authorizationUrl: endpoints.authorizationUrl,
             tokenUrl: endpoints.tokenUrl,
             metadataUrl: endpoints.metadataUrl ?? null,
-            scopes: galleryEntry
-              ? normalizeOauthScopes(stateRow.requestedScopes)
-              : endpoints.scopes,
+            scopes: authorizedScopes,
             clientIdEnv: client.clientIdEnv,
             clientSecretEnv: client.clientSecret
               ? client.clientSecretEnv
@@ -15690,6 +16427,8 @@ export function toolAccessService(
             oauth: {
               expiresAt,
               scope: token.scope,
+              scopeSource: grantedScopes.scopeSource,
+              unrequestedScopes: grantedScopes.unrequestedScopes,
               tokenType: token.tokenType,
             },
           },
@@ -15881,6 +16620,12 @@ export function toolAccessService(
           "Only a company owner, admin, or member with connection-manager permission can share credentials with the organization.",
         );
       }
+      await tx.select({ id: toolApplications.id }).from(toolApplications)
+        .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, connection.companyId)))
+        .for("update");
+      await tx.select({ id: toolConnections.id }).from(toolConnections)
+        .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
+        .for("update");
       const txSecrets = secretService(tx);
       const txSecretContext = { dbClient: tx, secretClient: txSecrets };
 
@@ -15925,6 +16670,10 @@ export function toolAccessService(
         if (existingRefreshRef)
           nextCredentialSecretRefs.push(existingRefreshRef);
       }
+      const organizationGrantedScopes = resolveGrantedOauthScopes({
+        tokenScope: token.scope,
+        requestedScopes: authorizedScopes,
+      });
       const nextConfig = {
         ...connection.config,
         oauth: {
@@ -15933,9 +16682,7 @@ export function toolAccessService(
           authorizationUrl: endpoints.authorizationUrl,
           tokenUrl: endpoints.tokenUrl,
           metadataUrl: endpoints.metadataUrl ?? null,
-          scopes: galleryEntry
-            ? normalizeOauthScopes(stateRow.requestedScopes)
-            : endpoints.scopes,
+          scopes: authorizedScopes,
           clientIdEnv: client.clientIdEnv,
           clientSecretEnv: client.clientSecret ? client.clientSecretEnv : null,
           credentialScope: credentialScope(connection, input.actor),
@@ -15952,7 +16699,13 @@ export function toolAccessService(
         },
         providerMetadata: {
           ...asRecord(connection.config.providerMetadata),
-          oauth: { expiresAt, scope: token.scope, tokenType: token.tokenType },
+          oauth: {
+            expiresAt,
+            scope: token.scope,
+            scopeSource: organizationGrantedScopes.scopeSource,
+            unrequestedScopes: organizationGrantedScopes.unrequestedScopes,
+            tokenType: token.tokenType,
+          },
         },
       };
       const [updatedConnection] = await tx
@@ -15990,7 +16743,12 @@ export function toolAccessService(
       // Synchronize it after every successful callback/rotation so all real tool
       // execution paths receive the credentials that setup and catalog discovery
       // just proved.
-      await ensureDefaultOrganizationGrant(connection, tx);
+      await ensureDefaultOrganizationGrant(connection, tx, undefined, {
+        scopes: organizationGrantedScopes.scopes,
+        scopeSource: organizationGrantedScopes.scopeSource,
+        unrequestedScopes: organizationGrantedScopes.unrequestedScopes,
+        requestedScopes: authorizedScopes,
+      });
       await syncCredentialBindings(connection, [], tx);
     });
     emitConnectionUpdated(
@@ -16635,6 +17393,100 @@ export function toolAccessService(
         )
         .returning();
       return toStdioCommandTemplate(row);
+    },
+
+    async setupComposioApp(connectionId: string, toolkit: string, input: ComposioAppSetupInput, actor: ActorInfo): Promise<ComposioAppSetupResult> {
+      if (!findComposioCatalogApp(toolkit)) throw notFound("This Composio app is not in the catalog");
+      const { connection, manage } = await openComposioGateway(connectionId, actor);
+      let result = composioAppSetupResult(await manage([{ name: toolkit, action: "list" }]), toolkit);
+      if (input.action === "start" && result.status !== "connected") {
+        result = composioAppSetupResult(await manage([{ name: toolkit, action: "add" }]), toolkit);
+        if (result.status === "not_connected") throw unprocessable("Composio did not return a sign-in link for this app. Manage it in Composio to check its setup requirements.");
+      }
+      if (input.action === "complete") {
+        if (result.status !== "connected") throw conflict("Finish connecting this app in Composio, then check again");
+        const currentConnection = await getConnectionRow(connectionId);
+        if (currentConnection.status !== "active" || !currentConnection.enabled) {
+          throw conflict("The gateway is no longer active. Restore it before connecting this app.");
+        }
+      }
+      await audit({ companyId: connection.companyId, connectionId, action: "tool_connection.upstream_app_setup", outcome: "success", actor,
+        details: { toolkit, action: input.action, status: result.status } });
+      return result;
+    },
+
+    listAggregatorApps: async (connectionId: string, actor: ActorInfo) => aggregatorAppsResponse(await getConnectionRow(connectionId), actor),
+    syncAggregatorApps,
+    refreshAggregatorApps: async (connectionId: string, requested: string[], actor: ActorInfo) => {
+      const connection = await getConnectionRow(connectionId);
+      if (aggregatorProvider(connection) === "composio" && requested.length) {
+        const { manage } = await openComposioGateway(connectionId, actor);
+        if (requested.some(toolkit => !findComposioCatalogApp(toolkit))) throw notFound("This Composio app is not in the catalog");
+        await manage(requested.map(name => ({ name, action: "list" })));
+        return aggregatorAppsResponse(connection, actor);
+      }
+      return syncAggregatorApps(connectionId, true, actor);
+    },
+    configureArcadeDiscovery,
+    syncComposioApps: startComposioAppSync,
+
+    async listComposioApps(connectionId: string, actor: ActorInfo) {
+      const connection = await getConnectionRow(connectionId);
+      if (actor.actorType !== "user" || !actor.actorId) throw forbidden("Board access required");
+      if (connection.config.sourceTemplateKey !== "composio") throw notFound("Composio gateway not found");
+      return composioAppsResponse(connection, actor);
+    },
+
+    async refreshComposioApps(connectionId: string, requested: string[], actor: ActorInfo) {
+      if (requested.some(toolkit => !findComposioCatalogApp(toolkit))) throw notFound("This Composio app is not in the catalog");
+      const { connection, manage } = await openComposioGateway(connectionId, actor);
+      const existing = await cachedComposioApps(connection, actor);
+      // Migrate observations from the original direct setup flow on the first visit.
+      const history = await db.select({ details: toolAccessAuditEvents.details }).from(toolAccessAuditEvents).where(and(
+        eq(toolAccessAuditEvents.companyId, connection.companyId), eq(toolAccessAuditEvents.connectionId, connectionId),
+        eq(toolAccessAuditEvents.actorId, actor.actorId!), eq(toolAccessAuditEvents.action, "tool_connection.upstream_app_setup"),
+      )).orderBy(desc(toolAccessAuditEvents.createdAt)).limit(128);
+      const known = [...existing.filter(app => app.accounts.length > 0).map(app => app.toolkit),
+        ...history.map(row => row.details.toolkit).filter((toolkit): toolkit is string => typeof toolkit === "string" && Boolean(findComposioCatalogApp(toolkit)))];
+      const toolkits = [...new Set([...requested, ...known])];
+      for (let start = 0; start < toolkits.length; start += 32) {
+        await manage(toolkits.slice(start, start + 32).map(name => ({ name, action: "list" })));
+      }
+      return composioAppsResponse(connection, actor);
+    },
+
+    async manageComposioAppAccount(connectionId: string, toolkit: string, input: ComposioAppAccountInput, actor: ActorInfo) {
+      if (!findComposioCatalogApp(toolkit)) throw notFound("This Composio app is not in the catalog");
+      const { connection, manage } = await openComposioGateway(connectionId, actor);
+      if (input.action !== "add") {
+        const before = composioAppAccounts(await manage([{ name: toolkit, action: "list" }]), toolkit);
+        if (!before?.some(account => account.id === input.accountId)) throw notFound("This account is no longer available in the selected Composio app");
+      }
+      const details = { toolkit, ...(input.action !== "add" ? { accountId: input.accountId } : {}) };
+      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!,
+        action: `tool_connection.upstream_account_${input.action}_requested`, entityType: "tool_connection", entityId: connectionId, details });
+      let payload: unknown;
+      try {
+        payload = await manage([{ name: toolkit, action: input.action,
+          ...(input.action !== "add" ? { account_id: input.accountId } : {}), ...(input.action === "rename" ? { alias: input.alias } : {}) }]);
+      } catch (error) {
+        await audit({ companyId: connection.companyId, connectionId, actor, action: `tool_connection.upstream_account_${input.action}`,
+          outcome: "failure", reasonCode: "provider_unconfirmed", details });
+        throw error;
+      }
+      const result = composioAppSetupResult(payload, toolkit); // Reject provider errors before reporting success.
+      if (input.action === "add" && !result.authorizationUrl) throw unprocessable("Composio did not return a sign-in link. Check the app in Composio.");
+      if (input.action !== "add") {
+        const after = composioAppAccounts(await manage([{ name: toolkit, action: "list" }]), toolkit);
+        if (!after || (input.action === "remove" ? after.some(account => account.id === input.accountId)
+          : !after.some(account => account.id === input.accountId && account.alias === input.alias))) {
+          throw conflict("Composio has not confirmed this change. Refresh the accounts before trying again.");
+        }
+      }
+      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!,
+        action: `tool_connection.upstream_account_${input.action}`, entityType: "tool_connection", entityId: connectionId,
+        details: { toolkit, ...(input.action !== "add" ? { accountId: input.accountId } : {}) } });
+      return { ...result, apps: await cachedComposioApps(connection, actor) };
     },
 
     connectGalleryApp,
@@ -17302,7 +18154,7 @@ export function toolAccessService(
             companyId,
             applicationKey: normalizeKey(input.applicationName ?? input.name),
             name: input.applicationName ?? input.name,
-            type: isBrowserUseConnection({ transport, config }) ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
+            type: isBrowserUseConnection({ transport, config }) || isDaytonaConnection({ transport, config }) ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
             status: "active",
             metadata: {},
           })
@@ -17328,6 +18180,9 @@ export function toolAccessService(
             (input.authKind === "oauth" ? "per_user" : "shared"),
           status: input.status ?? "draft",
           enabled: input.enabled ?? false,
+          agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
+            typeof config.sourceTemplateKey === "string" ? getConnectableAppDefinition(config.sourceTemplateKey)?.agentInstructions : null,
+          ),
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
@@ -18032,12 +18887,27 @@ export function toolAccessService(
           );
         }
       }
+      const markMcpAccessConfigured = connection.transport === "mcp_remote"
+        && connection.config.mcpAgentAccessConfigured !== true;
       const accessExtensions: Array<{
         targetType: "company" | "agent";
         targetId: string;
         profileId: string;
       }> = [];
       await db.transaction(async (tx) => {
+        await lockToolConnectionRuntimeInputs(tx, connection.companyId, connection.id);
+        if (markMcpAccessConfigured) {
+          // Preserve an explicit zero-agent selection through OAuth. Merge the
+          // marker in SQL so concurrent credential/config changes are retained.
+          await tx.update(toolConnections).set({
+            config: sql`${toolConnections.config} || '{"mcpAgentAccessConfigured":true}'::jsonb`,
+            transportConfig: sql`${toolConnections.transportConfig} || '{"mcpAgentAccessConfigured":true}'::jsonb`,
+            updatedAt: now(),
+          }).where(and(
+            eq(toolConnections.companyId, connection.companyId),
+            eq(toolConnections.id, connection.id),
+          ));
+        }
         const existing = await tx
           .select()
           .from(toolConnectionInstalls)
@@ -18052,6 +18922,10 @@ export function toolAccessService(
             (install) => `${install.targetType}:${install.targetId}`,
           ),
         );
+        const bindings = await tx.select({ targetType: toolProfileBindings.targetType, targetId: toolProfileBindings.targetId })
+          .from(toolProfileBindings).innerJoin(toolProfiles, eq(toolProfiles.id, toolProfileBindings.profileId))
+          .where(and(eq(toolProfileBindings.companyId, connection.companyId), eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)));
+        await lockToolAssignmentAgents(tx, connection.companyId, [...existing, ...requested.values(), ...bindings]);
         const removals = existing.filter(
           (install) =>
             !requested.has(`${install.targetType}:${install.targetId}`),
@@ -18146,7 +19020,7 @@ export function toolAccessService(
               });
           }
         }
-        if (removeIds.length > 0 || additions.length > 0) {
+        if (markMcpAccessConfigured || removeIds.length > 0 || additions.length > 0) {
           const binding = actorBinding(actor);
           await tx.insert(toolAccessAuditEvents).values({
             companyId: connection.companyId,
@@ -18157,6 +19031,7 @@ export function toolAccessService(
             outcome: "success",
             reasonCode: "installs_changed",
             details: {
+              ...(markMcpAccessConfigured ? { mcpAgentAccessConfigured: true } : {}),
               added: additions.map((install) => ({
                 targetType: install.targetType,
                 targetId: install.targetId,
@@ -18200,6 +19075,10 @@ export function toolAccessService(
       const config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? existing.config,
       );
+      if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
+        const app = getConnectableAppDefinition(config.sourceTemplateKey);
+        if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
+      }
       if (existing.transport === "mcp_remote")
         await assertRemoteConnectionEndpointsAllowed(config);
       if (existing.transport === "local_stdio")
@@ -18216,12 +19095,13 @@ export function toolAccessService(
         ...(input.credentialRefs ?? existing.credentialRefs),
         ...(input.credentialSecretRefs ?? existing.credentialSecretRefs),
       ]);
-      const [row] = await db
+      const write = (database: Db) => database
         .update(toolConnections)
         .set({
           name: input.name ?? existing.name,
           status: input.status ?? existing.status,
           enabled: input.enabled ?? existing.enabled,
+          ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}),
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
@@ -18234,7 +19114,17 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connectionId))
         .returning();
-      await syncCredentialBindings(row);
+      const [row] = existing.transport === "chat_sdk"
+        ? await db.transaction(async tx => {
+            await notifyChatEndpointWork(tx, existing.id);
+            const rows = await write(tx as unknown as Db);
+            // Credential resolution must never observe the binding rebuild's
+            // delete/insert gap after a configuration wake.
+            await syncCredentialBindings(rows[0]!, [], tx);
+            return rows;
+          })
+        : await write(db);
+      if (existing.transport !== "chat_sdk") await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       emitConnectionUpdated(row, existing, "api");
       return toConnection(row);
@@ -18291,6 +19181,7 @@ export function toolAccessService(
     listCatalog: async (
       connectionId: string,
       companyId?: string,
+      actor?: ActorInfo,
     ): Promise<ToolCatalogEntry[]> => {
       const connection = await getConnectionRow(connectionId, companyId);
       let rows = await db
@@ -18298,17 +19189,29 @@ export function toolAccessService(
         .from(toolCatalogEntries)
         .where(eq(toolCatalogEntries.connectionId, connection.id))
         .orderBy(desc(toolCatalogEntries.updatedAt));
-      const cacheExpired =
+      // Native provider catalogs change with the deployed code. Upgrade saved
+      // Daytona connections too; their first small catalog must not survive
+      // merely because REST discovery has no remote MCP cache timer.
+      const nativeDaytona = isDaytonaConnection(connection);
+      const rowsByName = new Map(rows.map((row) => [row.toolName, row]));
+      const daytonaCatalogChanged = nativeDaytona && connection.status === "active" && (
+        rows.some((row) => row.status !== "removed" && !isDaytonaToolName(row.toolName))
+        || DAYTONA_TOOLS.some((tool) => {
+          const existing = rowsByName.get(tool.name);
+          return !existing || existing.versionHash !== descriptorHash(tool, daytonaRisk(tool.name));
+        })
+      );
+      const cacheExpired = daytonaCatalogChanged || (
         connection.transport === "mcp_remote" &&
         connection.status !== "archived" &&
         (rows.length === 0 ||
           !connection.lastCatalogRefreshAt ||
           connection.lastCatalogRefreshAt.getTime() <=
-            now().getTime() - catalogCacheTtlMs);
+            now().getTime() - catalogCacheTtlMs));
       if (cacheExpired) {
         try {
           await singleFlight(catalogRefreshFlights, connection.id, () =>
-            refreshCatalog(connection.id, {
+            refreshCatalog(connection.id, nativeDaytona && actor ? actor : {
               actorType: "system",
               actorId: "tool_catalog_cache",
             }),
@@ -18325,7 +19228,11 @@ export function toolAccessService(
           if (rows.length === 0) throw error;
         }
       }
-      return rows.map((row) => toCatalogEntryForConnection(row, connection));
+      // Even failed discovery must not keep retired native tools visible.
+      // Their database rows remain available to historical invocation records.
+      return rows
+        .filter((row) => !nativeDaytona || (row.status !== "removed" && isDaytonaToolName(row.toolName)))
+        .map((row) => toCatalogEntryForConnection(row, connection));
     },
 
     /** Recent tool-call events for one connection — drives App detail · Recent activity. */
@@ -18699,7 +19606,7 @@ export function toolAccessService(
             asc(toolProfileBindings.createdAt),
           ),
         db
-          .select()
+          .select(profileCatalogColumns)
           .from(toolCatalogEntries)
           .where(
             and(
@@ -18712,11 +19619,11 @@ export function toolAccessService(
           .from(agents)
           .where(eq(agents.companyId, companyId)),
         db
-          .select()
+          .select({ id: toolApplications.id, name: toolApplications.name })
           .from(toolApplications)
           .where(eq(toolApplications.companyId, companyId)),
         db
-          .select()
+          .select({ id: toolConnections.id, name: toolConnections.name })
           .from(toolConnections)
           .where(eq(toolConnections.companyId, companyId)),
       ]);
@@ -18762,9 +19669,7 @@ export function toolAccessService(
       companyId: string,
       input: CreateToolProfileWithEntries,
     ): Promise<ToolProfileWithDetails> => {
-      for (const entry of input.entries ?? []) {
-        await assertProfileEntryInput(companyId, entry);
-      }
+      await assertProfileEntryInputs(db, companyId, input.entries ?? []);
       const [row] = await db
         .insert(toolProfiles)
         .values({
@@ -18793,9 +19698,7 @@ export function toolAccessService(
     ): Promise<ToolProfileWithDetails> => {
       const existing = await getProfileRow(profileId);
       if (input.entries) {
-        for (const entry of input.entries) {
-          await assertProfileEntryInput(existing.companyId, entry);
-        }
+        await assertProfileEntryInputs(db, existing.companyId, input.entries);
       }
       await db
         .update(toolProfiles)
@@ -18903,14 +19806,19 @@ export function toolAccessService(
       summary: ToolProfileSummary;
       reassignedToProfileId: string | null;
       reassignedBindingCount: number;
-    }> => {
-      const existing = await getProfileRow(profileId);
+    }> => db.transaction(async tx => {
+      const existing = await getProfileRow(profileId, undefined, tx);
+      const db = tx as unknown as Db;
+      await tx.select({ id: toolProfiles.id }).from(toolProfiles)
+        .where(and(eq(toolProfiles.companyId, existing.companyId), inArray(toolProfiles.id, [profileId, ...(input.reassignToProfileId ? [input.reassignToProfileId] : [])])))
+        .orderBy(toolProfiles.id).for("update");
+      await lockToolAssignmentAgents(tx, existing.companyId, [{ targetType: "company", targetId: existing.companyId }]);
       if (input.force && input.reassignToProfileId) {
         throw badRequest(
           "Use either force or reassignToProfileId when deleting a tool profile, not both",
         );
       }
-      const details = await profileDetails(existing.id, existing.companyId);
+      const details = await profileDetails(existing.id, existing.companyId, tx);
       if (
         details.summary.isCompanyDefault &&
         !input.force &&
@@ -18932,6 +19840,7 @@ export function toolAccessService(
         const target = await getProfileRow(
           input.reassignToProfileId,
           existing.companyId,
+          tx,
         );
         if (target.status !== "active") {
           throw unprocessable(
@@ -18988,7 +19897,7 @@ export function toolAccessService(
         reassignedToProfileId: input.reassignToProfileId ?? null,
         reassignedBindingCount,
       };
-    },
+    }),
 
     addProfileEntry: async (
       profileId: string,
@@ -19086,12 +19995,15 @@ export function toolAccessService(
       profileId: string,
       input: CreateToolProfileBindingForProfile,
       actor?: ActorInfo,
-    ): Promise<ToolProfileBinding> => {
-      const profile = await getProfileRow(profileId);
+    ): Promise<ToolProfileBinding> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
+      const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
+      if (!profile) throw notFound("Tool profile not found");
       await assertTargetExists(
         profile.companyId,
         input.targetType,
         input.targetId,
+        tx,
       );
       const [row] = await db
         .insert(toolProfileBindings)
@@ -19113,17 +20025,20 @@ export function toolAccessService(
         .set({ updatedAt: new Date() })
         .where(eq(toolProfiles.id, profile.id));
       return toProfileBinding(row);
-    },
+    }),
 
     unbindProfile: async (
       profileId: string,
       input: UnbindToolProfileBinding,
-    ): Promise<{ unbound: number }> => {
-      const profile = await getProfileRow(profileId);
+    ): Promise<{ unbound: number }> => db.transaction(async tx => {
+      const db = tx as unknown as Db;
+      const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
+      if (!profile) throw notFound("Tool profile not found");
       await assertTargetExists(
         profile.companyId,
         input.targetType,
         input.targetId,
+        tx,
       );
       const rows = await db
         .delete(toolProfileBindings)
@@ -19143,7 +20058,7 @@ export function toolAccessService(
           .where(eq(toolProfiles.id, profile.id));
       }
       return { unbound: rows.length };
-    },
+    }),
 
     getEffectiveProfilesForAgent: async (
       companyId: string,
@@ -19340,6 +20255,7 @@ export function toolAccessService(
         input.connectionId,
         input.companyId,
       );
+      if (isDaytonaConnection(connection)) throw forbidden("Daytona credentials stay in the governed tool gateway and cannot be exported.");
       if (isBrowserUseConnection(connection)) throw forbidden("Browser Use credentials stay in the governed tool gateway and cannot be exported.");
       if (connection.connectionPurpose === "ai") throw unprocessable("AI credentials are available only through the runtime resolver");
       const application = await getConnectionApplication(connection);

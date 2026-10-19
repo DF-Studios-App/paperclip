@@ -46,6 +46,7 @@ export const models = [
   { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
   { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
   { id: "claude-haiku-5-5", label: "Claude Haiku 5.5" },
+  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
@@ -54,7 +55,6 @@ export const models = [
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
   { id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
-  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
 ];
 
 export const agentConfigurationDoc = `# claude_local agent configuration
@@ -88,6 +88,7 @@ ACP fields (only when engine="acp"):
 - stateDir (string, optional): ACP session state directory; defaults to Paperclip-managed company/agent scoped storage
 - nonInteractivePermissions (string, optional, default "deny"): fallback when the ACP agent asks for input outside an interactive session
 - warmHandleIdleMs (number, optional, default 0): keep the ACP process warm for this many ms after a successful run
+- stalledToolTimeoutSec (number, optional, default 1800): end the turn as failed ("acpx_tool_stalled") when a pending tool call gets no ACP update for this many seconds; 0 disables it. The default stays at least 15 minutes above MCP_TOOL_TIMEOUT and BASH_MAX_TIMEOUT_MS
 
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
