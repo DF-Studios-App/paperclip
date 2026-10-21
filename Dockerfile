@@ -185,6 +185,12 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+# Antigravity CLI (agy) for the agy_local adapter. It is not on npm; install from
+# the vendor's documented script (https://antigravity.google/docs/getting-started?tab=cli).
+# Installed to /usr/local/bin so the node user can run it. The vendor script runs
+# the binary after install and self-updates, so it is best-effort inside the image.
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+  && agy --version
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
