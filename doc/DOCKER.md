@@ -10,7 +10,7 @@ All commands below assume you are in the **project root** (the directory contain
 docker build -t paperclip-local .
 ```
 
-The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs.
+The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`), the Claude, Codex, OpenCode, Gemini, and Kimi CLIs, and the Antigravity CLI (`agy`) from its vendor install script. Installing `agy` does not sign it in; the `agy_local` adapter still needs an authenticated local account.
 
 Build arguments:
 
