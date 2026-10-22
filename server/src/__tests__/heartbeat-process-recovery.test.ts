@@ -500,17 +500,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   const childProcesses = new Set<ChildProcess>();
   const cleanupPids = new Set<number>();
 
-  function recoveryCompanyRow(
-    rowId: (typeof companies.$inferInsert)["id"],
+  async function seedRecoveryCompany(
+    companyId: string,
     issuePrefix: (typeof companies.$inferInsert)["issuePrefix"],
-  ): typeof companies.$inferInsert {
-    return {
-      id: rowId,
+  ) {
+    await db.insert(companies).values({
+      id: companyId,
       name: "Paperclip",
       issuePrefix,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
-    };
+    });
+    // The account created in beforeAll also needs an active membership for
+    // admission's current responsible-user authorization intersection.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
+    });
   }
 
   function recoveryAgentRow(
@@ -849,7 +858,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
 
     await db.insert(agents).values({
       id: agentId,
@@ -1081,7 +1090,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
 
     await db.insert(agents).values(recoveryAgentRow(agentId, companyId, "CodexCoder", "engineer", "idle"));
 
@@ -1263,9 +1272,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const wakeReason = input?.wakeReason ?? "execution_review_requested";
 
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
 
-    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
     await db.insert(agents).values(recoveryAgentRow(agentId, companyId, "CodexReviewer", "engineer", "idle"));
 
     await db.insert(agentWakeupRequests).values({
@@ -1341,7 +1349,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
 
     await db.insert(agents).values({
       id: agentId,
@@ -1528,9 +1536,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const now = new Date("2026-03-19T00:00:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
 
-    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -8290,19 +8297,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const lease = originalWatch(...args);
       return { ...lease, stop() { stopped(); lease.stop(); } };
     });
-    const originalUpdate = db.update.bind(db);
+    const originalTransaction = db.transaction.bind(db);
     const cleanupFailure = vi.fn(() => { throw new Error("fixture_deadline_cleanup_failure"); });
-    const update = vi.spyOn(db, "update").mockImplementation(((table: typeof heartbeatRuns) => {
-      const builder = originalUpdate(table);
-      const originalSet = builder.set.bind(builder);
-      builder.set = ((values: Record<string, unknown>) => {
-        if (table === heartbeatRuns && Object.keys(values).length === 1 && values.executionControlDeadlineAt === null) {
-          return { where: async () => cleanupFailure() };
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((operation, config) =>
+      originalTransaction(async tx => {
+        const originalUpdate = tx.update.bind(tx);
+        const update = vi.spyOn(tx, "update").mockImplementation(((table: typeof heartbeatRuns) => {
+          const builder = originalUpdate(table);
+          const originalSet = builder.set.bind(builder);
+          builder.set = ((values: Record<string, unknown>) => {
+            if (table === heartbeatRuns && Object.keys(values).length === 1 && values.executionControlDeadlineAt === null) {
+              return { where: async () => cleanupFailure() };
+            }
+            return originalSet(values);
+          }) as typeof builder.set;
+          return builder;
+        }) as typeof tx.update);
+        try {
+          return await operation(tx);
+        } finally {
+          update.mockRestore();
         }
-        return originalSet(values);
-      }) as typeof builder.set;
-      return builder;
-    }) as typeof db.update);
+      }, config));
     const heartbeat = heartbeatService(db);
     try {
       await heartbeat.resumeQueuedRuns();
@@ -8312,7 +8328,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(adapterExecutionControls.has(runId)).toBe(false);
       expect((await heartbeat.getRun(runId))?.status).not.toBe("running");
     } finally {
-      update.mockRestore();
+      transaction.mockRestore();
       watcher.mockRestore();
     }
   });
@@ -10833,7 +10849,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), interactionId = randomUUID();
     const resolvedAt = new Date("2026-03-19T00:05:00.000Z");
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
     await db.insert(agents).values({
       id: agentId, companyId, name: input.agentName ?? "CodexCoder", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {},
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
@@ -11490,7 +11506,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const blockerIssueId = randomUUID();
     const blockedIssueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
     await db.insert(agents).values([
       {
         id: creatorAgentId,
@@ -11617,7 +11633,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const agentId = randomUUID();
     const issueId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(companies).values(recoveryCompanyRow(companyId, issuePrefix));
+    await seedRecoveryCompany(companyId, issuePrefix);
     await db.insert(agents).values(recoveryAgentRow(agentId, companyId, "CodexCoder", "engineer", "idle"));
     await db.insert(issues).values({
       id: issueId,
@@ -11697,7 +11713,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     await heartbeat.reconcileStrandedAssignedIssues();
-    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 31_000));
+    const scheduledRun = (await selectRecoveryRunsByAgent(agentId))
+      .find((row) => row.status === "scheduled_retry");
+    expect(scheduledRun?.scheduledRetryAt).toBeInstanceOf(Date);
+    await heartbeat.promoteDueScheduledRetries(scheduledRun!.scheduledRetryAt!);
     await heartbeat.resumeQueuedRuns();
     // The continuation is produced by completion; wait for that durable boundary.
     await heartbeat.drainActiveRunExecutions();
@@ -11795,7 +11814,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     await heartbeat.reconcileStrandedAssignedIssues();
-    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 31_000));
+    const scheduledRun = (await selectRecoveryRunsByAgent(agentId))
+      .find((row) => row.status === "scheduled_retry");
+    expect(scheduledRun?.scheduledRetryAt).toBeInstanceOf(Date);
+    await heartbeat.promoteDueScheduledRetries(scheduledRun!.scheduledRetryAt!);
     await heartbeat.resumeQueuedRuns();
 
     const retryRun = await waitForValue(async () => {

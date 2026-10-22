@@ -11,17 +11,6 @@ description: >
 
 You run in **heartbeats** — short execution windows triggered by Paperclip. Each heartbeat, you wake up, check your work, do something useful, and exit. You do not run continuously.
 
-## Repository Routing for This Paperclip Project
-
-When a task changes or coordinates work in this Paperclip repository, keep all
-changes and GitHub work in the internal fork `DF-Studios-App/paperclip`. Create
-new GitHub issues and pull requests in that repository only. Target `master`
-for pull requests and use `origin` for pushes. Treat `upstream`
-(`paperclipai/paperclip`) as a read-only source for reference and comparison;
-never push to it or create issues or pull requests there. Before creating an
-issue or pull request, verify the repository target.
-If it is not clearly `DF-Studios-App/paperclip`, stop and ask the user.
-
 ## Terminology
 
 In Paperclip, **task** and **issue** refer to the same work item. The UI may use "task" while APIs, database fields, route names, and older docs may still say "issue"; treat them as the same entity unless a local context explicitly distinguishes them.
@@ -166,6 +155,7 @@ If `currentParticipant` does not match you, do not try to advance the stage — 
 **Step 7 — Do the work.** Use your tools and capabilities. Execution contract:
 
 - If the issue is actionable, start concrete work in the same heartbeat. Do not stop at a plan unless the issue specifically asks for planning.
+- Ask for information only when it prevents the next useful action. Optional reproduction details, an example of a past failure, or a preferred test case do not block general inspection and verification. Continue the independent work; explain what remains unverified if the specific example is still unavailable. Keep real access restrictions and approval gates authoritative.
 - Leave durable progress in comments, issue documents, or work products, then update the issue state/path to a clear final disposition before you exit.
 - Treat comments, documents, screenshots, work products, and `Remaining` bullets as evidence. They are not valid liveness paths by themselves.
 - Use child issues for parallel or long delegated work; do not busy-poll agents, sessions, child issues, or processes waiting for completion.
@@ -563,6 +553,8 @@ Use the task's provided working directory for task files. `AGENT_HOME` holds per
 
 Use `get_workspace` to inspect the current folder, pending selection, and capabilities. Use `list_workspaces` for authorized existing folders and `list_project_repositories` for repository choices. `select_workspace` and `prepare_repository` express intent; the harness validates and prepares it. Respect `next_normal_admission` responses: keep the current root, do not claim the requested checkout exists, and do not retry in a loop or interrupt the run. Project assignment alone does not relocate files. See `references/issue-workspaces.md` for the API equivalents.
 
+Prefer a matching configured, authorized source over guessing a repository URL. Inspect available runtime and testing capabilities before claiming that browser or command testing is unavailable. When an authorized repository is pending and unfinished work needs it, finish independent work, explain the remaining work, and yield. Native Runner can select the saved same-agent continuation from current task context; it does not need a timer or a user restart. A request only to stage a repository can finish normally without starting more work.
+
 ## Issue Workspace Runtime Controls
 
 When an issue needs browser/manual QA or a preview server, inspect its current execution workspace and use Paperclip's workspace runtime controls instead of starting unmanaged background servers yourself.
@@ -798,3 +790,5 @@ provider, and keep the agent assigned with `continuationPolicy: "wake_assignee"`
 so the answer resumes verification. A handoff comment asking the user to comment
 back or reassign the task is not a confirmation card. The card records the user's
 answer; verify the provider's gate and publish result before continuing.
+
+Repository routing for this Paperclip fork: keep changes and GitHub work in `DF-Studios-App/paperclip`. Create issues and pull requests there only, targeting `master`, and push through `origin`. Treat `upstream` (`paperclipai/paperclip`) as read-only: never push to it or create issues or pull requests there. If the target repository is not clearly `DF-Studios-App/paperclip`, stop and ask the user. Full details: `references/repository-routing.md`.

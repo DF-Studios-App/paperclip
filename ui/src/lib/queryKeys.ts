@@ -1,4 +1,8 @@
 export const queryKeys = {
+  agentCommentary: {
+    list: (companyId: string, filters: object) => ["agent-commentary", companyId, "list", filters] as const,
+    detail: (companyId: string, id: string | null) => ["agent-commentary", companyId, "detail", id] as const,
+  },
   skillSources: {
     projects: (companyId: string) => ['project-skill-repositories', companyId] as const,
     preview: (companyId: string, repositoryUrl: string, connectionId: string | null, commitSha: string | null, skillPath: string, filePath: string) => ['skill-sources', companyId, 'preview', repositoryUrl, connectionId, commitSha, skillPath, filePath] as const,
@@ -361,6 +365,9 @@ export const queryKeys = {
         "execution-workspace",
         executionWorkspaceId,
       ] as const,
+    summaries: (companyId: string) => ["issues", companyId, "summaries"] as const,
+    summaryBatch: (companyId: string, userId: string | null | undefined, sortedIds: readonly string[]) =>
+      ["issues", companyId, "summaries", userId ?? "__local_board__", sortedIds] as const,
     detail: (id: string) => ["issues", "detail", id] as const,
     comments: (issueId: string) => ["issues", "comments", issueId] as const,
     commentsList: (issueId: string) =>
@@ -504,6 +511,7 @@ export const queryKeys = {
     accessMembers: (id: string) => ["projects", "access-members", id] as const,
   },
   cases: {
+    handoffs: (id: string) => ["cases", "handoffs", id] as const,
     list: (companyId: string) => ["cases", companyId] as const,
     detail: (id: string) => ["cases", "detail", id] as const,
     documents: (id: string) => ["cases", "documents", id] as const,

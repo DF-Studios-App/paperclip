@@ -25,3 +25,10 @@ Product behavior is covered by
 [`product-harness-responsibility.mdc`](product-harness-responsibility.mdc): routine
 work belongs to the harness, and user-facing detail must support an outcome or a
 real decision. This applies to orchestration as well as UI.
+
+Background execution is covered by
+[`sleep-aware-background-work.mdc`](sleep-aware-background-work.mdc): new or
+expanded work must become quiet, use events and real scheduler deadlines, and
+preserve recovery across transactions, drain, and restart. This rule covers
+`server/src/index.ts` and the worker/producer paths in its scope. It does not
+require unrelated legacy polling to be migrated in the same PR.

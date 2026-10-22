@@ -1,3 +1,4 @@
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
@@ -8,6 +9,7 @@ import {
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
 import { recordNativeLocalProcessStop } from "../native-local-process-stop.js";
+import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
   hasLiveLegacyController,
@@ -16,6 +18,7 @@ import {
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
+import { reconcileRetainedWorkspaces } from "../workspace-recovery.js";
 import { randomUUID } from "node:crypto";
 import {
   and,
@@ -75,6 +78,7 @@ import {
 } from "../hot-restart.js";
 import { serverVersion } from "../../version.js";
 import { adapterExecutionControls, waitForAdapterStop } from "../adapter-execution-control.js";
+import { readRunCancellation } from "../run-cancellation.js";
 import { allowLegacyShutdownWorkspaceCleanup, beginLegacyShutdownWorkspaceSettlement, finishLegacyShutdownWorkspaceSettlement, maintainLegacyShutdownWorkspaceSettlement, sweepLegacyShutdownWorkspaceSettlements } from "../legacy-shutdown-workspace-settlement.js";
 
 import type { environmentService } from "../environments.js";
@@ -82,6 +86,7 @@ import type { environmentRuntimeService, ProviderResourceDisposition } from "../
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import type { HeartbeatRetryDependencies, createHeartbeatRetries } from "./retries.js";
+import type { CancelRunOptions } from "./run-control.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type HeartbeatRetries = ReturnType<typeof createHeartbeatRetries>;
@@ -95,6 +100,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     Awaited<ReturnType<ReturnType<typeof createHeartbeatRunState>["getRun"]>> | null
   >;
   environmentRuntime: ReturnType<typeof environmentRuntimeService>;
+  pluginWorkerManager?: WorkspaceWorkers;
   environmentsSvc: Pick<ReturnType<typeof environmentService>, "getById" | "getLeaseById" | "releaseLease">;
   instructionCopies: Pick<ReturnType<typeof agentInstructionWorkingCopyService>, "recoverStopped" | "recoverCaptured">;
   runtimeEnv: Record<string, string | undefined>;
@@ -144,7 +150,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
   acknowledgeRemoteStop: (runId: string, companyId: string) => Promise<void>;
   resumeRemoteStopComments: (run: HeartbeatRun) => Promise<void>;
   dispatchPendingNativeStatusWakeups: () => Promise<unknown>;
-  cancelRunInternal: (runId: string, reason?: string, options?: { resultJson?: Record<string, unknown> }) => Promise<unknown>;
+  cancelRunInternal: (runId: string, reason?: string, options?: Pick<CancelRunOptions, "resultJson" | "expectedStatus" | "errorCode">) => Promise<unknown>;
   startNextQueuedRunForAgent: (agentId: string) => Promise<unknown>;
 }
 
@@ -910,11 +916,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }
 
   async function recoverNativeRunsAfterRestart(now = new Date()) {
+    await reconcileRetainedWorkspaces(db, environmentRuntime, resumeRemoteStopComments);
     // A result committed before the old controller stopped outranks process
     // recovery. Finish its durable workspace/status suffix before deciding
     // whether any provider authority needs to be reopened.
     await reconcileNativeFinalizations(db, undefined, {
       environmentRuntime,
+      pluginWorkerManager: dependencies.pluginWorkerManager,
       onWorkspaceSettled: settleRecoveredNativeWorkspace,
     });
     await preserveCancelledNativeWorkspaces(db);
@@ -1917,6 +1925,31 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     await preserveCancelledNativeWorkspaces(db);
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
+    // A parked retry has no executor to finish a cancellation after a restart
+    // or a failed status write. Consume its durable intent through normal run
+    // control; the guarded CAS and terminal settlement make competing sweeps
+    // safe, and dispatch cannot promote a fenced retry in the meantime.
+    const interruptedRetryCancellations = await db.select().from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        sql`jsonb_typeof(${heartbeatRuns.resultJson}->'startupCancellation') = 'object'`,
+      ))
+      .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.id))
+      .limit(20);
+    for (const run of interruptedRetryCancellations) {
+      const cancellation = readRunCancellation(run.resultJson);
+      if (!cancellation?.expected) continue;
+      try {
+        await cancelRunInternal(run.id, cancellation.reason, {
+          expectedStatus: "scheduled_retry",
+          errorCode: readNonEmptyString(parseObject(run.resultJson?.startupCancellation).errorCode) ?? "cancelled",
+          resultJson: parseObject(run.resultJson),
+        });
+      } catch (error) {
+        // Leave the durable intent for the next bounded periodic sweep.
+        logger.warn({ err: error, runId: run.id }, "failed to finish interrupted retry cancellation");
+      }
+    }
     // Recovery never launches a provider or infers stopped ownership from
     // terminal status. Uncaptured local copies require durable stop evidence.
     await instructionCopies.recoverStopped().catch(error => {
@@ -1931,6 +1964,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // mode, never the current feature flag.
     await reconcileNativeFinalizations(db, undefined, {
       environmentRuntime,
+      pluginWorkerManager: dependencies.pluginWorkerManager,
       onWorkspaceSettled: settleRecoveredNativeWorkspace,
     }).catch((error) => {
       logger.warn(
@@ -1939,6 +1973,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       );
     });
     scheduleRetainedNativeSessionCleanup();
+    await reconcileRetainedWorkspaces(db, environmentRuntime, resumeRemoteStopComments);
     await dispatchPendingNativeStatusWakeups().catch((error) => {
       logger.warn(
         { err: error },
@@ -2332,6 +2367,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         !revokedState.processPid &&
         !revokedState.processGroupId;
       const shouldRetry =
+        !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         (run.processLossRetryCount ?? 0) < 1 &&
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||

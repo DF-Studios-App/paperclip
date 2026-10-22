@@ -161,6 +161,13 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enablePaperclipNotebook: {
+    title: "Paperclip Notebook",
+    description: "Allow Paperclip Notebook connections and publishing through an explicitly enabled instance rollout.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableMcpAggregators: {
     title: "MCP aggregators (compatibility)",
     description: "Deprecated compatibility key. MCP aggregators are always enabled; stored and managed values are ignored.",
@@ -281,7 +288,7 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
   enableFastResponses: {
     title: "Experimental fast responses",
     description:
-      "Show Connections in company settings and allow short acknowledgements while agents begin work.",
+      "Allow short acknowledgements while agents begin work. Configure them in Settings → Connections.",
     tier: "managed",
     cloudDefault: false,
     selfHostedDefault: false,
