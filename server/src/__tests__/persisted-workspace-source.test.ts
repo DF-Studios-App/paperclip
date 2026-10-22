@@ -91,6 +91,13 @@ describe("persisted Git workspace source", () => {
     expect(await resolvePersistedGitWorkspaceSource(input)).toBe(original);
   });
 
+  it("matches a recorded repository URL that omits the origin's .git suffix", async () => {
+    const { original, workspace, input } = await fixture();
+    expect(await resolvePersistedGitWorkspaceSource({
+      ...input, workspace: { ...workspace, repoUrl: "https://example.invalid/original" },
+    })).toBe(original);
+  });
+
   it("rejects a symlink that redirects a managed source into another repository", async () => {
     const { root, original, input } = await fixture();
     const alias = path.join(root, "scoped", "original");

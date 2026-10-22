@@ -19,7 +19,7 @@ import { runIdentityContexts } from "@paperclipai/db";
 import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
-import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { isManagedGitHubIdentityConnection, resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
@@ -2855,10 +2855,7 @@ export function createToolGatewayService(
             eq(toolConnections.companyId, session.companyId),
           ),
         );
-      if (
-        connection?.config.sourceTemplateKey === "github" ||
-        connection?.transportConfig?.sourceTemplateKey === "github"
-      ) {
+      if (connection && isManagedGitHubIdentityConnection(connection)) {
         let selected = await resolveManagedGitHubIdentitySelection(
           db,
           session.companyId,
@@ -3988,9 +3985,7 @@ export function createToolGatewayService(
     resolveOptions: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
     const tracked =
-      session.identityContextId &&
-      (connection.config.sourceTemplateKey === "github" ||
-        connection.transportConfig?.sourceTemplateKey === "github");
+      session.identityContextId && isManagedGitHubIdentityConnection(connection);
     try {
       const captured = githubOperationCredentials.get(session);
       const headers =
@@ -4500,8 +4495,7 @@ export function createToolGatewayService(
     if (
       session.identityContextId &&
       session.agentId &&
-      (connection.config.sourceTemplateKey === "github" ||
-        connection.transportConfig?.sourceTemplateKey === "github")
+      isManagedGitHubIdentityConnection(connection)
     ) {
       const captured = githubOperationCredentials.get(session);
       const selected = captured
