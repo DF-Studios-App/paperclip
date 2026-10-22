@@ -31,8 +31,131 @@ export interface AgyAccountCandidate {
 /** Used when AGY reports exhausted quota without a "Resets in" duration. */
 export const AGY_DEFAULT_QUOTA_WINDOW_MS = 5 * 60 * 60 * 1000;
 
+/** The id of the sign-in in the Paperclip host's own HOME. */
+export const AGY_DEFAULT_ACCOUNT_ID = "default";
+
 const AGY_ACCOUNT_STATE_FILE = ".paperclip-agy-quota.json";
+const AGY_ACCOUNT_RECORD_FILE = "account.json";
 const ACCOUNT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const COMPANY_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+export interface AgyCompanyAccountRecord {
+  id: string;
+  label: string;
+  home: string;
+  createdAt: string;
+}
+
+/** `<instanceRoot>/companies/<companyId>/agy-accounts`; each child directory is one account HOME. */
+export function resolveAgyCompanyAccountsDir(instanceRoot: string, companyId: string): string {
+  if (!COMPANY_ID_RE.test(companyId)) throw new Error(`Invalid company id '${companyId}'.`);
+  return path.resolve(instanceRoot, "companies", companyId, "agy-accounts");
+}
+
+/** AGY's sign-in file on Linux. Other platforms keep the sign-in in the OS credential store. */
+export function agySignInFile(home: string): string {
+  return path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+}
+
+/** Whether `home` holds an AGY sign-in. Returns true off Linux, where the sign-in is not a file. */
+export async function isAgyHomeSignedIn(home: string, platform: NodeJS.Platform = process.platform): Promise<boolean> {
+  if (platform !== "linux") return true;
+  return pathExists(agySignInFile(home));
+}
+
+/** Company accounts in creation order. Directories without a valid record are ignored. */
+export async function listAgyCompanyAccounts(accountsDir: string): Promise<AgyCompanyAccountRecord[]> {
+  let entries: Array<import("node:fs").Dirent>;
+  try {
+    entries = await fs.readdir(accountsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const records = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && ACCOUNT_ID_RE.test(entry.name) && entry.name !== AGY_DEFAULT_ACCOUNT_ID)
+      .map(async (entry): Promise<AgyCompanyAccountRecord | null> => {
+        const home = path.join(accountsDir, entry.name);
+        try {
+          const raw = JSON.parse(await fs.readFile(path.join(home, AGY_ACCOUNT_RECORD_FILE), "utf8")) as Record<string, unknown>;
+          return {
+            id: entry.name,
+            label: typeof raw.label === "string" && raw.label.trim() ? raw.label.trim() : entry.name,
+            home,
+            createdAt: typeof raw.createdAt === "string" ? raw.createdAt : "",
+          };
+        } catch {
+          return null;
+        }
+      }),
+  );
+  return records
+    .filter((record): record is AgyCompanyAccountRecord => record !== null)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+}
+
+/** Creates the HOME directory and record for a new company account. */
+export async function createAgyCompanyAccount(
+  accountsDir: string,
+  input: { label?: string | null; now?: Date } = {},
+): Promise<AgyCompanyAccountRecord> {
+  await fs.mkdir(accountsDir, { recursive: true });
+  const existing = new Set((await fs.readdir(accountsDir).catch(() => [] as string[])));
+  let index = existing.size + 1;
+  let id = `account-${index}`;
+  while (existing.has(id)) id = `account-${++index}`;
+  const home = path.join(accountsDir, id);
+  await fs.mkdir(home);
+  const record: AgyCompanyAccountRecord = {
+    id,
+    label: input.label?.trim() || id,
+    home,
+    createdAt: (input.now ?? new Date()).toISOString(),
+  };
+  await fs.writeFile(
+    path.join(home, AGY_ACCOUNT_RECORD_FILE),
+    `${JSON.stringify({ label: record.label, createdAt: record.createdAt }, null, 2)}\n`,
+    "utf8",
+  );
+  return record;
+}
+
+/** Deletes a company account HOME, including its AGY sign-in. */
+export async function removeAgyCompanyAccount(accountsDir: string, accountId: string): Promise<boolean> {
+  if (!ACCOUNT_ID_RE.test(accountId) || accountId === AGY_DEFAULT_ACCOUNT_ID) return false;
+  const home = path.resolve(accountsDir, accountId);
+  if (path.dirname(home) !== path.resolve(accountsDir)) return false;
+  const stat = await fs.lstat(home).catch(() => null);
+  if (!stat?.isDirectory()) return false;
+  await fs.rm(home, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * The accounts a run may use, in priority order. An explicit `config.accounts`
+ * list wins. Otherwise the company accounts are used, after the host's own
+ * sign-in when it exists. With no company accounts the list is empty and the
+ * adapter runs exactly as a single-account agent.
+ */
+export async function resolveAgyAccountPool(input: {
+  config: Record<string, unknown>;
+  companyAccountsDir: string | null;
+  defaultHome: string;
+}): Promise<{ accounts: AgyAccount[]; warnings: string[]; source: "config" | "company" | "none" }> {
+  const configured = readAgyAccounts(input.config);
+  if (configured.accounts.length > 0 || configured.warnings.length > 0) {
+    return { ...configured, source: configured.accounts.length > 0 ? "config" : "none" };
+  }
+  if (!input.companyAccountsDir) return { accounts: [], warnings: [], source: "none" };
+  const records = await listAgyCompanyAccounts(input.companyAccountsDir);
+  if (records.length === 0) return { accounts: [], warnings: [], source: "none" };
+  const accounts: AgyAccount[] = [];
+  if (await isAgyHomeSignedIn(input.defaultHome)) accounts.push({ id: AGY_DEFAULT_ACCOUNT_ID, home: null });
+  for (const record of records) {
+    if (await isAgyHomeSignedIn(record.home)) accounts.push({ id: record.id, home: record.home });
+  }
+  return { accounts, warnings: [], source: "company" };
+}
 
 function readAccountEntry(value: unknown): AgyAccount | null {
   if (typeof value === "string") {

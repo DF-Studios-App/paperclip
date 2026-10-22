@@ -10,6 +10,31 @@ export {
 } from "./skills.js";
 export { testEnvironment } from "./test.js";
 export {
+  AGY_DEFAULT_ACCOUNT_ID,
+  createAgyCompanyAccount,
+  isAgyHomeSignedIn,
+  isAgyAccountAvailable,
+  listAgyCompanyAccounts,
+  readAgyAccountState,
+  removeAgyCompanyAccount,
+  resolveAgyAccountPool,
+  resolveAgyCompanyAccountsDir,
+  type AgyCompanyAccountRecord,
+} from "./accounts.js";
+export {
+  AGY_LOGIN_TIMEOUT_MS,
+  agyLoginAsksForCode,
+  agyLoginAsksForMethod,
+  agyLoginReportsFailure,
+  extractAgyAuthorizationUrl,
+  startAgyLogin,
+  stripAgyTerminalOutput,
+  type AgyLoginHandle,
+  type AgyLoginOutcome,
+  type AgyLoginProcess,
+  type StartAgyLoginOptions,
+} from "./login.js";
+export {
   parseAgyOutput,
   parseAntigravityOutput,
   isAgyUnknownSessionError,

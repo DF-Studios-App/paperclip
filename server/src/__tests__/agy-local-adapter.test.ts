@@ -17,6 +17,8 @@ import { DEFAULT_AGY_LOCAL_MODEL, models } from "@paperclipai/adapter-agy-local"
 import { parseAgyStdoutLine, buildAgyLocalConfig } from "@paperclipai/adapter-agy-local/ui";
 import { printAgyStreamEvent } from "@paperclipai/adapter-agy-local/cli";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
+import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import { resolveAgyAccountPool, resolveAgyCompanyAccountsDir } from "@paperclipai/adapter-agy-local/server";
 
 describe("agy_local parser", () => {
   it("extracts session, summary, and terminal error message from text output", () => {
@@ -682,7 +684,9 @@ describe("agy_local multi-account failover", () => {
 
   const mockByHome = (responses: Record<string, ProcResult>) =>
     vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockImplementation(
-      async (_runId, _target, _command, _args, options) => responses[options.env?.HOME ?? ""] ?? ok(SESSION_A),
+      // The default account does not override HOME, so it resolves to the process HOME.
+      async (_runId, _target, _command, _args, options) =>
+        responses[options.env?.HOME || process.env.HOME || ""] ?? ok(SESSION_A),
     );
 
   const readState = async (home: string) =>
@@ -861,6 +865,80 @@ describe("agy_local multi-account failover", () => {
     await expect(
       fs.access(path.join(homeA, ".gemini", ".paperclip-agy-quota.json")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the company accounts after the host sign-in when the agent lists none", async () => {
+    const previousHome = process.env.HOME;
+    const hostHome = path.join(root, "host-home");
+    // The test setup points PAPERCLIP_HOME and PAPERCLIP_INSTANCE_ID at a temporary instance.
+    const instanceRoot = resolvePaperclipInstanceRootForAdapter({ env: process.env });
+    const companyHome = path.join(instanceRoot, "companies", "c1", "agy-accounts", "account-1");
+    for (const home of [hostHome, companyHome]) {
+      await fs.mkdir(path.join(home, ".gemini", "antigravity-cli"), { recursive: true });
+      await fs.writeFile(path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "token");
+    }
+    await fs.writeFile(path.join(companyHome, "account.json"), JSON.stringify({ label: "Conta 2", createdAt: "2026-10-22T00:00:00.000Z" }));
+    process.env.HOME = hostHome;
+    try {
+      const runProcessSpy = mockByHome({ [hostHome]: quota(), [companyHome]: ok(SESSION_B) });
+      const pool = await resolveAgyAccountPool({
+        config: {},
+        companyAccountsDir: resolveAgyCompanyAccountsDir(instanceRoot, "c1"),
+        defaultHome: hostHome,
+      });
+      expect(pool.accounts.map((account) => account.id)).toEqual(["default", "account-1"]);
+      const result = await execute({
+        runId: "run-company-accounts",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: { command: "agy", cwd: process.cwd() },
+        context: {},
+        onLog: vi.fn(),
+      });
+
+      expect(runProcessSpy).toHaveBeenCalledTimes(2);
+      // The default account keeps the process HOME; the company account overrides it.
+      expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBeUndefined();
+      expect(runProcessSpy.mock.calls[1][4].env?.HOME).toBe(companyHome);
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionParams).toMatchObject({ agyAccountId: "account-1" });
+      expect((await readState(hostHome)).exhaustedUntil).toEqual(expect.any(String));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it("gives the next account a handoff with the previous summary and the workspace state", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "agy-handoff-"));
+    const { execFileSync } = await import("node:child_process");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: workspace });
+      await fs.writeFile(path.join(workspace, "feature.ts"), "export const done = true;\n");
+      const runProcessSpy = mockByHome({
+        [homeA]: { exitCode: 1, signal: null, timedOut: false, stdout: "Planning the change\nWrote feature.ts", stderr: QUOTA_4H },
+        [homeB]: ok(SESSION_B),
+      });
+
+      await execute({
+        runId: "run-handoff",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: { ...accountsConfig(), cwd: workspace },
+        context: {},
+        onLog: vi.fn(),
+      });
+
+      expect(runProcessSpy).toHaveBeenCalledTimes(2);
+      const stdin = JSON.parse(runProcessSpy.mock.calls[1][4].stdin?.trim() ?? "{}") as { message?: { content?: string } };
+      const prompt = stdin.message?.content ?? "";
+      expect(prompt).toContain("stopped because");
+      expect(prompt).toContain("Wrote feature.ts");
+      expect(prompt).toContain("feature.ts");
+      expect(prompt).toContain("Review these changes first");
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it("skips an account that is not signed in without recording quota", async () => {

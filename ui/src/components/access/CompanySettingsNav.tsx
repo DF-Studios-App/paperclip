@@ -15,6 +15,7 @@ const items = [
   { value: "instance-profile", label: "Profile", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/profile` },
   { value: "instance-environments", label: "Environments", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/environments` },
   { value: "connections", label: "Connections", href: "/company/settings/connections" },
+  { value: "agy-accounts", label: "Antigravity accounts", href: "/company/settings/agy-accounts" },
   { value: "instance-access", label: "Access", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/access` },
   { value: "instance-experimental", label: "Experimental", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/experimental` },
   { value: "instance-plugins", label: "Plugins", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/plugins` },
@@ -40,6 +41,10 @@ const hiddenSettingKeyByTab: Partial<Record<CompanySettingsTab, string>> = {
 export function getCompanySettingsTab(pathname: string): CompanySettingsTab {
   if (pathname.includes("/company/settings/connections")) {
     return "connections";
+  }
+
+  if (pathname.includes("/company/settings/agy-accounts")) {
+    return "agy-accounts";
   }
 
   if (pathname.includes(`${INSTANCE_SETTINGS_PATH_PREFIX}/profile`)) {
