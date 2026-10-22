@@ -51,6 +51,16 @@ import { resolveAgySkillsHome } from "./skills.js";
 import { buildAgyRemoteSkillsCommand } from "./remote-skills.js";
 import { prepareAgyRuntimeMcpConfig } from "./runtime-config.js";
 import {
+  buildAgyAccountEnv,
+  describeAgyAccountStates,
+  earliestAgyAccountReset,
+  markAgyAccountExhausted,
+  pickAgyAccount,
+  readAgyAccountCandidates,
+  readAgyAccounts,
+  type AgyAccountCandidate,
+} from "./accounts.js";
+import {
   describeAgyFailure,
   detectAgyAuthRequired,
   detectAgyQuotaExhausted,
@@ -264,6 +274,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const graceSec = asNumber(config.graceSec, 20);
 
+  const defaultAgyHome = runtimeEnv.HOME || os.homedir();
+  const { accounts: configuredAgyAccounts, warnings: agyAccountWarnings } = readAgyAccounts(config);
+  for (const warning of agyAccountWarnings) {
+    await onLog("stderr", `[paperclip] ${warning}\n`);
+  }
+  if (executionTargetIsRemote && configuredAgyAccounts.length > 0) {
+    await onLog(
+      "stderr",
+      "[paperclip] AGY accounts apply to local execution only; the remote execution target uses its own AGY sign-in.\n",
+    );
+  }
+  const agyAccountCandidates = executionTargetIsRemote
+    ? []
+    : await readAgyAccountCandidates(configuredAgyAccounts, defaultAgyHome);
+
   await ensureAdapterExecutionTargetRuntimeCommandInstalled({
     runId,
     target: executionTarget,
@@ -417,13 +442,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
-  const canResumeSession =
+  // A conversation belongs to the account that created it. Sessions saved
+  // before accounts were configured belong to the default sign-in.
+  const runtimeSessionAccountId =
+    asString(runtimeSessionParams.agyAccountId, "") ||
+    agyAccountCandidates.find((candidate) => candidate.home === defaultAgyHome)?.account.id ||
+    null;
+  const initialAgyAccount =
+    agyAccountCandidates.length > 0
+      ? pickAgyAccount(agyAccountCandidates, { preferId: runtimeSessionAccountId })
+      : null;
+  const sessionAccountMatches =
+    !initialAgyAccount || initialAgyAccount.account.id === runtimeSessionAccountId;
+  const sessionLocationMatches =
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 ||
       path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+  const canResumeSession = sessionLocationMatches && sessionAccountMatches;
   const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  if (sessionLocationMatches && !sessionAccountMatches && initialAgyAccount) {
+    await onLog(
+      "stdout",
+      `[paperclip] AGY CLI session "${runtimeSessionId}" belongs to account "${runtimeSessionAccountId ?? "unknown"}"; starting a fresh session on account "${initialAgyAccount.account.id}".\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] AGY CLI session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -492,30 +535,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const renderedBootstrapPrompt =
-    !sessionId && bootstrapPromptTemplate.trim().length > 0
-      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-      : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-    resumedSession: Boolean(sessionId),
-  });
-  const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-  const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  const prompt = prefixAgyGoal(joinPromptSections([
-    instructionsPrefix,
-    renderedBootstrapPrompt,
-    wakePrompt,
-    sessionHandoffNote,
-    renderedPrompt,
-  ]));
-  const promptMetrics = {
-    promptChars: prompt.length,
-    instructionsChars: instructionsPrefix.length,
-    bootstrapPromptChars: renderedBootstrapPrompt.length,
-    wakePromptChars: wakePrompt.length,
-    sessionHandoffChars: sessionHandoffNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+  // A resumed conversation only needs the wake delta; a fresh one (first run,
+  // stale-session retry, or another account) needs the full prompt.
+  const buildPrompt = (resumedSession: boolean) => {
+    const renderedBootstrapPrompt =
+      !resumedSession && bootstrapPromptTemplate.trim().length > 0
+        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+        : "";
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession });
+    const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+    const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
+    const prompt = prefixAgyGoal(joinPromptSections([
+      instructionsPrefix,
+      renderedBootstrapPrompt,
+      wakePrompt,
+      sessionHandoffNote,
+      renderedPrompt,
+    ]));
+    return {
+      prompt,
+      promptMetrics: {
+        promptChars: prompt.length,
+        instructionsChars: instructionsPrefix.length,
+        bootstrapPromptChars: renderedBootstrapPrompt.length,
+        wakePromptChars: wakePrompt.length,
+        sessionHandoffChars: sessionHandoffNote.length,
+        heartbeatPromptChars: renderedPrompt.length,
+      },
+    };
   };
 
   const buildArgs = (resumeSessionId: string | null) => {
@@ -544,16 +592,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, account: AgyAccountCandidate | null) => {
     const args = buildArgs(resumeSessionId);
+    const { prompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
+    const accountEnv = account ? await buildAgyAccountEnv(account.home, defaultAgyHome, env) : {};
+    if (account && account.home !== defaultAgyHome) {
+      await ensureAgySkillsInjected(
+        onLog,
+        agySkillEntries,
+        desiredAgySkillNames,
+        path.join(account.home, ".gemini", "skills"),
+      );
+    }
     if (onMeta) {
       await onMeta({
         adapterType: "agy_local",
         command: resolvedCommand,
         cwd: effectiveExecutionCwd,
-        commandNotes,
+        commandNotes: account
+          ? [...commandNotes, `Using AGY account "${account.account.id}" (HOME=${account.home}).`]
+          : commandNotes,
         commandArgs: args,
-        env: loggedEnv,
+        env: { ...loggedEnv, ...accountEnv },
         prompt,
         promptMetrics,
         context,
@@ -567,7 +627,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args,
       {
         cwd,
-        env,
+        env: { ...env, ...accountEnv },
         stdin: `${JSON.stringify({ event: "user", message: { content: prompt } })}\n`,
         timeoutSec,
         graceSec,
@@ -578,6 +638,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return {
       proc,
       parsed: parseAgyOutput(proc.stdout, proc.stderr),
+      account,
     };
   };
 
@@ -591,10 +652,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: string;
       };
       parsed: ReturnType<typeof parseAgyOutput>;
+      account: AgyAccountCandidate | null;
     },
     clearSessionOnMissingSession = false,
     isRetry = false,
   ): AdapterExecutionResult => {
+    const agyAccountId = attempt.account?.account.id ?? null;
     const authMeta = detectAgyAuthRequired({
       stdout: attempt.proc.stdout,
       stderr: attempt.proc.stderr,
@@ -686,6 +749,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ({
           sessionId: resolvedSessionId,
           cwd: effectiveExecutionCwd,
+          ...(agyAccountId ? { agyAccountId } : {}),
           ...(nextCumulativeUsage ? { cumulativeUsage: nextCumulativeUsage } : {}),
           ...(workspaceId ? { workspaceId } : {}),
           ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
@@ -731,6 +795,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson: {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
+        ...(agyAccountId ? { agyAccountId } : {}),
         ...(quotaMeta.exhausted
           ? { errorFamily: "transient_upstream", quotaResetHint: quotaMeta.resetHint }
           : {}),
@@ -743,24 +808,109 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
+  const allAgyAccountsExhaustedResult = (): AdapterExecutionResult => {
+    const states = describeAgyAccountStates(agyAccountCandidates);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `All configured AGY accounts are out of quota (${states}).`,
+      errorCode: "agy_quota_exhausted",
+      errorFamily: "transient_upstream",
+      retryNotBefore: earliestAgyAccountReset(agyAccountCandidates),
+      provider: resolveAgyProvider(model),
+      biller: "google",
+      model,
+      resultJson: { errorFamily: "transient_upstream", agyAccounts: states },
+      clearSession: false,
+    };
+  };
+
+  // Decides whether a finished attempt should move on to the next account:
+  // exhausted account quota (recorded for every agent sharing the account) or
+  // an account that is not signed in. Short upstream errors stay on the account.
+  const accountSwitchReason = async (
+    attempt: Awaited<ReturnType<typeof runAttempt>>,
+    result: AdapterExecutionResult,
+  ): Promise<string | null> => {
+    const account = attempt.account;
+    if (!account || attempt.proc.timedOut) return null;
+    if (result.errorCode === "agy_auth_required") {
+      return `account "${account.account.id}" is not signed in (HOME=${account.home})`;
+    }
+    if (result.errorCode !== "agy_quota_exhausted") return null;
+    const quota = detectAgyQuotaExhausted({ stdout: attempt.proc.stdout, stderr: attempt.proc.stderr });
+    if (quota.kind !== "quota") return null;
+    try {
+      account.state = await markAgyAccountExhausted(account.home, quota);
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[paperclip] Failed to record AGY account "${account.account.id}" quota state: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      account.state = {
+        exhaustedUntil: quota.retryNotBefore,
+        resetHint: quota.resetHint,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return `account "${account.account.id}" quota exhausted${quota.resetHint ? ` (${quota.resetHint})` : ""}`;
+  };
+
   const executeTurn = async (): Promise<AdapterExecutionResult> => {
-    const initial = await runAttempt(sessionId);
+    if (agyAccountCandidates.length > 0 && !initialAgyAccount) {
+      await onLog("stdout", `[paperclip] ${allAgyAccountsExhaustedResult().errorMessage}\n`);
+      return allAgyAccountsExhaustedResult();
+    }
+    let account = initialAgyAccount;
+    let attempt = await runAttempt(sessionId, account);
     ctx.signal?.throwIfAborted();
+    let result: AdapterExecutionResult;
     if (
       sessionId &&
-      !initial.proc.timedOut &&
-      ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.isError) &&
-      isAgyUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
+      !attempt.proc.timedOut &&
+      ((attempt.proc.exitCode ?? 0) !== 0 || attempt.parsed.isError) &&
+      isAgyUnknownSessionError(attempt.proc.stdout, attempt.proc.stderr)
     ) {
       await onLog(
         "stdout",
         `[paperclip] AGY CLI resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+      attempt = await runAttempt(null, account);
+      ctx.signal?.throwIfAborted();
+      result = toResult(attempt, true, true);
+    } else {
+      result = toResult(attempt);
     }
 
-    return toResult(initial);
+    const triedAccountIds = new Set<string>();
+    while (account) {
+      triedAccountIds.add(account.account.id);
+      const reason = await accountSwitchReason(attempt, result);
+      if (!reason) break;
+      const next = pickAgyAccount(agyAccountCandidates, { exclude: triedAccountIds });
+      if (!next) {
+        const states = describeAgyAccountStates(agyAccountCandidates);
+        await onLog("stdout", `[paperclip] AGY ${reason}; no other account is available (${states}).\n`);
+        if (result.errorCode === "agy_quota_exhausted") {
+          result = {
+            ...result,
+            retryNotBefore: earliestAgyAccountReset(agyAccountCandidates) ?? result.retryNotBefore,
+            errorMessage: `${result.errorMessage ?? "AGY quota exhausted."} All configured AGY accounts are out of quota (${states}).`,
+          };
+        }
+        break;
+      }
+      await onLog(
+        "stdout",
+        `[paperclip] AGY ${reason}; switching to account "${next.account.id}" with a fresh session.\n`,
+      );
+      account = next;
+      attempt = await runAttempt(null, account);
+      ctx.signal?.throwIfAborted();
+      result = toResult(attempt, true, true);
+    }
+    return result;
   };
 
   try {
