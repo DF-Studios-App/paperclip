@@ -42,6 +42,7 @@ import {
   parseObject,
   renderTemplate,
   renderPaperclipWakePrompt,
+  resolvePaperclipInstanceRootForAdapter,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -57,7 +58,8 @@ import {
   markAgyAccountExhausted,
   pickAgyAccount,
   readAgyAccountCandidates,
-  readAgyAccounts,
+  resolveAgyAccountPool,
+  resolveAgyCompanyAccountsDir,
   type AgyAccountCandidate,
 } from "./accounts.js";
 import {
@@ -81,6 +83,70 @@ function resolveAgyProvider(model: string): string | null {
   if (normalized.startsWith("claude-")) return "anthropic";
   if (normalized.startsWith("gpt-")) return "openai";
   return null;
+}
+
+const HANDOFF_SUMMARY_LIMIT = 4000;
+const HANDOFF_STATUS_LIMIT = 4000;
+
+function clipForHandoff(text: string, limit: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > limit ? `…${trimmed.slice(-limit)}` : trimmed;
+}
+
+/**
+ * The state a new account needs to continue an interrupted run: what the
+ * previous attempt reported and what is already on the workspace. Git status
+ * is read from the working tree, so the agent continues from real changes and
+ * does not trust its own memory of them.
+ */
+export async function buildAccountSwitchHandoff(input: {
+  cwd: string;
+  previousAccountId: string;
+  nextAccountId: string;
+  previousSummary: string | null;
+  reason: string;
+}): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const git = (args: string[]) =>
+    new Promise<string>((resolve) => {
+      execFile("git", args, { cwd: input.cwd, timeout: 15_000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+        resolve(error ? "" : stdout);
+      });
+    });
+  const [status, diffStat] = await Promise.all([
+    git(["status", "--porcelain"]),
+    git(["diff", "--stat"]),
+  ]);
+  const sections = [
+    `The previous run stopped because ${input.reason}. It continues now on account "${input.nextAccountId}".`,
+    "This is a new conversation. Do not repeat work that is already on the workspace.",
+  ];
+  if (input.previousSummary?.trim()) {
+    sections.push(
+      "What the previous attempt reported before it stopped:",
+      clipForHandoff(input.previousSummary, HANDOFF_SUMMARY_LIMIT),
+    );
+  }
+  const changes = clipForHandoff(`${status}${diffStat ? `\n${diffStat}` : ""}`, HANDOFF_STATUS_LIMIT);
+  sections.push(
+    changes
+      ? `Current workspace changes (git status and diff stat):\n${changes}`
+      : "The workspace has no uncommitted changes yet. The previous attempt may have made none, or it may have committed them.",
+    "Review these changes first, then continue the assigned task from where it stopped.",
+  );
+  return sections.join("\n\n");
+}
+
+function prefixAccountHandoff(handoff: string, prompt: string): string {
+  return joinPromptSections([handoff, prompt]);
+}
+
+function resolveAgyCompanyAccountsDirForRun(companyId: string, env: NodeJS.ProcessEnv): string | null {
+  try {
+    return resolveAgyCompanyAccountsDir(resolvePaperclipInstanceRootForAdapter({ env }), companyId);
+  } catch {
+    return null;
+  }
 }
 
 function parseCumulativeUsage(value: unknown): UsageSummary | null {
@@ -275,7 +341,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const graceSec = asNumber(config.graceSec, 20);
 
   const defaultAgyHome = runtimeEnv.HOME || os.homedir();
-  const { accounts: configuredAgyAccounts, warnings: agyAccountWarnings } = readAgyAccounts(config);
+  const { accounts: configuredAgyAccounts, warnings: agyAccountWarnings } = await resolveAgyAccountPool({
+    config,
+    companyAccountsDir: resolveAgyCompanyAccountsDirForRun(agent.companyId, runtimeEnv),
+    defaultHome: defaultAgyHome,
+  });
   for (const warning of agyAccountWarnings) {
     await onLog("stderr", `[paperclip] ${warning}\n`);
   }
@@ -592,9 +662,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null, account: AgyAccountCandidate | null) => {
+  const runAttempt = async (
+    resumeSessionId: string | null,
+    account: AgyAccountCandidate | null,
+    handoff = "",
+  ) => {
     const args = buildArgs(resumeSessionId);
-    const { prompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
+    const built = buildPrompt(Boolean(resumeSessionId));
+    const prompt = handoff ? prefixAccountHandoff(handoff, built.prompt) : built.prompt;
+    const promptMetrics = { ...built.promptMetrics, accountHandoffChars: handoff.length };
     const accountEnv = account ? await buildAgyAccountEnv(account.home, defaultAgyHome, env) : {};
     if (account && account.home !== defaultAgyHome) {
       await ensureAgySkillsInjected(
@@ -905,8 +981,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] AGY ${reason}; switching to account "${next.account.id}" with a fresh session.\n`,
       );
+      const handoff = await buildAccountSwitchHandoff({
+        cwd: effectiveExecutionCwd,
+        previousAccountId: account.account.id,
+        nextAccountId: next.account.id,
+        previousSummary: attempt.parsed.summary,
+        reason,
+      });
       account = next;
-      attempt = await runAttempt(null, account);
+      attempt = await runAttempt(null, account, handoff);
       ctx.signal?.throwIfAborted();
       result = toResult(attempt, true, true);
     }
