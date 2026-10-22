@@ -8,3 +8,7 @@ skills/** text=auto eol=lf
 # exact bytes (CRLF in the recorded copies) in git and on every checkout.
 packages/db/src/migrations/** -text
 packages/plugins/plugin-llm-wiki/migrations/** -text
+
+# Bundled skill release files are compared byte-for-byte with the snapshot stored
+# when a company is seeded. Keep their exact bytes in git and on every checkout.
+skills-releases/paperclip/** -text
