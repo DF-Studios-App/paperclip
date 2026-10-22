@@ -25,6 +25,8 @@ declare global {
           status?: string;
         }>;
         isInstanceAdmin?: boolean;
+        /** The company's root CEO. Passes board-only guards, limited to its own company. */
+        isLeaderAgent?: boolean;
         keyId?: string;
         keyScope?: AgentApiKeyScope;
         runId?: string;

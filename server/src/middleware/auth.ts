@@ -23,6 +23,7 @@ import {
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
+import { isRootLeaderAgent, leaderUserIdForCompany } from "../lib/root-leader-agent.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
@@ -466,6 +467,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         userId: onBehalfOfUserId,
       });
 
+      const isLeader = await isRootLeaderAgent(db, agentRecord);
       req.actor = {
         type: "agent",
         agentId: claims.sub,
@@ -477,6 +479,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         ...(claims.authorizing_user_id ? { authorizingUserId: claims.authorizing_user_id } : {}),
         identityContextId: identityRun?.activeIdentityContextId ?? null,
         onBehalfOfMemberships,
+        ...(isLeader ? { isLeaderAgent: true, userId: leaderUserIdForCompany(claims.company_id), companyIds: [claims.company_id] } : {}),
         source: "agent_jwt",
       };
       next();
@@ -522,6 +525,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const isLeader = await isRootLeaderAgent(db, agentRecord);
     req.actor = {
       type: "agent",
       agentId: key.agentId,
@@ -534,6 +538,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         userId: responsibleUserId,
       }),
       runId: runIdHeader || undefined,
+      ...(isLeader ? { isLeaderAgent: true, userId: leaderUserIdForCompany(key.companyId), companyIds: [key.companyId] } : {}),
       source: "agent_key",
     };
 

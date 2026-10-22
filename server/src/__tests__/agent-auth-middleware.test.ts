@@ -41,6 +41,9 @@ function createDbState(input: {
     id: input.agent.id,
     companyId: input.agent.companyId,
     status: input.agent.status ?? "active",
+    role: "engineer",
+    reportsTo: null,
+    metadata: null,
   };
   const keyRow = input.agentKey
     ? {

@@ -1,3 +1,4 @@
+import { isBoardOrLeader } from "./authz.js";
 /**
  * @fileoverview Plugin management REST API routes
  *
@@ -647,7 +648,7 @@ export function pluginRoutes(
       throw unprocessable("Webhook-scoped plugin API routes require a signature verifier and are not enabled");
     }
     assertAuthenticated(req);
-    if (req.actor.type !== "board" && req.actor.type !== "agent") {
+    if (!isBoardOrLeader(req) && req.actor.type !== "agent") {
       throw forbidden("Board or agent access required");
     }
   }

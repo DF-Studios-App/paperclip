@@ -1,3 +1,4 @@
+import { isBoardOrLeader } from "./authz.js";
 import express, { Router, type ErrorRequestHandler, type RequestHandler } from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -204,7 +205,7 @@ export function publicMcpManagementRoutes(oauth: PublicMcpOAuth, agentOAuth?: Pu
   };
   const deviceOAuth = async (code: string) => agentOAuth && await agentOAuth.ownsDevice(code) ? agentOAuth : oauth;
   const realUser: RequestHandler = (req, _res, next) => {
-    if (req.actor.type !== "board" || !req.actor.userId || !["session", "cloud_tenant"].includes(req.actor.source ?? "")) {
+    if (!isBoardOrLeader(req) || !req.actor.userId || !["session", "cloud_tenant"].includes(req.actor.source ?? "")) {
       throw new McpOAuthError("access_denied", "Sign in to manage assistant connections.", 401);
     }
     next();

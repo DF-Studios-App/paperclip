@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { activityLog, agents, companies, companyMemberships, createDb, principalPermissionGrants } from "@paperclipai/db";
-import { LOW_TRUST_REVIEW_PRESET, type PermissionKey } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, PERMISSION_KEYS, type PermissionKey } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.js";
+import { builtInAgentService } from "../services/built-in-agents.js";
 import { authorizationService } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { agentJoinGrantsFromDefaults } from "../services/invite-grants.js";
@@ -135,6 +136,48 @@ describeDatabase("new agent configuration defaults", () => {
     await agentService(db).remove(peer.id);
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.principalId, peer.id))).toEqual([]);
+
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
+    await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
+    await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
+    await db.delete(companies).where(eq(companies.id, companyId));
+  });
+
+  it("gives the root CEO every permission key", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Root CEO grants",
+      issuePrefix: `RC${companyId.slice(0, 6).toUpperCase()}`,
+    });
+    const ceo = await createAgentLifecycle(db).requestHire(companyId, {
+      name: "CEO",
+      role: "ceo",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+
+    const ceoKeys = (await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.companyId, companyId)))
+      .filter((grant) => grant.principalId === ceo.id)
+      .map((grant) => grant.permissionKey);
+    expect(ceoKeys).toEqual(expect.arrayContaining([...PERMISSION_KEYS]));
+    for (const permissionKey of PERMISSION_KEYS) {
+      if (permissionKey === "tasks:assign_scope") continue; // Requires a structured scope; checked below.
+      expect(await accessService(db).hasPermission(companyId, "agent", ceo.id, permissionKey)).toBe(true);
+    }
+    expect(await authorizationService(db).decidePrincipalGrant({
+      companyId,
+      principalType: "agent",
+      principalId: ceo.id,
+      action: "tasks:assign",
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentId: ceo.id },
+    })).toMatchObject({ allowed: true });
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));

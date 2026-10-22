@@ -32,6 +32,7 @@ import type {
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
 import {
+  DEFAULT_TRUST_PRESET,
   LOW_TRUST_REVIEW_PRESET,
   extractAgentMentionIds,
   trustPresetSchema,
@@ -65,6 +66,8 @@ export type AuthorizationActor =
     keyScope?: AgentApiKeyScope | null;
     runId?: string | null;
     onBehalfOfUserId?: string | null;
+    /** The company's root CEO: board-equivalent, so responsible-user, authorizing-user and low-trust limits do not apply. */
+    isLeaderAgent?: boolean;
     /** Pinned, server-derived external authorizer; never an agent-selected principal. */
     authorizingUserId?: string | null;
     source?:
@@ -1162,6 +1165,9 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     companyId: string;
     resource: AuthorizationResource;
   }): Promise<TrustPresetResolution> {
+    if (input.actor.isLeaderAgent) {
+      return { kind: "standard", preset: DEFAULT_TRUST_PRESET, boundary: null, sourcePresets: {} };
+    }
     const { issue, project } = await loadResourceContext(input.resource);
     const run = await loadRunPolicy(input.actor.runId, input.companyId, input.actorAgent.id);
     const resolution = resolveCoreTrustPreset({
@@ -2676,6 +2682,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     const responsibleUserId = input.actor.onBehalfOfUserId?.trim();
     if (
       input.actor.type !== "agent" ||
+      input.actor.isLeaderAgent ||
       input.action === "inbox:manage" ||
       !responsibleUserId ||
       !agentDecision.allowed
@@ -2773,7 +2780,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     agentDecision: AuthorizationDecision,
   ): Promise<AuthorizationDecision> {
     const authorizingUserId = input.actor.authorizingUserId?.trim();
-    if (input.actor.type !== "agent" || !authorizingUserId || !agentDecision.allowed) return agentDecision;
+    if (input.actor.type !== "agent" || input.actor.isLeaderAgent || !authorizingUserId || !agentDecision.allowed) return agentDecision;
 
     const companyId = companyIdForResource(input.resource);
     // External authority always uses current membership, without the request's
@@ -2895,7 +2902,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
   // still evaluated by decide(). Project policies can contribute an additional
   // root/project scope, so the query must also retain projects with such policy.
   async function projectDiscoveryCandidateIds(actor: AuthorizationActor, companyId: string): Promise<string[] | null> {
-    if (actor.type !== "agent" || !actor.agentId || actor.keyScope) return null;
+    if (actor.type !== "agent" || !actor.agentId || actor.keyScope || actor.isLeaderAgent) return null;
     const agent = await loadAgent(actor.agentId);
     if (!agent || agent.companyId !== companyId) return [];
     const run = await loadRunPolicy(actor.runId, companyId, agent.id);

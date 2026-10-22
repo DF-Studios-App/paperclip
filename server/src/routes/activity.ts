@@ -4,7 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess, isBoardOrLeader } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
 import { badRequest, forbidden } from "../errors.js";
@@ -127,7 +127,7 @@ export function activityRoutes(db: Db) {
   const agentAudit = agentActionAuditService(db);
 
   async function hasAgentAuditPermission(req: import("express").Request, companyId: string) {
-    if (req.actor.type !== "board") return false;
+    if (!isBoardOrLeader(req)) return false;
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
     return Boolean(
       req.actor.userId

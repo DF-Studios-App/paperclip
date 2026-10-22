@@ -6,7 +6,7 @@ import { forbidden, notFound } from "../errors.js";
 import { accessService, heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { summarySlotService } from "../services/summary-slots.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 
 function readScopeId(req: Request): string | null {
   const raw = req.query.scopeId;
@@ -40,7 +40,7 @@ export function summarySlotRoutes(db: Db) {
   /** Manual generate is a board/user action; agents cannot trigger it. */
   async function assertCanGenerateSummary(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       throw forbidden("Only board operators can generate summaries.");
     }
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;

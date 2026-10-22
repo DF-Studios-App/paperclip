@@ -4,7 +4,7 @@ import { updateInboxAgentPolicySchema } from "@paperclipai/shared";
 import { forbidden, notFound, unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService, inboxAgentPolicyService, logActivity } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 
 export function inboxAgentPolicyRoutes(db: Db) {
   const router = Router();
@@ -12,7 +12,7 @@ export function inboxAgentPolicyRoutes(db: Db) {
   const policies = inboxAgentPolicyService(db);
 
   function selfUserId(req: Request) {
-    if (req.actor.type !== "board" || !req.actor.userId) throw unauthorized("Board user context required");
+    if (!isBoardOrLeader(req) || !req.actor.userId) throw unauthorized("Board user context required");
     return req.actor.userId;
   }
 

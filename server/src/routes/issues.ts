@@ -1,3 +1,4 @@
+import { isBoardOrLeader } from "./authz.js";
 import { parseObject } from "../adapters/utils.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -4960,7 +4961,7 @@ export function issueRoutes(
   }
 
   async function canUseIssueBreakGlass(req: Request, issue: { companyId: string }) {
-    if (req.actor.type !== "board" || !req.actor.userId) return false;
+    if (!isBoardOrLeader(req) || !req.actor.userId) return false;
     return db
       .select({ role: companyMemberships.membershipRole })
       .from(companyMemberships)
@@ -5139,7 +5140,7 @@ export function issueRoutes(
     res: Response,
     issue: { companyId: string; responsibleUserId: string | null; createdByUserId: string | null; assigneeUserId: string | null },
   ) {
-    if (req.actor.type !== "board" || !req.actor.userId) {
+    if (!isBoardOrLeader(req) || !req.actor.userId) {
       res.status(403).json({ error: "Only a responsible user, issue owner, or administrator can manage issue privacy" });
     return false;
     }
@@ -6819,7 +6820,7 @@ export function issueRoutes(
   ) {
     // Agents may still finish reporting an interrupted run. New operator
     // messages must not enter the paused-conversation triage wake path.
-    if (req.actor.type !== "board") return true;
+    if (!isBoardOrLeader(req)) return true;
     const hold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
     if (!hold) return true;
     res.status(409).json({
@@ -8179,7 +8180,7 @@ export function issueRoutes(
     }
     let query = parsedQuery.data;
     if (query.assigneeUserId === "me") {
-      if (req.actor.type !== "board" || !req.actor.userId) {
+      if (!isBoardOrLeader(req) || !req.actor.userId) {
         res
           .status(403)
           .json({ error: "assigneeUserId=me requires board authentication" });
@@ -8268,7 +8269,7 @@ export function issueRoutes(
       res.status(400).json({ error: "includeParticipatedTasks must be true or false when provided" });
       return;
     }
-    if (includeParticipatedTasks && (req.actor.type !== "board" || !req.actor.userId)) {
+    if (includeParticipatedTasks && (!isBoardOrLeader(req) || !req.actor.userId)) {
       res.status(403).json({ error: "includeParticipatedTasks requires board authentication" });
       return;
     }
@@ -8286,7 +8287,7 @@ export function issueRoutes(
 
     if (
       assigneeUserFilterRaw === "me" &&
-      (!assigneeUserId || req.actor.type !== "board")
+      (!assigneeUserId || !isBoardOrLeader(req))
     ) {
       res
         .status(403)
@@ -8295,7 +8296,7 @@ export function issueRoutes(
     }
     if (
       touchedByUserFilterRaw === "me" &&
-      (!touchedByUserId || req.actor.type !== "board")
+      (!touchedByUserId || !isBoardOrLeader(req))
     ) {
       res
         .status(403)
@@ -8304,7 +8305,7 @@ export function issueRoutes(
     }
     if (
       inboxArchivedByUserFilterRaw === "me" &&
-      (!inboxArchivedByUserId || req.actor.type !== "board")
+      (!inboxArchivedByUserId || !isBoardOrLeader(req))
     ) {
       res.status(403).json({
         error: "inboxArchivedByUserId=me requires board authentication",
@@ -8313,7 +8314,7 @@ export function issueRoutes(
     }
     if (
       unreadForUserFilterRaw === "me" &&
-      (!unreadForUserId || req.actor.type !== "board")
+      (!unreadForUserId || !isBoardOrLeader(req))
     ) {
       res
         .status(403)
@@ -9840,7 +9841,7 @@ export function issueRoutes(
             const failedRunId = activeRecoveryAction.evidence?.runId;
             if (
               !opts.chatRunRetries ||
-              req.actor.type !== "board" ||
+              !isBoardOrLeader(req) ||
               !req.actor.userId ||
               typeof failedRunId !== "string" ||
               !isUuidLike(failedRunId) ||
@@ -10819,7 +10820,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board authentication required" });
       return;
     }
@@ -10876,7 +10877,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board authentication required" });
       return;
     }
@@ -11112,7 +11113,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board authentication required" });
       return;
     }
@@ -11786,7 +11787,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board authentication required" });
       return;
     }
@@ -11825,7 +11826,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board authentication required" });
       return;
     }
@@ -13875,7 +13876,7 @@ export function issueRoutes(
           });
           return;
         }
-        if (req.actor.type !== "board") {
+        if (!isBoardOrLeader(req)) {
           res.status(403).json({
             error:
               "Only board users can interrupt active runs from issue comments",
@@ -16044,7 +16045,7 @@ export function issueRoutes(
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res.status(403).json({ error: "Board access required" });
       return;
     }
@@ -17982,7 +17983,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res
         .status(403)
         .json({ error: "Only board users can view feedback votes" });
@@ -18005,7 +18006,7 @@ export function issueRoutes(
       "Issue not found",
     );
     if (!issue) return;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res
         .status(403)
         .json({ error: "Only board users can view feedback traces" });
@@ -18044,7 +18045,7 @@ export function issueRoutes(
 
   router.get("/feedback-traces/:traceId", async (req, res) => {
     const traceId = req.params.traceId as string;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res
         .status(403)
         .json({ error: "Only board users can view feedback traces" });
@@ -18063,7 +18064,7 @@ export function issueRoutes(
 
   router.get("/feedback-traces/:traceId/bundle", async (req, res) => {
     const traceId = req.params.traceId as string;
-    if (req.actor.type !== "board") {
+    if (!isBoardOrLeader(req)) {
       res
         .status(403)
         .json({ error: "Only board users can view feedback trace bundles" });
@@ -18080,7 +18081,7 @@ export function issueRoutes(
   router.get("/companies/:companyId/chats", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
+    if (!isBoardOrLeader(req) || !req.actor.userId) throw forbidden("Board user access required");
     if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
     const conversations = await svc.listConversations(companyId, req.actor.userId);
     res.json(await filterIssuesForActor(req, conversations));
@@ -18091,7 +18092,7 @@ export function issueRoutes(
     router[method]("/companies/:companyId/chats/:agentRef", async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
+      if (!isBoardOrLeader(req) || !req.actor.userId) throw forbidden("Board user access required");
       if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
       const resolved = await agentsSvc.resolveByReference(companyId, req.params.agentRef as string);
       if (resolved.ambiguous) throw conflict("Agent reference is ambiguous");
@@ -18426,7 +18427,7 @@ export function issueRoutes(
       }
 
       if (interruptRequested) {
-        if (req.actor.type !== "board") {
+        if (!isBoardOrLeader(req)) {
           res.status(403).json({
             error:
               "Only board users can interrupt active runs from issue comments",
@@ -19179,7 +19180,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      if (req.actor.type !== "board") {
+      if (!isBoardOrLeader(req)) {
         res
           .status(403)
           .json({ error: "Only board users can vote on AI feedback" });

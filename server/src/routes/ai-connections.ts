@@ -26,7 +26,7 @@ import {
   type AiConnectionList,
   aiConnectionPoolConfigSchema,
 } from "@paperclipai/shared";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
@@ -122,7 +122,7 @@ export async function assertAiConnectionCreateAccess(
 export async function canInstallSharedAiConnectionForNewAgent(
   db: Db, req: Request, companyId: string, binding: AiConnectionBinding,
 ): Promise<boolean> {
-  if (req.actor.type !== "board" || binding.mode !== "shared") return false;
+  if (!isBoardOrLeader(req) || binding.mode !== "shared") return false;
   assertCompanyAccess(req, companyId);
   const member = req.actor.memberships?.find(m => m.companyId === companyId && m.status === "active");
   if (member?.membershipRole === "viewer") return false;
