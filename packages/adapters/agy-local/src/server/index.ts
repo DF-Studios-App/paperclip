@@ -65,9 +65,11 @@ function normalizeAgySessionParams(raw: unknown): Record<string, unknown> | null
       : undefined;
   const rawCumulativeUsage = record.cumulativeUsage ?? record.cumulative_usage;
   const cumulativeUsage = readCumulativeUsage(rawCumulativeUsage);
+  const agyAccountId = readNonEmptyString(record.agyAccountId);
   return {
     sessionId,
     ...(cwd ? { cwd } : {}),
+    ...(agyAccountId ? { agyAccountId } : {}),
     ...(cumulativeUsage ? { cumulativeUsage } : {}),
     ...(workspaceId ? { workspaceId } : {}),
     ...(repoUrl ? { repoUrl } : {}),

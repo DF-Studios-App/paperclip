@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type {
   AdapterEnvironmentCheck,
@@ -18,6 +20,7 @@ import {
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { isAgyAccountAvailable, readAgyAccountCandidates, readAgyAccounts } from "./accounts.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -158,6 +161,53 @@ export async function testEnvironment(
           hint: "Verify if agy command is correctly installed and configured.",
         });
       }
+    }
+  }
+
+  const { accounts, warnings: accountWarnings } = readAgyAccounts(config);
+  for (const warning of accountWarnings) {
+    checks.push({ code: "agy_account_invalid", level: "warn", message: warning });
+  }
+  if (accounts.length > 0 && targetIsRemote) {
+    checks.push({
+      code: "agy_accounts_remote_ignored",
+      level: "warn",
+      message: "AGY accounts apply to local execution only; this remote target uses its own AGY sign-in.",
+    });
+  } else if (accounts.length > 0) {
+    const candidates = await readAgyAccountCandidates(accounts, runtimeEnv.HOME || os.homedir());
+    for (const candidate of candidates) {
+      const label = `AGY account "${candidate.account.id}" (HOME=${candidate.home})`;
+      // On Linux AGY stores its sign-in as a file; elsewhere it uses the OS
+      // credential store, which a separate HOME does not isolate.
+      const signInFile = path.join(candidate.home, ".gemini", "antigravity-cli", "antigravity-oauth-token");
+      const homeExists = await fs.access(candidate.home).then(() => true, () => false);
+      const signedIn =
+        process.platform !== "linux" || (await fs.access(signInFile).then(() => true, () => false));
+      if (!homeExists || !signedIn) {
+        checks.push({
+          code: "agy_account_not_signed_in",
+          level: "warn",
+          message: `${label} has no AGY sign-in.`,
+          hint: `Sign in once with: HOME=${candidate.home} agy`,
+        });
+      } else if (!isAgyAccountAvailable(candidate.state)) {
+        checks.push({
+          code: "agy_account_quota_exhausted",
+          level: "info",
+          message: `${label} is out of quota until ${candidate.state?.exhaustedUntil}.`,
+        });
+      } else {
+        checks.push({ code: "agy_account_ready", level: "info", message: `${label} is configured.` });
+      }
+    }
+    if (process.platform !== "linux") {
+      checks.push({
+        code: "agy_accounts_shared_credential_store",
+        level: "warn",
+        message:
+          "On this OS AGY keeps its sign-in in the OS credential store, so separate account HOME directories may share one sign-in. Multi-account switching is supported on Linux hosts such as the Docker image.",
+      });
     }
   }
 
