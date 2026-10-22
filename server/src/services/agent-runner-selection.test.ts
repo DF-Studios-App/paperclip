@@ -74,8 +74,97 @@ describe("server-owned Codex runner selection", () => {
     expect(resolveNewAgentRunner(resolved)).toEqual(resolved);
     expect(input.adapterConfig).toHaveProperty("search", false);
   });
-  it.each(["claude_local", "opencode_local", "grok_local", "cursor", "pi_local", "process", "external"])("keeps %s default unchanged", adapterType => {
+  it.each(["grok_local", "cursor", "process", "external"])("keeps %s default unchanged", adapterType => {
     expect(resolveNewAgentRunner({ adapterType, target, adapterConfig: { custom: "preserved" } })).toEqual({ adapterType, adapterConfig: { custom: "preserved" } });
+  });
+  it.each(qualifiedTargets.filter(target => !(target.platform === "linux" && target.architecture === "arm64")))("defaults Pi to native on $platform/$architecture and round trips exact thinking", target => {
+    const adapterConfig = { model: "openrouter/anthropic/claude-sonnet-4.6", thinking: "high", command: "pi", env: { OPENROUTER_API_KEY: { type: "secret_ref", secretId: "connection" } }, cwd: "/workspace" };
+    const selected = resolveNewAgentRunner({ adapterType: "pi_local", adapterConfig, target });
+    expect(agentRunnerAvailability("pi_local", target).defaultRunner).toBe("paperclip");
+    expect(selected).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: adapterConfig.model, piThinkingLevel: "high", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn", cwd: adapterConfig.cwd, env: adapterConfig.env } });
+    expect(resolveNewAgentRunner(selected)).toEqual(selected);
+    expect(resolveNewAgentRunner({ ...selected, runner: "legacy" })).toEqual({ adapterType: "pi_local", adapterConfig: { model: adapterConfig.model, thinking: "high", cwd: adapterConfig.cwd, env: adapterConfig.env } });
+  });
+  it.each(["minimal", "medium", "xhigh"])("keeps unsupported Pi thinking %s explicit", thinking => {
+    const input = { adapterType: "pi_local", target, adapterConfig: { model: "custom/model", thinking } };
+    expect(() => resolveNewAgentRunner(input)).toThrow("Legacy runner");
+    expect(resolveNewAgentRunner({ ...input, runner: "legacy" })).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+  });
+  it.each([{ command: "custom-pi" }, { args: ["--extension", "custom.ts"] }, { extraArgs: "--no-tools" }, { stdoutLogMode: "raw" }, { thinking: "low", piThinkingLevel: "high" }])("rejects unsupported Pi configuration %j", extra => {
+    expect(() => resolveNewAgentRunner({ adapterType: "pi_local", target, adapterConfig: { model: "custom/model", ...extra } })).toThrow("Legacy runner");
+  });
+  it.each([undefined, "", "model", "provider/"])("requires a Pi provider/model outside inactive setup: %s", model => {
+    expect(() => resolveNewAgentRunner({ adapterType: "pi_local", target, adapterConfig: { model } })).toThrow("provider/model");
+  });
+  it("allows an inactive Pi draft before model selection and preserves saved native policy", () => {
+    expect(resolveNewAgentRunner({ adapterType: "pi_local", target, setupOnly: true })).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "", piThinkingLevel: "low" } });
+    const saved = { adapterType: "paperclip_runner", target, adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "custom/model", piThinkingLevel: "max", acpxPermissionMode: "approve-reads", lifecycleMode: "warm", idleTimeoutMs: 1234 } };
+    expect(resolveNewAgentRunner(saved)).toEqual({ adapterType: saved.adapterType, adapterConfig: saved.adapterConfig });
+    expect(() => resolveNewAgentRunner({ ...saved, runner: "legacy" })).toThrow("Legacy Pi cannot honor");
+  });
+  it.each([{ driver: "local", platform: "win32", architecture: "x64" }, { driver: "local", platform: "linux", architecture: "arm64", libc: "glibc" as const, glibcVersion: "2.39" }, { driver: "ssh", platform: "linux", architecture: "arm64", libc: "glibc" as const, glibcVersion: "2.39" }, { driver: "sandbox" }, { driver: "local", platform: "linux", architecture: "x64", libc: "musl" as const }])("keeps Pi legacy on unqualified $driver/$platform targets", target => {
+    const input = { adapterType: "pi_local", adapterConfig: { model: "custom/model", thinking: "medium" }, target };
+    expect(agentRunnerAvailability("pi_local", target).defaultRunner).toBe("legacy");
+    expect(resolveNewAgentRunner(input)).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+    expect(() => resolveNewAgentRunner({ ...input, runner: "paperclip" })).toThrow("unavailable");
+  });
+  it.each(["minimal", "medium", "xhigh"])("honors an explicit Legacy Pi thinking edit to %s when resuming a native draft", thinking => {
+    expect(resolveNewAgentRunner({ adapterType: "paperclip_runner", runner: "legacy", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "custom/model", piThinkingLevel: "max", thinking } })).toEqual({ adapterType: "pi_local", adapterConfig: { model: "custom/model", thinking } });
+  });
+  it("honors disabled and overridden Pi adapters", () => {
+    const input = { adapterType: "pi_local", target, adapterConfig: { model: "custom/model" } };
+    state.overridden.add("pi_local");
+    expect(resolveNewAgentRunner(input).adapterType).toBe("pi_local");
+    state.overridden.clear(); state.disabled = ["paperclip_runner"];
+    expect(resolveNewAgentRunner(input).adapterType).toBe("pi_local");
+    state.disabled = ["pi_local"];
+    expect(() => resolveNewAgentRunner(input)).toThrow("Pi is disabled");
+  });
+  it.each(qualifiedTargets.filter(target => !(target.platform === "linux" && target.architecture === "arm64")))("defaults OpenCode to its native provider on $platform/$architecture", target => {
+    const adapterConfig = { model: "openrouter/anthropic/claude-sonnet-4.6", dangerouslySkipPermissions: true, command: "opencode", env: { OPENROUTER_API_KEY: { type: "secret_ref", secretId: "connection" } }, cwd: "/workspace", instructionsFilePath: "/workspace/AGENTS.md" };
+    const selected = resolveNewAgentRunner({ adapterType: "opencode_local", adapterConfig, target });
+    expect(agentRunnerAvailability("opencode_local", target).defaultRunner).toBe("paperclip");
+    expect(selected).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "opencode", model: adapterConfig.model, env: adapterConfig.env, cwd: adapterConfig.cwd, instructionsFilePath: adapterConfig.instructionsFilePath, opencodePermissionMode: "allow", lifecycleMode: "per_turn" } });
+    expect(resolveNewAgentRunner(selected)).toEqual(selected);
+    expect(resolveNewAgentRunner({ ...selected, runner: "legacy" })).toMatchObject({ adapterType: "opencode_local", adapterConfig: { model: adapterConfig.model, dangerouslySkipPermissions: true } });
+  });
+  it.each([{ driver: "local", platform: "win32", architecture: "x64" }, { driver: "local", platform: "linux", architecture: "arm64", libc: "glibc" as const, glibcVersion: "2.39" }, { driver: "ssh", platform: "linux", architecture: "arm64", libc: "glibc" as const, glibcVersion: "2.39" }, { driver: "sandbox", platform: "linux", architecture: "arm64", libc: "glibc" as const, glibcVersion: "2.39" }, { driver: "local", platform: "linux", architecture: "arm64", libc: "musl" as const }, { driver: "local", platform: "linux", architecture: "x64", libc: "glibc" as const, glibcVersion: "2.38" }, { driver: "sandbox" }])("keeps OpenCode legacy on unqualified $driver/$platform targets", target => {
+    const input = { adapterType: "opencode_local", adapterConfig: { model: "custom/model", command: "custom-opencode" }, target };
+    expect(agentRunnerAvailability("opencode_local", target)).toEqual({ supportedRunners: ["legacy"], defaultRunner: "legacy" });
+    expect(resolveNewAgentRunner(input)).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+    expect(() => resolveNewAgentRunner({ ...input, runner: "paperclip" })).toThrow("unavailable");
+  });
+  it.each([{ command: "custom-opencode" }, { variant: "high" }, { extraArgs: ["--agent", "plan"] }, { args: ["--attach", "http://localhost"] }, { dangerouslySkipPermissions: false }])("rejects unsupported OpenCode settings instead of discarding them: %j", adapterConfig => {
+    const input = { adapterType: "opencode_local", adapterConfig: { model: "custom/model", ...adapterConfig }, target };
+    expect(() => resolveNewAgentRunner(input)).toThrow("Legacy runner");
+    expect(resolveNewAgentRunner({ ...input, runner: "legacy" })).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+  });
+  it.each([undefined, "", "model", "provider/"])("requires an explicit OpenCode provider/model: %s", model => {
+    expect(() => resolveNewAgentRunner({ adapterType: "opencode_local", adapterConfig: { model }, target })).toThrow("provider/model");
+  });
+  it("stores an inactive native OpenCode setup draft before model selection, but cannot hire it", () => {
+    const input = { adapterType: "opencode_local", target };
+    expect(resolveNewAgentRunner({ ...input, setupOnly: true })).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "opencode", model: "", opencodePermissionMode: "allow", lifecycleMode: "per_turn" } });
+    expect(() => resolveNewAgentRunner(input)).toThrow("provider/model");
+  });
+  it("honors native OpenCode permissions and refuses to discard them on return to legacy", () => {
+    const selected = resolveNewAgentRunner({ adapterType: "opencode_local", adapterConfig: { model: "custom/model", opencodePermissionMode: "ask" }, target });
+    expect(selected.adapterConfig.opencodePermissionMode).toBe("ask");
+    expect(() => resolveNewAgentRunner({ ...selected, runner: "legacy" })).toThrow("opencodePermissionMode");
+  });
+  it("resolves OpenCode against the company sandbox qualification and preserves disabled/overridden adapters", async () => {
+    const input = { adapterType: "opencode_local", adapterConfig: { model: "custom/model" } };
+    state.settings = { defaultEnvironmentId: "sandbox" };
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active", config: { provider: "daytona" } });
+    expect((await resolveNewAgentRunnerForCompany({} as never, "company", input)).adapterType).toBe("opencode_local");
+    state.sandboxQualification.mockResolvedValue({ platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" });
+    expect((await resolveNewAgentRunnerForCompany({} as never, "company", input)).adapterType).toBe("paperclip_runner");
+    state.overridden.add("opencode_local");
+    expect(resolveNewAgentRunner({ ...input, target }).adapterType).toBe("opencode_local");
+    state.overridden.clear(); state.disabled = ["paperclip_runner"];
+    expect(resolveNewAgentRunner({ ...input, target }).adapterType).toBe("opencode_local");
+    state.disabled = ["opencode_local"];
+    expect(() => resolveNewAgentRunner({ ...input, target })).toThrow("OpenCode is disabled");
   });
   it.each(qualifiedTargets)("allows an explicit legacy runner and native to legacy round trip on $platform/$architecture", target => {
     expect(resolveNewAgentRunner({ adapterType: "codex_local", target, runner: "legacy", adapterConfig: { extraArgs: ["--search"] } }).adapterType).toBe("codex_local");
@@ -376,9 +465,12 @@ describe("server-owned Codex runner selection", () => {
 });
 
 describe("Codex creation runner contract", () => {
-  it("graduates only Codex and retains saved provider identity", () => {
+  it("graduates qualified harnesses and retains saved provider identity", () => {
     expect(paperclipRunnerProfileForHarness("codex_local")).toEqual({ provider: "codex" });
-    for (const harness of ["claude_local", "opencode_local", "grok_local", "cursor", "pi_local", "process"]) expect(paperclipRunnerProfileForHarness(harness)).toBeUndefined();
+    expect(paperclipRunnerProfileForHarness("claude_local")).toEqual({ provider: "acpx", acpxAgent: "claude" });
+    expect(paperclipRunnerProfileForHarness("opencode_local")).toEqual({ provider: "opencode" });
+    expect(paperclipRunnerProfileForHarness("pi_local")).toEqual({ provider: "acpx", acpxAgent: "pi" });
+    for (const harness of ["grok_local", "cursor", "process"]) expect(paperclipRunnerProfileForHarness(harness)).toBeUndefined();
     expect(agentHarnessType("paperclip_runner", { provider: "codex" })).toBe("codex_local");
     expect(agentHarnessType("paperclip_runner", { provider: "acpx", acpxAgent: "claude" })).toBe("claude_local");
     expect(agentHarnessType("paperclip_runner", { provider: "unknown" })).toBe("unknown");
@@ -394,12 +486,105 @@ describe("Codex creation runner contract", () => {
       expect(paperclipRunnerSupportsPlatform("codex_local", "linux", architecture, "unknown")).toBe(false);
     }
     for (const [platform, architecture] of [["darwin", "ia32"], ["linux", "arm"], ["win32", "x64"], ["win32", "arm64"], ["freebsd", "x64"]]) expect(paperclipRunnerSupportsPlatform("codex_local", platform, architecture)).toBe(false);
-    expect(paperclipRunnerSupportsPlatform("claude_local", "darwin", "arm64")).toBe(false);
+    expect(paperclipRunnerSupportsPlatform("claude_local", "darwin", "arm64")).toBe(true);
   });
   it("keeps auto out of saved update defaults and validates request intent", () => {
     expect(createAgentSchema.parse({ name: "Codex", adapterType: "codex_local" }).runner).toBeUndefined();
     expect(updateAgentSchema.parse({ title: "same execution" })).not.toHaveProperty("runner");
     expect(testAdapterEnvironmentSchema.parse({ runner: "legacy" }).runner).toBe("legacy");
     expect(createAgentSchema.safeParse({ name: "Codex", adapterType: "codex_local", runner: "other" }).success).toBe(false);
+  });
+});
+
+
+describe("Claude runner defaults", () => {
+  const mac = { driver: "local", platform: "darwin", architecture: "arm64" };
+  beforeEach(() => { state.disabled = []; state.overridden.clear(); });
+  it.each(qualifiedTargets)("defaults Claude to the qualified $platform $architecture profile", target => {
+    expect(agentRunnerAvailability("claude_local", target)).toEqual({ supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" });
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target })).toEqual({
+      adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn" },
+    });
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target, runner: "legacy", adapterConfig: { model: "custom", dangerouslySkipPermissions: true } }))
+      .toEqual({ adapterType: "claude_local", adapterConfig: { model: "custom", dangerouslySkipPermissions: true } });
+  });
+  it.each(["x64", "arm64"])("keeps Darwin SSH %s automatic selection Legacy while preserving explicit assets", architecture => {
+    const target = { driver: "ssh", platform: "darwin", architecture };
+    expect(agentRunnerAvailability("claude_local", target)).toEqual({ supportedRunners: ["paperclip", "legacy"], defaultRunner: "legacy" });
+    const config = { model: "custom-model", dangerouslySkipPermissions: false };
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target, adapterConfig: config })).toEqual({ adapterType: "claude_local", adapterConfig: config });
+    const assets = { runnerRemoteProviderPackPath: "/operator/mac-pack", runnerRemoteBinaryPath: "/operator/mac-daemon" };
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target, runner: "paperclip", adapterConfig: assets }))
+      .toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { ...assets, provider: "acpx", acpxAgent: "claude" } });
+    const saved = { adapterType: "paperclip_runner", adapterConfig: { ...assets, provider: "acpx", acpxAgent: "claude" }, target };
+    expect(resolveNewAgentRunner(saved)).toEqual({ adapterType: saved.adapterType, adapterConfig: saved.adapterConfig });
+  });
+  it.each(["x64", "arm64"])("keeps incompatible Linux Claude %s targets legacy", architecture => {
+    for (const libc of ["musl", "unknown"] as const) {
+      expect(agentRunnerAvailability("claude_local", { driver: "local", platform: "linux", architecture, libc }).defaultRunner).toBe("legacy");
+    }
+    expect(agentRunnerAvailability("claude_local", { driver: "local", platform: "linux", architecture, libc: "glibc", glibcVersion: "2.17" }).defaultRunner).toBe("legacy");
+  });
+  it("saves native Claude with Opus 5.5, preserving credentials and shared settings", () => {
+    const config = { env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "key" } }, instructionsFilePath: "/workspace/AGENTS.md", timeoutSec: 180, dangerouslySkipPermissions: true };
+    const result = resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: config });
+    expect(result).toEqual({ adapterType: "paperclip_runner", adapterConfig: { env: config.env, instructionsFilePath: config.instructionsFilePath, timeoutSec: 180, provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn" } });
+    expect(resolveNewAgentRunner(result)).toEqual(result);
+    expect(config.dangerouslySkipPermissions).toBe(true);
+  });
+  it("preserves explicit models and Legacy choices", () => {
+    const legacy = { adapterType: "claude_local", target: mac, runner: "legacy" as const, adapterConfig: { model: "custom", chrome: true } };
+    expect(resolveNewAgentRunner(legacy)).toEqual({ adapterType: legacy.adapterType, adapterConfig: legacy.adapterConfig });
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { model: "custom" } }).adapterConfig.model).toBe("custom");
+  });
+  it.each(["claude-sonnet-5-5", "custom-model"])("preserves the plain environment model binding %s", model => {
+    const env = { ANTHROPIC_MODEL: { type: "plain", value: model } };
+    const native = resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { env } });
+    expect(native.adapterConfig.model).toBe(model);
+    expect(native.adapterConfig.env).toEqual(env);
+  });
+  it.each(["ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BEDROCK_BASE_URL"])("rejects unresolved %s before choosing a default", key => {
+    const env = { [key]: { type: "secret_ref", secretId: "override" } };
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { env } })).toThrow(`env.${key}`);
+    expect(resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { env, model: "custom-model" } }).adapterConfig.model).toBe("custom-model");
+  });
+  it("does not pin the ordinary model over a plain provider-routing binding", () => {
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac,
+      adapterConfig: { env: { CLAUDE_CODE_USE_BEDROCK: { type: "plain", value: "1" } } } })).toThrow("Legacy runner");
+  });
+  it.each(["permissionMode", "acpPermissionMode"])("translates the legacy Claude %s without granting broader permissions", key => {
+    for (const mode of ["deny-all", "approve-reads", "approve-all"]) {
+      const native = resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { engine: "acp", [key]: mode } });
+      expect(native.adapterConfig.acpxPermissionMode).toBe(mode);
+      expect(native.adapterConfig[key]).toBeUndefined();
+    }
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { [key]: "deny-all", acpxPermissionMode: "approve-all" } })).toThrow("cannot honor");
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { [key]: "unrecognized" } })).toThrow("Legacy runner");
+  });
+  it("retains saved native Claude and allows an explicit compatible Legacy switch", () => {
+    const saved = { adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude", model: "custom", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn" } };
+    expect(resolveNewAgentRunner(saved)).toEqual(saved);
+    expect(resolveNewAgentRunner({ ...saved, runner: "legacy" })).toEqual({ adapterType: "claude_local", adapterConfig: { model: "custom", dangerouslySkipPermissions: true } });
+    expect(() => resolveNewAgentRunner({ ...saved, runner: "legacy", adapterConfig: { ...saved.adapterConfig, acpxPermissionMode: "deny-all" } })).toThrow("cannot honor");
+  });
+  it.each(["chrome", "agentCommand", "maxTurnsPerRun", "networkScope"])("rejects unsupported %s without fallback", key => {
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { [key]: "configured" } })).toThrow("Legacy runner");
+  });
+  it.each(["low", "medium", "high", "xhigh", "max"])("translates Claude effort %s and preserves it on an explicit Legacy switch", effort => {
+    const native = resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { effort } });
+    expect(native.adapterConfig.modelReasoningEffort).toBe(effort);
+    expect(native.adapterConfig.effort).toBeUndefined();
+    expect(resolveNewAgentRunner({ ...native, runner: "legacy" }).adapterConfig).toMatchObject({ effort });
+  });
+  it("rejects invalid effort and unknown platform defaults", () => {
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac, adapterConfig: { effort: "ultra" } })).toThrow("Claude effort");
+    expect(agentRunnerAvailability("claude_local", { driver: "sandbox" }).defaultRunner).toBe("legacy");
+  });
+  it("keeps unqualified targets and overrides legacy", () => {
+    expect(agentRunnerAvailability("claude_local", { driver: "local", platform: "win32", architecture: "x64" }).defaultRunner).toBe("legacy");
+    state.overridden.add("claude_local");
+    expect(agentRunnerAvailability("claude_local", mac).defaultRunner).toBe("legacy");
+    state.overridden.clear(); state.disabled = ["claude_local"];
+    expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac })).toThrow("Claude is disabled");
   });
 });

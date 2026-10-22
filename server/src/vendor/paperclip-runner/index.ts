@@ -37,6 +37,7 @@ export type {
   NativeExecutionInputV5,
   NativeExecutionInputV6,
   NativeExecutionInputV8,
+  NativeExecutionInputV9,
   MuseBindingSnapshot,
   DotBindingSnapshot,
   ExternalProviderPort,
@@ -65,6 +66,8 @@ export type {
   PrpWireConnection,
   ReplayControlPlaneEventsInput,
   RunnerExecutionDriver,
+  RunnerLaunchPreparer,
+  DurableRecoveryIdentity,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
   StrictCompletionContractInput,
@@ -82,6 +85,8 @@ const sourceUrl = new URL(
 const runner = (await import(sourceUrl.href)) as RunnerModule;
 
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
+export const RUNNER_PRP_PROTOCOL_MIN = runner.RUNNER_PRP_PROTOCOL_MIN;
+export const RUNNER_PRP_PROTOCOL_MAX = runner.RUNNER_PRP_PROTOCOL_MAX;
 export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
 export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
@@ -137,6 +142,7 @@ export const parsePaperclipQuestionSet = runner.parsePaperclipQuestionSet;
 export const parsePaperclipQuestionResponse =
   runner.parsePaperclipQuestionResponse;
 export const resolveQualifiedAcpxProfile = runner.resolveQualifiedAcpxProfile;
+export const resolveClaudeEffort = runner.resolveClaudeEffort;
 export const QUALIFIED_ACPX_PROFILES = runner.QUALIFIED_ACPX_PROFILES;
 export const QUALIFIED_ACPX_VERSION = runner.QUALIFIED_ACPX_VERSION;
 export const CURSOR_DISTRIBUTION_PINS = runner.CURSOR_DISTRIBUTION_PINS;

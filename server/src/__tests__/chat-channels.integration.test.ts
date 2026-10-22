@@ -1,4 +1,5 @@
 import { idleWorkSnapshot } from "../services/task-admission.js";
+import { requestTaskRetry } from "../services/task-retry.js";
 import { stageReceiptReactionRemovals } from "../services/chat-receipt-reactions.js";
 import type { Db } from "@paperclipai/db";
 import * as activityLogModule from "../services/activity-log.js";
@@ -23,10 +24,14 @@ import { githubChatWizardService } from "../services/chat-github-wizard.js";
 import { dispatchGitHubBotCloudEvent } from "../services/chat-github-cloud-ingress.js";
 import { githubChatManagementService } from "../services/chat-github-management.js";
 import { githubChatReviewService } from "../services/chat-github-reviews.js";
+import { resolveGitHubReviewInstructions } from "../services/chat-channels/github/review-instructions.js";
 import { githubResponseCommentService } from "../services/chat-github-response-comments.js";
 import { githubReviewCheckService } from "../services/chat-github-checks.js";
 import { githubAutomaticReviewEvent } from "../services/chat-github-events.js";
 import { githubBotToolsForSession, syncGitHubBotTools } from "../services/chat-github-tools.js";
+import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat/run-preparation.js";
+import { createAssignedMcpTools } from "../services/native-runtime/assigned-mcp-tools.js";
+import { createToolGatewayService } from "../services/tool-gateway.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { chatGitHubRegistrations, chatGitHubReviews, chatGitHubConfigurations, toolCatalogEntries } from "@paperclipai/db";
@@ -179,12 +184,14 @@ import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
 } from "../services/chat-run-publications.js";
 import {
+  extractWakeCommentIds,
   heartbeatService,
   resolveExternalChatWakeProvider,
 } from "../services/heartbeat.js";
-import { resolveRunScopedMentionedSkillKeys } from "../services/heartbeat/run-preparation.js";
+import { buildPaperclipWakePayload, resolveRunScopedMentionedSkillKeys } from "../services/heartbeat/run-preparation.js";
 import {
   registerServerAdapter,
+  runningProcesses,
   unregisterServerAdapter,
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
@@ -2477,7 +2484,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await send(); await send();
       const rows = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), eq(chatDeliveries.providerEventId, `${threadId}:41902`)));
       expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ state: "filtered", principalId: null, redactedError: "GitHub message explicitly mentions a different connected bot" });
+      expect(rows[0]).toMatchObject({ state: "filtered", principalId: null, redactedError: "GitHub message explicitly addresses a different recipient" });
       expect(rows[0].normalizedEvent).toHaveProperty("filtering.contentRetained", false);
       expect(JSON.stringify(rows[0].normalizedEvent)).not.toContain("tell me a joke");
       expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(1);
@@ -2485,11 +2492,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(f.runtime.endpoints.get(f.endpoint.id)?.reactions).toEqual([]);
       expect(f.responseWrites).toHaveLength(1);
       expect(await f.service.listActivity(f.endpoint.id)).toEqual(expect.arrayContaining([
-        expect.objectContaining({ status: "filtered", detail: "GitHub message explicitly mentions a different connected bot" }),
+        expect.objectContaining({ status: "filtered", detail: "GitHub message explicitly addresses a different recipient" }),
       ]));
     });
-    it.each(["Thanks, continue", "@octocat thanks", "@unknown-bot help", "@gonzo-other help", "x@gonzo help"])(
-      "retains subscribed GitHub follow-ups without another exact connected bot mention: %s", async text => {
+    it.each(["Thanks, continue", "Thanks @octocat", "Please ask @unknown-bot for context", "Check @gonzo-other's advice", "x@gonzo help"])(
+      "retains subscribed GitHub follow-ups with incidental human or unknown mentions: %s", async text => {
         const f = await subscribedGitHubFixture();
         await addPeerGitHubBot(f);
         const wakeCount = f.wakeup.mock.calls.length;
@@ -2515,7 +2522,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(chatEndpoints).set({ botUsername: "gonzo[bot]", status: kind === "archived" ? "archived" : "active" }).where(eq(chatEndpoints.id, peer.id));
       const wakeCount = f.wakeup.mock.calls.length;
       await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread: f.thread,
-        trigger: "subscribed_message", message: makeMessage({ id: "41902", text: "@gonzo help", userId: "42", userName: "octocat" }) });
+        trigger: "subscribed_message", message: makeMessage({ id: "41902", text: "Please consider @gonzo's advice", userId: "42", userName: "octocat" }) });
       expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(2);
       expect(f.wakeup).toHaveBeenCalledTimes(wakeCount + 1);
     });
@@ -2596,6 +2603,267 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       )))[0];
       return { ...f, service, head, assessment, provider, action, inline, checks, writes };
     }
+    it("reuses one main GitHub PR comment across review requests", async () => {
+      const f = await publicationRetryFixture();
+      await f.service.execute(f.session, "submit_review", f.assessment, "first-review");
+      const originalId = [...f.responseComments.keys()][0];
+      // Restart after a provider write whose shared receipt was lost. The
+      // App-owned marker, rather than process memory, must recover the target.
+      await db.update(chatActions).set({ result: null }).where(and(eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.kind, "github_pr_response_comment")));
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({
+          endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802",
+        }) }).returning();
+      const session = { ...f.session, runId: next.id };
+      await f.service.execute(session, "begin_review", { reviewedCommit: f.head });
+      await f.service.execute(session, "submit_review", { ...f.assessment, summary: "Second assessment" }, "second-review");
+      expect([...f.responseComments.keys()]).toEqual([originalId]);
+      expect(f.responseComments.get(originalId)?.body).toContain("Second assessment");
+      expect(f.responseWrites.filter(write => write.method === "POST")).toHaveLength(1);
+    });
+    it("ignores a review request addressed to an external GitHub bot", async () => {
+      const f = await subscribedGitHubFixture("github:paperclipai/paperclip:419");
+      const wakeCount = f.wakeup.mock.calls.length;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread: f.thread,
+        trigger: "subscribed_message", message: makeMessage({ id: "41902", text: "@greptile review", userId: "42", userName: "octocat" }) });
+      const [delivery] = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id),
+        eq(chatDeliveries.providerEventId, `${f.thread.id}:41902`)));
+      expect(delivery.state).toBe("filtered");
+      expect(f.wakeup).toHaveBeenCalledTimes(wakeCount);
+      expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(1);
+      expect(f.responseWrites).toHaveLength(1);
+    });
+    it("retains a provider-verified GitHub mention when its plain text uses an alias", async () => {
+      const f = await subscribedGitHubFixture("github:paperclipai/paperclip:419");
+      const wakeCount = f.wakeup.mock.calls.length;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread: f.thread,
+        trigger: "mention", message: makeMessage({ id: "41902", text: "@rendered-alias review", userId: "42", userName: "octocat", mentioned: true }) });
+      expect(f.wakeup).toHaveBeenCalledTimes(wakeCount + 1);
+      expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(2);
+    });
+    it("reconciles a GitHub working comment when execution stops without a publication", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "execution_finalization_deadline_exceeded" })
+        .where(eq(heartbeatRuns.id, f.run.id));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.conversation.issueId!));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect(f.responseComments.size).toBe(1);
+      expect([...f.responseComments.values()][0].body).toContain("stopped before completing");
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect(f.responseComments.size).toBe(1);
+      expect([...f.responseComments.values()][0].body).toContain("paused");
+    });
+    it("preserves newer GitHub PR progress when an older run fails", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, f.run.id));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({
+          endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802",
+        }) }).returning();
+      await githubChatReviewService(db, f.providerFetch).execute({ ...f.session, runId: next.id }, "update_comment",
+        { body: "Reviewing the new request", idempotencyKey: "new-progress" });
+      await expect(githubResponseCommentService(db, f.providerFetch).failRun({ ...f.session, endpointId: f.endpoint.id,
+        body: "Old run failed" })).rejects.toMatchObject({ status: 403 });
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect(f.responseComments.size).toBe(1);
+      expect([...f.responseComments.values()][0].body).toContain("Reviewing the new request");
+    });
+    it("adopts an existing GitHub PR placeholder and retires earlier duplicate placeholders", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      const original = [...f.responseComments.values()][0];
+      original.body = original.body.replace(/<!-- paperclip-pr-response:[^>]+ -->\n/, "");
+      await db.delete(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_pr_response_comment")));
+      // Reconcile a pre-upgrade acknowledgement before its run completes.
+      const [first] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+      await db.update(chatActions).set({ status: "received" }).where(eq(chatActions.id, first.id));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect(f.responseComments.size).toBe(1);
+      expect(original.body).toContain("paperclip-pr-response:");
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      const [second] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id),
+        eq(chatActions.kind, "github_response_comment"), sql`${chatActions.id} <> ${first.id}`));
+      // Simulate the second request's persisted pre-upgrade provider receipt.
+      const duplicateId = 799999;
+      f.responseComments.set(duplicateId, { ...original, id: duplicateId,
+        body: original.body.replace(/<!-- paperclip-pr-response:[^>]+ -->\n/, ""),
+        html_url: `${original.html_url}-legacy`,
+      });
+      await db.update(chatActions).set({ status: "received", result: { ...second.result, id: String(duplicateId) } }).where(eq(chatActions.id, second.id));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect(f.responseComments.get(duplicateId)?.body).toContain("current review");
+      expect(f.responseComments.get(duplicateId)?.body).not.toContain("queued");
+      expect(f.responseWrites.filter(write => write.method === "POST")).toHaveLength(1);
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "comment", { body: "Final result", idempotencyKey: "legacy-final" });
+      expect(original.body).toContain("Final result");
+    });
+    it("keeps a newer GitHub request open when its acknowledgement follows older progress", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      const [link] = await db.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.endpointId, f.endpoint.id), eq(chatMessageLinks.providerMessageId, "41802")));
+      await db.update(chatActions).set({ status: "received", result: null }).where(and(eq(chatActions.deliveryId, link.deliveryId!), eq(chatActions.kind, "github_response_comment")));
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "update_comment", { body: "Older run progress", idempotencyKey: "old-progress" });
+      await githubResponseCommentService(db, f.providerFetch).tryAcknowledge(link.deliveryId!);
+      const [response] = await db.select().from(chatActions).where(and(eq(chatActions.deliveryId, link.deliveryId!), eq(chatActions.kind, "github_response_comment")));
+      expect(response.result?.final).toBe(false);
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+        status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({
+          endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802",
+        }) }).returning();
+      const result = await githubChatReviewService(db, f.providerFetch).execute({ ...f.session, runId: next.id }, "update_comment",
+        { body: "Newer request progress", idempotencyKey: "new-progress" });
+      expect(result.status).toBe("processed");
+      expect([...f.responseComments.values()][0].body).toContain("Newer request progress");
+    });
+    it.each([false, true])("closes a GitHub placeholder after a formal review (legacy receipt: %s)", async legacy => {
+      const f = await publicationRetryFixture();
+      const formal = { id: 991, html_url: "https://github.com/paperclipai/paperclip/pull/418#pullrequestreview-991" };
+      if (legacy) {
+        await db.insert(chatActions).values({ companyId: f.companyId, endpointId: f.endpoint.id, conversationId: f.conversation.id,
+          kind: "github_review_publication", providerActionId: randomUUID(), status: "processed",
+          payload: { operation: "formal_review", session: f.session }, result: { id: String(formal.id), url: formal.html_url } });
+      } else {
+        const config = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: config.revision,
+          configuration: { ...config.configuration, defaults: { ...config.configuration.defaults,
+            allowApprove: true, publishSummary: false, publishInline: false } } }, "owner-user");
+        f.setSupplementalProviderFetch(async (input, init) => String(input).includes("/pulls/418/reviews")
+          ? Response.json(init?.method === "POST" ? formal : []) : f.provider(input, init));
+        await f.service.execute(f.session, "submit_review", f.assessment, "score-only");
+        await f.service.execute(f.session, "formal_review", { event: "APPROVE", reviewedCommit: f.head, body: "Reviewed", idempotencyKey: "formal-only" });
+      }
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      const body = [...f.responseComments.values()][0].body;
+      expect(body).not.toMatch(/Review queued|Working on this/);
+      expect(body).toContain("paperclip-response-state:final");
+    });
+    it("retires a legacy coalesced GitHub placeholder before replacing its receipt", async () => {
+      const f = await publicationRetryFixture();
+      const original = { ...[...f.responseComments.values()][0] };
+      const [first] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      const duplicateId = 799999;
+      f.responseComments.set(duplicateId, { ...original, id: duplicateId,
+        body: original.body.replace(/<!-- paperclip-pr-response:[^>]+ -->\n/, ""),
+        html_url: "https://github.com/paperclipai/paperclip/pull/418#issuecomment-799999" });
+      await db.update(chatActions).set({ result: { ...first.result, id: String(duplicateId) } }).where(eq(chatActions.id, first.id));
+      const links = await db.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.endpointId, f.endpoint.id), eq(chatMessageLinks.direction, "inbound")));
+      const latest = await chatWakeContext({ endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...latest, wakeCommentIds: links.map(link => link.commentId) } }).where(eq(heartbeatRuns.id, f.run.id));
+      await f.service.execute(f.session, "begin_review", { reviewedCommit: f.head });
+      await f.service.execute(f.session, "submit_review", f.assessment, "coalesced-upgrade");
+      expect(f.responseComments.get(duplicateId)?.body).toContain("current review");
+      expect(f.responseComments.get(duplicateId)?.body).not.toMatch(/Review queued|Working on this/);
+      expect([...f.responseComments.values()].some(comment => comment.body.includes("Advisory review"))).toBe(true);
+    });
+    it("does not handle a blocked new GitHub request with an older run's final reply", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "comment", { body: "Earlier result", idempotencyKey: "earlier-result" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.conversation.issueId!));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "New request", userId: "42", userName: "octocat", mentioned: true }) });
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      const body = [...f.responseComments.values()][0].body;
+      expect(body).toContain("paused");
+      expect(body).not.toContain("has been handled");
+      expect(f.responseComments.size).toBe(1);
+    });
+    it.each([["failed", false], ["failed", true], ["queued", false], ["queued", true]] as const)(
+      "resumes a paused GitHub request and reconciles stopped execution (prior run: %s, progress: %s)", async (status, progress) => {
+        const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+        await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.run.id));
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.conversation.issueId!));
+        const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+        await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+          trigger: "mention", message: makeMessage({ id: "41802", text: "New request", userId: "42", userName: "octocat", mentioned: true }) });
+        const responses = githubResponseCommentService(db, f.providerFetch);
+        await responses.processPending();
+        expect([...f.responseComments.values()][0].body).toContain("paused");
+        const pausedWrites = f.responseWrites.length;
+        await responses.processPending();
+        await responses.processPending();
+        expect(f.responseWrites).toHaveLength(pausedWrites);
+        await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.conversation.issueId!));
+        const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId,
+          status: "running", runtimeMode: "native", contextSnapshot: await chatWakeContext({
+            endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802",
+          }) }).returning();
+        const session = { ...f.session, runId: next.id };
+        if (progress) {
+          expect(await githubChatReviewService(db, f.providerFetch).execute(session, "update_comment",
+            { body: "Resumed request progress", idempotencyKey: "resumed-progress" })).toMatchObject({ status: "processed" });
+          expect([...f.responseComments.values()][0].body).toContain("Resumed request progress");
+        }
+        await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, next.id));
+        await responses.failRun({ ...session, endpointId: f.endpoint.id, body: "Resumed work stopped" });
+        expect(f.responseComments.size).toBe(1);
+        expect([...f.responseComments.values()][0].body).toContain("Resumed work stopped");
+      });
+    it("preserves a final GitHub assessment while settling an incomplete request receipt", async () => {
+      const f = await publicationRetryFixture();
+      await f.service.execute(f.session, "submit_review", f.assessment, "published-assessment");
+      const before = [...f.responseComments.values()][0].body;
+      const [response] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+      await db.update(chatActions).set({ result: { ...response.result, final: false } }).where(eq(chatActions.id, response.id));
+      await db.update(heartbeatRuns).set({ status: "succeeded", updatedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect([...f.responseComments.values()][0].body).toBe(before);
+      const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, response.id));
+      expect(settled.result?.final).toBe(true);
+    });
+    it("reconciles stopped GitHub work from native identity without legacy wake fields", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!,
+        responsibleUserId: "owner-user", messageIds: [String(f.run.contextSnapshot?.wakeCommentId)], cause: "instruction" });
+      await db.update(heartbeatRuns).set({ nativeIssueId: f.conversation.issueId, contextSnapshot: {}, status: "failed", updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, f.run.id));
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.conversation.issueId!));
+      await githubResponseCommentService(db, f.providerFetch).processPending();
+      expect([...f.responseComments.values()][0].body).toContain("stopped before completing");
+      expect(f.responseComments.size).toBe(1);
+    });
+    it("retires a legacy GitHub placeholder when its acknowledgement is superseded", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      const original = { ...[...f.responseComments.values()][0] };
+      const [first] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_response_comment")));
+      const duplicateId = 799999;
+      f.responseComments.set(duplicateId, { ...original, id: duplicateId,
+        body: original.body.replace(/<!-- paperclip-pr-response:[^>]+ -->\n/, ""),
+        html_url: "https://github.com/paperclipai/paperclip/pull/418#issuecomment-799999" });
+      await db.update(chatActions).set({ status: "received", result: { ...first.result, id: String(duplicateId) } }).where(eq(chatActions.id, first.id));
+      const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
+        trigger: "mention", message: makeMessage({ id: "41802", text: "Review again", userId: "42", userName: "octocat", mentioned: true }) });
+      const links = await db.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.endpointId, f.endpoint.id), eq(chatMessageLinks.direction, "inbound")));
+      const latest = await chatWakeContext({ endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...latest, wakeCommentIds: links.map(link => link.commentId) } }).where(eq(heartbeatRuns.id, f.run.id));
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "update_comment", { body: "Newer progress", idempotencyKey: "latest-progress" });
+      await githubResponseCommentService(db, f.providerFetch).tryAcknowledge(first.deliveryId!);
+      expect(f.responseComments.get(duplicateId)?.body).toContain("current review");
+      expect([...f.responseComments.values()].some(comment => comment.body.includes("Newer progress"))).toBe(true);
+      const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, first.id));
+      expect(settled.result?.final).toBe(false);
+    });
     it.each([false, true])("recovers an approved queued GitHub review without another approval (revoked: %s)", async revoked => {
       const f = await publicationRetryFixture();
       let unavailable = true;
@@ -2786,6 +3054,55 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey })).rejects.toThrow();
       expect(summaryAttempts).toBe(2);
     }, 25_000);
+    it.each([
+      { boardFollowUp: false, legacyOrigin: false },
+      { boardFollowUp: true, legacyOrigin: false },
+      { boardFollowUp: false, legacyOrigin: true },
+      { boardFollowUp: true, legacyOrigin: true },
+    ])("keeps GitHub review tools callable through a later native task gateway (board follow-up: $boardFollowUp, legacy origin: $legacyOrigin)", async ({ boardFollowUp, legacyOrigin }) => {
+      vi.stubEnv("PAPERCLIP_API_URL", "https://paperclip.example.test");
+      onTestFinished(() => vi.unstubAllEnvs());
+      const f = await publicationRetryFixture();
+      const identity = await initializeRunIdentity(db, {
+        companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!,
+        responsibleUserId: "owner-user", messageIds: legacyOrigin ? [] : [String(f.run.contextSnapshot?.wakeCommentId)], cause: "instruction",
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.assignedAgentId));
+      const gateway = createToolGatewayService(db);
+      const first = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: f.run.id });
+      const firstTools = await createAssignedMcpTools({ gateway, gatewayPublicId: new URL(first[0].url).pathname.split("/").at(-1)!, bearerToken: first[0].token });
+      expect(await firstTools.execute({ tool: "paperclip_search_assigned_tools", arguments: { query: "begin_review" } })).toMatchObject({ tools: expect.arrayContaining([expect.objectContaining({ name: expect.stringContaining("begin_review") })]) });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      const [later] = await db.insert(heartbeatRuns).values({
+        companyId: f.companyId, agentId: f.assignedAgentId, status: "running", runtimeMode: "native",
+        nativeIssueId: f.conversation.issueId, contextSnapshot: { wakeReason: "issue_monitor_due" },
+      }).returning();
+      const [boardMessage] = boardFollowUp ? await db.insert(issueComments).values({
+        companyId: f.companyId, issueId: f.conversation.issueId!, authorType: "user", authorUserId: "owner-user", body: "Finish the review",
+      }).returning() : [];
+      await initializeRunIdentity(db, {
+        companyId: f.companyId, runId: later.id, issueId: f.conversation.issueId!,
+        responsibleUserId: "owner-user", parentContextId: identity.id, messageIds: boardMessage ? [boardMessage.id] : [], cause: "monitor",
+      });
+      const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: later.id });
+      expect(servers).toHaveLength(1);
+      await expect(gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: later.id, issueId: randomUUID() }))
+        .rejects.toMatchObject({ reasonCode: "run_context_mismatch" });
+      const assigned = await createAssignedMcpTools({ gateway, gatewayPublicId: new URL(servers[0].url).pathname.split("/").at(-1)!, bearerToken: servers[0].token });
+      expect(await assigned.execute({ tool: "paperclip_search_assigned_tools", arguments: { query: "begin_review" } })).toMatchObject({ tools: expect.arrayContaining([expect.objectContaining({ name: expect.stringContaining("begin_review") })]) });
+      const read = assigned.definitions().find(tool => String(tool.name).includes("read_pull_request"))!;
+      expect(await assigned.execute({ tool: String(read.name), arguments: { section: "metadata" } })).toMatchObject({ data: { pull: { number: 418 } } });
+      const begin = assigned.definitions().find(tool => String(tool.name).includes("begin_review"))!;
+      await assigned.execute({ tool: String(begin.name), arguments: { reviewedCommit: f.head } });
+      const submit = assigned.definitions().find(tool => String(tool.name).includes("submit_review"))!;
+      expect(await assigned.execute({ tool: String(submit.name), arguments: f.assessment })).toMatchObject({ data: { status: "processed", score: 3 } });
+      expect(f.responseComments.size).toBe(1);
+      expect([...f.responseComments.values()][0].body).toContain("Advisory review");
+      await db.update(chatIdentityLinks).set({ status: "revoked" }).where(eq(chatIdentityLinks.endpointId, f.endpoint.id));
+      await expect(assigned.execute({ tool: String(read.name), arguments: { section: "metadata" } })).rejects.toThrow();
+    });
     it.each([403, 401])("preserves GitHub connection intent after publication HTTP %s", async status => {
       const f = await toolReplyFixture();
       const initialEndpoint = await f.service.get(f.endpoint.id);
@@ -2843,6 +3160,103 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(await githubBotToolsForSession(db, { ...f.session, issueId: randomUUID() })).toEqual([]);
       expect(await readChatConversationsByEndpointId(f.endpoint.id)).toHaveLength(2);
     });
+    describe("replies in review finding threads behind an active run", () => {
+      const pr = "github:paperclipai/paperclip:17044";
+      async function findingThreadFixture() {
+        vi.stubEnv("PAPERCLIP_API_URL", "https://paperclip.example.test");
+        onTestFinished(() => vi.unstubAllEnvs());
+        const f = await subscribedGitHubFixture(pr);
+        const adapterType = `github-finding-thread-test-${randomUUID()}`;
+        const execute = vi.fn(async (_input: { runId: string; context: Record<string, unknown> }) => ({
+          exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Answered the finding thread",
+        }));
+        registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false, execute,
+          testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+        const heartbeat = heartbeatService(db);
+        const activeRunId = randomUUID();
+        onTestFinished(async () => {
+          runningProcesses.delete(activeRunId);
+          await heartbeat.drainActiveRunExecutions();
+          unregisterServerAdapter(adapterType);
+        });
+        const issueId = f.conversation.issueId!;
+        await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+        await db.update(agents).set({ adapterType, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+          .where(eq(agents.id, f.assignedAgentId));
+        // Published findings bind their inline threads to the PR review task.
+        const { id: _id, ...base } = f.conversation;
+        const threads = await Promise.all(["4332012267", "4332012626"].map(async (commentId) => {
+          const thread = makeThread({ channelId: "paperclipai/paperclip", id: `${pr}:rc:${commentId}` }).thread;
+          const [conversation] = await db.insert(chatConversations).values({ ...base, externalThreadId: thread.id,
+            providerUrl: `https://github.com/paperclipai/paperclip/pull/17044#discussion_r${commentId}` }).returning();
+          return { thread, conversation };
+        }));
+        // The review-request run still holds the task when the linked user replies.
+        await db.insert(heartbeatRuns).values({ id: activeRunId, companyId: f.companyId, agentId: f.assignedAgentId,
+          status: "running", startedAt: new Date(), contextSnapshot: { issueId, source: "chat:github" },
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+        runningProcesses.set(activeRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+        await db.update(issues).set({ status: "in_review", executionRunId: activeRunId,
+          executionAgentNameKey: "maya", executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+        f.wakeup.mockImplementation(heartbeat.wakeup);
+        let messageId = 41950;
+        const reply = (thread: Thread, text: string) => deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id,
+          provider: "github", thread, trigger: "subscribed_message",
+          message: makeMessage({ id: String(messageId++), text, userId: "42", userName: "octocat" }) });
+        const commentFor = async (text: string) => (await readIssueCommentsByIssueId(issueId)).find((c) => c.body.includes(text))!.id;
+        const finishActiveRun = async () => {
+          runningProcesses.delete(activeRunId);
+          await heartbeat.cancelRun(activeRunId, "Review request finished", { suppressImmediateRecovery: true });
+          await heartbeat.drainActiveRunExecutions();
+        };
+        const followUpRuns = async () => (await readHeartbeatRunsByCompanyId(f.companyId))
+          .filter((run) => run.id !== activeRunId && run.wakeupRequestId)
+          .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        return { ...f, issueId, threads, execute, reply, commentFor, finishActiveRun, followUpRuns };
+      }
+
+      it("answers each finding thread in its own run instead of one unattestable batch", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First finding is intentional");
+        await f.reply(f.threads[1].thread, "Second finding is fixed in the next commit");
+        const first = await f.commentFor("First finding"), second = await f.commentFor("Second finding");
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs.map((run) => ({ status: run.status, errorCode: run.errorCode, error: run.error })))
+          .toEqual([{ status: "succeeded", errorCode: null, error: null }, { status: "succeeded", errorCode: null, error: null }]);
+        expect(runs.map((run) => extractWakeCommentIds(run.contextSnapshot))).toEqual([[first], [second]]);
+        expect(runs.map((run) => run.contextSnapshot?.chatConversationId))
+          .toEqual(f.threads.map(({ conversation }) => conversation.id));
+        expect(f.execute.mock.calls.map(([input]) => [input.context.paperclipExternalChatExecutionBound,
+          extractWakeCommentIds(input.context)])).toEqual([[true, [first]], [true, [second]]]);
+      });
+
+      it("still batches several replies in one finding thread into one attested run", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First note on this finding");
+        await f.reply(f.threads[0].thread, "Second note on this finding");
+        const ids = [await f.commentFor("First note"), await f.commentFor("Second note")];
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toMatchObject({ status: "succeeded", errorCode: null });
+        expect(extractWakeCommentIds(runs[0].contextSnapshot)).toEqual(ids);
+        expect(f.execute).toHaveBeenCalledTimes(1);
+      });
+
+      it("still denies each separated finding-thread run after the linked identity is revoked", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First finding is intentional");
+        await f.reply(f.threads[1].thread, "Second finding is fixed in the next commit");
+        await db.update(chatIdentityLinks).set({ status: "revoked", revokedAt: new Date() })
+          .where(eq(chatIdentityLinks.principalId, f.principal.id));
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs.length).toBeGreaterThan(0);
+        for (const run of runs) expect(run).toMatchObject({ status: "failed", errorCode: "setup_failed" });
+        expect(f.execute).not.toHaveBeenCalled();
+      });
+    });
     it.each([
       { label: "returns the confirmed GitHub assessment when publication takes longer than ten seconds", delayMs: 11_000, timeoutMs: undefined },
       { label: "preserves an explicit shorter GitHub tool deadline and reconciles without duplicate publication", delayMs: 200, timeoutMs: 50 },
@@ -2873,7 +3287,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const tools = await githubBotToolsForSession(db, f.session);
       const tool = tools.find(tool => tool.upstreamToolName === "submit_review")!;
       await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
-      const assessment = { reviewedCommit: head, score: 5, complete: true, summary: "Looks good", rationale: "Reviewed the changed file",
+      const assessment = { reviewedCommit: head, score: 5, complete: true,
+        summary: "Reviewed the changed behavior and its callers. ".repeat(30),
+        rationale: "Checked the mutation boundary and the client retry contract. ".repeat(30),
         coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
       const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, timeoutMs })
         .then(value => ({ value }), error => ({ error }));
@@ -2896,6 +3312,124 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(invocation).toMatchObject({ status: "succeeded", errorCode: null, errorMessage: null });
       expect(f.responseWrites).toHaveLength(writes);
     }, 40_000);
+    it.each(["submit_review", "comment", "update_comment"] as const)("recovers long %s requests without accepting changes hidden by the audit preview", async name => {
+      const f = await publicationRetryFixture();
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === name)!;
+      const text = "Checked the changed behavior, connected callers, and coverage. ".repeat(30);
+      const parameters = name === "submit_review"
+        ? { ...f.assessment, summary: text, rationale: text, coverage: { ...f.assessment.coverage,
+          limitations: Array.from({ length: 51 }, (_, index) => `Coverage limitation ${index}`) } }
+        : { body: text, idempotencyKey: "long-publication" };
+      const first = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters });
+      const writes = f.responseWrites.length;
+      const replay = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters });
+      expect(replay).toMatchObject({ invocationId: first.invocationId, result: { data: { status: "processed" } } });
+      if (name === "submit_review") {
+        vi.stubEnv("PAPERCLIP_API_URL", "https://paperclip.example.test");
+        onTestFinished(() => vi.unstubAllEnvs());
+        await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!,
+          responsibleUserId: "owner-user", messageIds: [String(f.run.contextSnapshot?.wakeCommentId)], cause: "instruction" });
+        const servers = await buildPaperclipRuntimeMcpServers({ db,
+          agent: (await db.select().from(agents).where(eq(agents.id, f.assignedAgentId)))[0], runId: f.run.id });
+        const assigned = await createAssignedMcpTools({ gateway,
+          gatewayPublicId: new URL(servers[0].url).pathname.split("/").at(-1)!, bearerToken: servers[0].token });
+        const found = await assigned.execute({ tool: "paperclip_search_assigned_tools", arguments: { query: "Submit a review assessment" } }) as { tools: { name: string }[] };
+        const submit = found.tools.filter(candidate => candidate.name.includes("__submit_review_"));
+        expect(submit).toHaveLength(1);
+        expect(await assigned.execute({ tool: "paperclip_call_assigned_tool", arguments: { name: submit[0].name, arguments: parameters } }))
+          .toMatchObject({ data: { status: "processed" } });
+      }
+      expect(f.responseWrites).toHaveLength(writes);
+      expect(f.responseComments.size).toBe(1);
+      const changed = name === "submit_review" ? { ...parameters, summary: `${text} Changed conclusion.` }
+        : { ...parameters, body: `${text} Changed conclusion.` };
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: changed }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "github_idempotency_conflict" });
+      if (name === "submit_review") {
+        const changedCoverage = { ...parameters, coverage: { ...parameters.coverage!,
+          limitations: [...parameters.coverage!.limitations.slice(0, 50), "Changed final limitation"] } };
+        await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: changedCoverage }))
+          .rejects.toMatchObject({ status: 409, reasonCode: "github_idempotency_conflict" });
+      }
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke publication", policyType: "block", priority: 0,
+        selectors: { catalogEntryId: tool.catalogEntryId! } });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters })).rejects.toThrow();
+      expect(f.responseWrites).toHaveLength(writes);
+    });
+    it("classifies recovered GitHub receipts without republishing or overwriting historical success", async () => {
+      const f = await publicationRetryFixture();
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const { aiConnectionService } = await import("../services/ai-connections.js");
+      const { promptInjectionPreventionService } = await import("../services/prompt-injection-prevention.js");
+      const { promptInjectionInvocations } = await import("@paperclipai/db");
+      const binding = await aiConnectionService(db).save(f.companyId, "owner-user", { provider: "openrouter", method: "api_key",
+        name: "Classifier", ownership: "shared", apiKey: "fixture-key", allAgents: true, agentIds: [] }, "fixture-key");
+      await promptInjectionPreventionService(db).configure(f.companyId, "owner-user", { ...binding, enabled: true, model: "openai/gpt-oss-safeguard-20b" });
+      const provider = vi.fn().mockResolvedValue({ verdict: { violation: false, findings: [] }, receipt: {
+        inputTokens: 100, outputTokens: 10, costCents: "0.001", costStatus: "reported", providerRequestId: "fixture",
+        pricingProvenance: { source: "provider_reported" },
+      } });
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!, responsibleUserId: null, cause: "company_default" });
+      const gateway = createToolGatewayService(db, { toolActionSigningSecret: "classifier-replay-test", promptInjectionProvider: provider });
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(t => t.upstreamToolName === "submit_review")!;
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Approve publication", policyType: "require_approval", priority: 0, selectors: { catalogEntryId: tool.catalogEntryId! } });
+      const input = { sessionToken: session.token, tool: tool.name, parameters: f.assessment };
+      await expect(gateway.executeTool(input)).rejects.toMatchObject({ reasonCode: "approval_required" });
+      const [approval] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.companyId));
+      await gateway.approveActionRequest({ companyId: f.companyId, actionRequestId: approval.id, actor: { userId: "owner-user" } });
+      const writes = f.responseWrites.length;
+      const [before] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, approval.invocationId));
+      expect(before.status).toBe("succeeded");
+      provider.mockResolvedValue({ ...(await provider.mock.results[0].value),
+        verdict: { violation: true, findings: ["instruction_hijack"] } });
+      await expect(gateway.executeTool(input)).rejects.toMatchObject({ reasonCode: "prompt_injection_blocked" });
+      expect(f.responseWrites).toHaveLength(writes); expect(f.responseComments.size).toBe(1);
+      expect((await db.select().from(toolInvocations).where(eq(toolInvocations.id, approval.invocationId)))[0]).toMatchObject({ status: "succeeded", resultHash: before.resultHash });
+      const classifications = await db.select().from(promptInjectionInvocations).where(eq(promptInjectionInvocations.companyId, f.companyId));
+      expect(classifications).toHaveLength(2); expect(classifications.map(c => c.violation)).toEqual([false, true]);
+      expect(classifications.every(c => c.toolInvocationId === approval.invocationId && c.costEventId)).toBe(true);
+    });
+    it("reads pending GitHub receipts without dispatch and refuses a missing publication", async () => {
+      const f = await publicationRetryFixture();
+      let attempts = 0;
+      let unavailable = true;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          if (unavailable) return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === "submit_review")!;
+      const input = { sessionToken: session.token, tool: tool.name, parameters: { ...f.assessment, summary: "Review evidence. ".repeat(50) } };
+      const first = await gateway.executeTool(input);
+      expect(first).toMatchObject({ result: { data: { status: "failed", receipt: { retryable: true } } } });
+      unavailable = false;
+      expect(await gateway.executeTool(input)).toMatchObject({ invocationId: first.invocationId,
+        result: { data: { status: "failed", receipt: { retryable: true } } } });
+      expect(attempts).toBe(1);
+      const action = await f.action();
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, action.id));
+      await githubChatReviewService(db, f.providerFetch).processPending();
+      expect(await gateway.executeTool(input)).toMatchObject({ invocationId: first.invocationId, result: { data: { status: "processed" } } });
+      expect(attempts).toBe(2);
+      expect(f.responseComments.size).toBe(1);
+      const writes = f.responseWrites.length;
+      await db.delete(chatActions).where(eq(chatActions.id, action.id));
+      await expect(gateway.executeTool(input)).rejects.toMatchObject({ status: 409, reasonCode: "github_publication_unavailable" });
+      expect(attempts).toBe(2);
+      expect(f.responseWrites).toHaveLength(writes);
+    });
     it("does not post a GitHub working comment when the scheduler declines the request", async () => {
       const f = await reviewBotFixture();
       f.wakeup.mockImplementation(async (agentId, opts) => {
@@ -3056,7 +3590,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const f = await toolReplyFixture(threadId);
       const service = githubChatReviewService(db, f.providerFetch);
       expect(f.responseWrites).toHaveLength(1);
-      expect(f.responseWrites[0]).toMatchObject({ method: "POST", body: expect.stringContaining("Working on this") });
+      expect(f.responseWrites[0]).toMatchObject({ method: "POST", body: expect.stringContaining(
+        threadId === "github:paperclipai/paperclip:418" ? "Review queued" : "Working on this") });
       expect(f.runtime.endpoints.get(f.endpoint.id)?.reactions).toEqual([]);
       const progress = await service.execute(f.session, "update_comment", { body: "Checking the request", idempotencyKey: "progress-1" });
       expect(progress.status).toBe("processed");
@@ -3182,7 +3717,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const thread = makeThread({ channelId: "paperclipai/paperclip", id: f.conversation.externalThreadId }).thread;
         await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
           trigger: "mention", message: makeMessage({ id: "41802", text: "Review this too", userId: "42", userName: "octocat", mentioned: true }) });
-        await expect.poll(async () => { await githubResponseCommentService(db, f.providerFetch).processPending(); return f.responseComments.size; }, { timeout: 10_000 }).toBe(2);
+        await expect.poll(async () => { await githubResponseCommentService(db, f.providerFetch).processPending(); return f.responseWrites.length; }, { timeout: 10_000 }).toBe(2);
         f.responseComments.delete([...f.responseComments.keys()][0]);
         const links = await db.select().from(chatMessageLinks).where(and(eq(chatMessageLinks.endpointId, f.endpoint.id), eq(chatMessageLinks.direction, "inbound")));
         const latest = await chatWakeContext({ endpointId: f.endpoint.id, issueId: f.conversation.issueId, provider: "github", providerMessageId: "41802" });
@@ -3216,13 +3751,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         findings: [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", body: "Example finding" }],
       }, "inline-only");
       expect(inlineWrites).toHaveLength(1);
-      expect(f.responseWrites.map(write => write.method)).toEqual(deletedSibling ? ["POST", "POST", "PATCH"] : ["POST", "PATCH"]);
-      expect(f.responseComments.size).toBe(1);
+      expect(f.responseWrites.map(write => write.method)).toEqual(["POST", "PATCH"]);
+      expect(f.responseComments.size).toBe(deletedSibling ? 0 : 1);
       const comment = [...f.responseComments.values()][0];
-      expect(comment.body).toContain("Review complete.");
-      expect(comment.body).toContain("https://github.com/paperclipai/paperclip/pull/418");
-      expect(comment.body).not.toContain("Disabled summary");
-      expect(comment.body).toContain("paperclip-response-state:final");
+      if (!deletedSibling) {
+        expect(comment.body).toContain("Review complete.");
+        expect(comment.body).toContain("https://github.com/paperclipai/paperclip/pull/418");
+        expect(comment.body).not.toContain("Disabled summary");
+        expect(comment.body).toContain("paperclip-response-state:final");
+      }
       await expect(githubRunReplyState(db, { ...f.session, endpointId: f.endpoint.id })).resolves.toBe("confirmed");
     });
     it.each(["during_summary", "after_summary"] as const)("keeps partial review delivery authoritative when the head changes %s", async phase => {
@@ -3264,6 +3801,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       if (phase === "after_summary") {
         const [review] = await readChatGitHubReviewsByEndpointId(f.endpoint.id);
         expect(review.publicationReceipts.summary).toMatchObject({ id: String([...f.responseComments.keys()][0]) });
+        const writes = f.responseWrites.length;
+        const { buildExecutionContinuation } = await import("../services/execution-continuation.js");
+        const continuation = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.session.issueId,
+          agentId: f.assignedAgentId, context: { previousRunId: f.run.id }, summary: null, exposeLowTrustRaw: false });
+        expect(continuation.completedActions).toContainEqual(expect.objectContaining({
+          runId: f.run.id, operationId: "github_review_publication", result: expect.objectContaining({
+            repository: review.repository, pullNumber: review.pullNumber, headSha: review.headSha,
+            part: "summary", publicationId: review.publicationReceipts.summary.id, url: review.publicationReceipts.summary.url,
+          }),
+        }));
+        const { githubRecoveryReceipts } = await import("../services/chat-channels/github/recovery-receipts.js");
+        expect(await githubRecoveryReceipts(db, randomUUID(), f.session.issueId)).toEqual([]);
+        expect(await githubRecoveryReceipts(db, f.companyId, randomUUID())).toEqual([]);
+        expect(f.responseWrites).toHaveLength(writes);
       }
     });
     it("does not invent a GitHub completion response when the agent sends no tool reply", async () => {
@@ -3307,6 +3858,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(fallback.state).toBe(expected === "none" ? "published" : "cancelled");
       },
     );
+    it("preserves an earlier final GitHub answer when a later continuation fails", async () => {
+      const f = await toolReplyFixture();
+      const identity = await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!, responsibleUserId: "owner-user", messageIds: [String(f.run.contextSnapshot?.wakeCommentId)], cause: "instruction" });
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "comment", { body: "Earlier final answer", idempotencyKey: randomUUID() });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+      const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId, status: "failed", nativeIssueId: f.conversation.issueId, contextSnapshot: {} }).returning();
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: later.id, issueId: f.conversation.issueId!, responsibleUserId: "owner-user", parentContextId: identity.id, cause: "monitor" });
+      const writes = f.responseWrites.length;
+      await expect(githubResponseCommentService(db, f.providerFetch).failRun({ companyId: f.companyId, endpointId: f.endpoint.id, issueId: f.conversation.issueId!, runId: later.id, body: "Later run failed" })).rejects.toMatchObject({ status: 403 });
+      expect(f.responseWrites).toHaveLength(writes);
+      expect([...f.responseComments.values()][0].body).toContain("Earlier final answer");
+    });
     it("rechecks a GitHub fallback after waiting for the credential lane", async () => {
       const f = await toolReplyFixture();
       await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, f.run.id));
@@ -5246,11 +5809,57 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(reviews[0].event.author.id).toBe("42");
       expect(reviews[0].policySnapshot.ratingThreshold).toBe(5);
       const comments = await readIssueCommentsByIssueId(task.id);
-      expect(comments[0].body).toContain(instruction);
-      expect(comments[0].body).toContain("Read the SKILL.md");
+      expect(comments[0].body).not.toContain(instruction);
+      expect(comments[0].body).not.toContain("Untrusted PR body");
+      const configArgs = { db, companyId: f.companyId, agentId: f.assignedAgentId, issueId: task.id, commentIds: [comments[0].id] };
+      const configs = await resolveGitHubReviewInstructions(configArgs);
+      expect(configs).toHaveLength(1);
+      expect(configs[0].instructions).toContain(instruction);
+      expect(configs[0].instructions).toContain("Read the SKILL.md");
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, companyId: randomUUID() })).toEqual([]);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, issueId: randomUUID() })).toEqual([]);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, agentId: randomUUID() })).toEqual([]);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [randomUUID()] })).toEqual([]);
+      const changed = await f.management.configuration(f.endpoint.id, "owner-user");
+      await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: changed.revision, configuration: {
+        ...changed.configuration, defaults: { ...changed.configuration.defaults, instructions: "UPDATED_REVIEW_POLICY" },
+      } }, "owner-user");
+      // Queued older requests retain their admitted configuration after an edit.
+      expect(await resolveGitHubReviewInstructions(configArgs)).toEqual(configs);
+      await f.service.handleWebhook(f.endpoint.publicId, "github", signedGitHubWebhookRequest({
+        event: "pull_request", delivery: randomUUID(), webhookSecret: f.webhookSecret,
+        payload: { ...payload, action: "synchronize", before: payload.pull_request.head.sha,
+          pull_request: { ...payload.pull_request, head: { sha: "c".repeat(40) } } },
+      }));
+      await expect.poll(async () => {
+        await f.service.processPendingDeliveries();
+        return (await readIssueCommentsByIssueId(task.id)).length;
+      }, { timeout: 10000 }).toBe(2);
+      const updatedComments = await readIssueCommentsByIssueId(task.id);
+      const newComment = updatedComments.find((row) => row.id !== comments[0].id)!;
+      await expect.poll(async () => (await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [newComment.id] })).length).toBe(1);
+      const updatedConfigs = await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [newComment.id] });
+      expect(updatedConfigs).toHaveLength(1);
+      expect(updatedConfigs[0].instructions).toContain("UPDATED_REVIEW_POLICY");
+      expect(updatedConfigs[0].key).not.toBe(configs[0].key);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [comments[0].id] })).toEqual(configs);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [comments[0].id, newComment.id] })).toEqual(updatedConfigs);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [newComment.id, comments[0].id] })).toEqual(configs);
+      const manualMarker = "Explain this review without starting a new assessment";
+      const manualThread = makeThread({ channelId: "paperclipai/paperclip", id: "github:paperclipai/paperclip:81" }).thread;
+      await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread: manualThread,
+        trigger: "mention", message: makeMessage({ id: "81001", text: `@${f.endpoint.botUsername} ${manualMarker}`,
+          userId: "42", userName: "octocat", mentioned: true }) });
+      const manualComment = (await readIssueCommentsByIssueId(task.id)).find((row) => row.body.includes(manualMarker))!;
+      // A discussion between automatic reviews must not reset the retained key.
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [manualComment.id] })).toEqual(updatedConfigs);
+      expect(await resolveGitHubReviewInstructions({ ...configArgs, commentIds: [newComment.id] })).toEqual(updatedConfigs);
       expect(await resolveRunScopedMentionedSkillKeys({ db, companyId: f.companyId, issueId: task.id, commentIds: [comments[0].id] })).toEqual([skill.key]);
       expect(comments[0].body).toContain("untrusted provider data");
       expect(comments[0].authorUserId).toBe("owner-user");
+      expect(comments[0].metadata?.sourceChannel).toBe("github");
+      const inbox = await issueService(db).list(f.companyId, { touchedByUserId: "owner-user" });
+      expect(inbox.map((issue) => issue.id)).not.toContain(task.id);
       const [run] = await db.insert(heartbeatRuns).values({
         companyId: f.companyId,
         agentId: f.assignedAgentId,
@@ -5258,6 +5867,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         status: "running",
         contextSnapshot: { issueId: task.id, wakeCommentId: comments[0].id },
       }).returning();
+      const wakeArgs = { db, companyId: f.companyId, agentId: f.assignedAgentId, runId: run.id,
+        contextSnapshot: { issueId: task.id, wakeCommentId: comments[0].id, wakeCommentIds: [comments[0].id], source: "chat:github",
+          wakeReason: "External chat message received", paperclipHarnessCheckedOut: true } };
+      const wake = await buildPaperclipWakePayload(wakeArgs);
+      expect(wake?.githubReviewConfigurations).toEqual(configs);
+      const { renderPaperclipWakePrompt } = await import("@paperclipai/adapter-utils/server-utils");
+      const prompt = renderPaperclipWakePrompt(wake);
+      expect(prompt.split(instruction)).toHaveLength(2);
+      expect(prompt).not.toContain("Untrusted PR body");
+      const unbound = await buildPaperclipWakePayload({ ...wakeArgs, contextSnapshot: { ...wakeArgs.contextSnapshot, paperclipHarnessCheckedOut: false } });
+      expect(unbound?.externalChatProvider).toBeNull();
+      expect(renderPaperclipWakePrompt(unbound)).not.toContain("## External chat response contract");
+      const [boardComment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: task.id,
+        authorUserId: "owner-user", authorType: "user", body: "Continue the review" }).returning();
+      const boardFollowup = await buildPaperclipWakePayload({ ...wakeArgs,
+        contextSnapshot: { issueId: task.id, wakeCommentIds: [boardComment.id], wakeReason: "issue_commented" } });
+      expect(boardFollowup?.externalChatProvider).toBeNull();
+      expect(boardFollowup?.githubReviewConfigurations).toEqual(updatedConfigs);
+      expect(renderPaperclipWakePrompt(boardFollowup)).toContain("UPDATED_REVIEW_POLICY");
       f.setSupplementalProviderFetch(async (input) => String(input).endsWith("/pulls/81")
         ? Response.json({ ...payload.pull_request, head: { sha: "c".repeat(40) } })
         : undefined);
@@ -8228,6 +8856,40 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(executeConnectorTool(db, binding, "slack_post_message", { channel: "DROUTINE", text: "Revoked", idempotencyKey: randomUUID() })).rejects.toThrow();
   });
 
+  it("keeps Slack tools callable after a native task continuation without wake JSON", async () => {
+    const { resolveConnectorAssignments } = await import("../services/connector-runtime.js");
+    const { executeSlackTool } = await import("../services/connectors/slack.js");
+    await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
+    const f = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(f, { allowUnlinkedPeople: false });
+    const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: f.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UCONTINUE" }).returning();
+    await db.insert(chatIdentityLinks).values({ companyId: f.companyId, endpointId: endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
+    const thread = makeThread({ channelId: "slack:CCONTINUE", id: "slack:CCONTINUE:7100.1" });
+    await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, message: makeMessage({ id: "7100.1", text: "@maya read this channel", mentioned: true, userId: "UCONTINUE" }), trigger: "mention" });
+    const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
+    const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
+    const [first] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId, status: "running", contextSnapshot: { issueId: conversation.issueId } }).returning();
+    const origin = await initializeRunIdentity(db, { companyId: f.companyId, runId: first.id, issueId: conversation.issueId!, responsibleUserId: "owner-user", messageIds: [String(action.payload.commentId)], cause: "instruction" });
+    const binding = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId!, runId: first.id };
+    expect((await resolveConnectorAssignments(db, binding)).map(assignment => assignment.key)).toEqual(["slack"]);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, first.id));
+    const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.assignedAgentId, status: "running", runtimeMode: "native", nativeIssueId: conversation.issueId, contextSnapshot: { wakeReason: "issue_monitor_due" } }).returning();
+    await initializeRunIdentity(db, { companyId: f.companyId, runId: later.id, issueId: conversation.issueId!, responsibleUserId: "owner-user", parentContextId: origin.id, cause: "monitor" });
+    const continued = { ...binding, runId: later.id };
+    expect((await resolveConnectorAssignments(db, continued)).map(assignment => assignment.key)).toEqual(["slack"]);
+    const provider = vi.fn(async (input: RequestInfo | URL) => {
+      const method = String(input).split("/").at(-1);
+      if (method === "users.info") return Response.json({ ok: true, user: { id: "UCONTINUE", team_id: "T-PAPERCLIP" } });
+      if (method === "conversations.info") return Response.json({ ok: true, channel: { id: "CCONTINUE", is_member: true, is_private: false } });
+      if (method === "conversations.members") return Response.json({ ok: true, members: ["UCONTINUE"] });
+      if (method === "conversations.history") return Response.json({ ok: true, messages: [{ ts: "7000.1", text: "Retained channel history" }] });
+      throw new Error(`Unexpected Slack method ${method}`);
+    });
+    expect(await executeSlackTool(db, continued, "slack_history", { channel: "CCONTINUE" }, provider as typeof fetch)).toMatchObject({ messages: [{ text: "Retained channel history" }] });
+    await service.revokeLink(endpoint.id, principal.id, "owner-user");
+    expect(await resolveConnectorAssignments(db, continued)).toEqual([]);
+    await expect(executeSlackTool(db, continued, "slack_history", { channel: "CCONTINUE" }, provider as typeof fetch)).rejects.toThrow();
+  });
   it("binds Slack tools to the admitted linked request, recovers its provenance and revokes retained access", async () => {
     const { resolveConnectorAssignments, executeConnectorTool, applyConnectorSkills, prepareConnectorSkillDelivery } = await import("../services/connector-runtime.js");
     const { executeSlackTool } = await import("../services/connectors/slack.js");
@@ -8327,7 +8989,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     cliApp.use("/api", slackToolRoutes(db, "https://paperclip.example"));
     cliApp.use(errorHandler);
-    await request(cliApp).post(`/api/companies/${binding.companyId}/slack/tasks/${binding.issueId}/tools`).send({ tool: "slack_channel_info", arguments: { channel: "COTHER" } }).expect(200);
+    await request(cliApp).post(`/api/companies/${binding.companyId}/slack/tasks/${binding.issueId}/tools`).send({ tool: "slack_channel_info", arguments: { channel: "COTHER" } }).expect(response => expect(response.status, response.text).toBe(200));
     await request(cliApp).post(`/api/companies/${randomUUID()}/slack/tasks/${binding.issueId}/tools`).send({ tool: "slack_history", arguments: { channel: "COTHER" } }).expect(403);
     await request(cliApp).post(`/api/companies/${binding.companyId}/slack/tasks/${randomUUID()}/tools`).send({ tool: "slack_history", arguments: { channel: "COTHER" } }).expect(403);
     await request(cliApp).post(`/api/companies/${binding.companyId}/slack/tasks/${binding.issueId}/tools`).send({ tool: "slack_history", arguments: { channel: "COTHER", token: "forged" } }).expect(400);
@@ -8710,15 +9372,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const [source] = await db.insert(projectWorkspaces).values({ companyId: fixture.companyId, projectId: project.id,
       name: "Source", cwd: `/tmp/chat-source-${fixture.companyId}` }).returning();
     const defaults = { workspace: { kind: "configured_source" as const, projectWorkspaceId: source.id, mode: "shared" as const } };
-    await expect(service.update(endpoint.id, { executionDefaults: defaults }, "owner-user")).rejects.toMatchObject({ status: 403 });
-    await db.insert(companyMemberships).values({ companyId: fixture.companyId, principalType: "agent",
-      principalId: fixture.assignedAgentId, status: "active", membershipRole: "member" });
-    await db.insert(principalPermissionGrants).values([
-      { companyId: fixture.companyId, principalType: "user", principalId: "owner-user", permissionKey: "tasks:assign_scope",
-        scope: { projectId: project.id, assigneeAgentId: fixture.assignedAgentId } },
-      { companyId: fixture.companyId, principalType: "agent", principalId: fixture.assignedAgentId, permissionKey: "tasks:assign_scope",
-        scope: { projectId: project.id, assigneeAgentId: fixture.assignedAgentId } },
-    ]);
+    // Selecting readable workspace configuration does not assign the task to its source project
+    // or require filesystem-write grants from that project.
     await service.update(endpoint.id, { executionDefaults: defaults }, "owner-user");
     const thread = makeThread({ channelId: "C-PROTECTED", id: "slack:C-PROTECTED:8300.1", name: "protected" });
     await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread,
@@ -9534,6 +10189,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       })
       .expect(400);
   });
+
 
   it.each([
     {
@@ -59316,7 +59972,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       {
         threadId: dm.thread.id,
         messageId: "outbound-2",
-        text: "Maya completed this turn.",
+        text: "Maya has no final response to show yet. Open the task in Paperclip for details.",
       },
     ]);
     expect(
@@ -59459,7 +60115,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           messageId: "outbound-2",
           text: publishesComment
             ? `Explicit Telegram reply via ${authorizationReason}`
-            : "Maya completed this turn.",
+            : "Maya has no final response to show yet. Open the task in Paperclip for details.",
         },
       ]);
       await expect(
@@ -60269,6 +60925,75 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
         rmSync(directory, { recursive: true, force: true });
       }
+    },
+  );
+
+  it.each(["stopped", "real_queue", "unknown_executor", "source_edited", "cancelled_stopped", "cancelled_unknown"] as const)(
+    "admits ordinary chat task Retry with a missing checkpoint only after containment: %s", async kind => {
+      const context = await failedChatRetryFixture("telegram", undefined, kind === "real_queue");
+      try {
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: context.issue.id,
+          nativePhase: "terminal_failure", errorCode: "runner_remote_process_identity_unavailable",
+          runnerProfileJson: {},
+          ...(kind.startsWith("cancelled_") ? { status: "cancelled" } : {}),
+        }).where(eq(heartbeatRuns.id, context.runId));
+        await db.insert(nativeRunFinalizations).values({ companyId: context.fixture.companyId,
+          issueId: context.issue.id, runId: context.runId, phase: "terminal_failure" });
+        const exact = { companyId: context.fixture.companyId, issueId: context.issue.id,
+          agentId: context.fixture.assignedAgentId, failedRunId: context.runId, initiatedByUserId: "owner-user" };
+        await expect(db.transaction(tx => context.service.prepareFailedChatRunRetry(tx, exact)))
+          .rejects.toMatchObject({ details: { code: "chat_failed_run_retry_not_authorized" } });
+        if (kind !== "unknown_executor" && kind !== "cancelled_unknown") await db.insert(heartbeatRunEvents).values({
+          companyId: context.fixture.companyId, agentId: context.fixture.assignedAgentId, runId: context.runId,
+          seq: 1, eventType: "native.local_process_stopped", payload: { processPid: 999999999, processGroupId: null },
+        });
+        const request = { db, companyId: context.fixture.companyId, issueId: context.issue.id,
+          actorId: "owner-user", actorSource: "cloud_tenant", observedRunId: context.runId, idempotencyKey: randomUUID(),
+          prepareChatRetry: context.service.prepareFailedChatRunRetry };
+        const receipt = await requestTaskRetry(request);
+        expect(receipt.chatActionId).toBeTruthy();
+        expect((await requestTaskRetry(request)).requestId).toBe(receipt.requestId);
+        if (kind === "source_edited") await db.update(issueComments).set({ body: "Changed source", updatedAt: new Date() })
+          .where(eq(issueComments.id, String(context.action.payload.commentId)));
+        if (kind === "real_queue") {
+          // Exercise the real dispatch transaction while another live run
+          // occupies capacity. This test makes no provider-execution claim.
+          await db.update(agents).set({ adapterType: "paperclip_runner", status: "running",
+            runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+            .where(eq(agents.id, context.fixture.assignedAgentId));
+          await db.insert(heartbeatRuns).values({ companyId: context.fixture.companyId,
+            agentId: context.fixture.assignedAgentId, status: "running", startedAt: new Date() });
+          context.wakeup.mockImplementation(heartbeatService(db).wakeup);
+        }
+        const outcome = await context.service.processFailedChatRunRetry(receipt.chatActionId!);
+        if (kind === "stopped" || kind === "real_queue" || kind === "cancelled_stopped") {
+          expect(outcome).toMatchObject({ status: "queued" });
+          const [wake] = await readAgentWakeupRequestsById(receipt.chatActionId!);
+          expect(wake, JSON.stringify({
+            action: (await db.select().from(chatActions).where(eq(chatActions.id, receipt.chatActionId!)))[0],
+            wakeResult: await context.wakeup.mock.results.at(-1)?.value,
+          })).toBeDefined();
+          expect(wake).toMatchObject({ requestedByActorType: context.receipt.requestedByActorType,
+            requestedByActorId: context.receipt.requestedByActorId,
+            payload: { wakeCommentIds: [context.action.payload.commentId], retryOfRunId: context.runId } });
+          if (kind === "real_queue") {
+            const [intent] = await readAgentWakeupRequestsById(receipt.requestId!);
+            expect(intent).toMatchObject({ status: "coalesced", runId: wake.runId });
+            expect(wake.runId).toBeTruthy();
+            const [successor] = await readHeartbeatRunsById(wake.runId!);
+            expect(successor).toMatchObject({ status: "queued", contextSnapshot: {
+              taskRetryRequestId: receipt.requestId, forceFreshSession: true,
+              chatFailedRunRetry: { actionId: receipt.chatActionId },
+            } });
+            await context.service.processFailedChatRunRetry(receipt.chatActionId!);
+            expect((await readHeartbeatRunsByCompanyId(context.fixture.companyId))
+              .filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId)).toHaveLength(1);
+          }
+        } else {
+          expect(outcome).toMatchObject({ status: "failed" });
+          expect(await readAgentWakeupRequestsById(receipt.chatActionId!)).toHaveLength(0);
+        }
+      } finally { await context.service.shutdown(); }
     },
   );
 

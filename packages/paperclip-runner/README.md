@@ -46,6 +46,12 @@ specifications are internal to built-in execution; they are not a plugin wire
 contract. Existing flat transport options remain compatible through this shared
 interface. This refactor does not add Launcher APIs or change harness capabilities.
 
+An execution owner can supply `prepareLaunch`, a Runner artifact identity, and
+process and connection hooks. Core supplies the launch requirements. The owner
+returns a provider descriptor bound to those requirements. Core checks the policy
+and assigned resources. See [Runner launch preparation](../../doc/runner-launch-preparation.md)
+for the contract and recovery record.
+
 Connection continuations inspect the harness descriptor's optional
 `toolRefreshOnResume` capability. Native Codex, Claude Managed Agents, AgentCore,
 OpenCode, and qualified Claude/Codex/Grok ACPX profiles expose it; unqualified
@@ -186,6 +192,14 @@ and terminal settlement at the process boundary. Copilot and Pi remain gated.
 Verified distributions are build-owned; no provider accepts an arbitrary executable.
 See [the rich ACP capability report](../../doc/architecture/runner-rich-acp-capabilities.md).
 
+If the controller sends assigned MCP tools in the PRP catalog, the sidecar uses
+its authenticated tool bridge.
+Isolated provider admission accepts this route without a separate native MCP endpoint.
+Direct runtime-host callers must supply the native gateway binding unless they select
+PRP tool delivery and supply the semantic tool bridge.
+PRP delivery keeps the controller's exact operation names, including compact MCP catalog tools.
+The selected permission and read-only policies still apply.
+
 Install Cursor explicitly with `paperclipai runtime setup cursor`; npm installation
 does not download it. Run setup as the OS user that runs Paperclip (the service
 account for a managed service). Setup writes to that account's
@@ -202,7 +216,7 @@ the task waits for the next instruction. See the
 
 A release includes all four platform daemons and the Linux provider-pack identity
 from its matching Daytona image. Run `stage:release-binaries` with a manifest that
-binds each daemon path and SHA-256, plus `remoteProviderPack: {path, sha256}` for
+binds each daemon path and SHA-256, plus `remoteProviderPacks: {"linux-x64": {path, sha256}, "linux-arm64": {path, sha256}}` for
 the actual image's `provider-pack.json`. Assemble these assets after the normal
 build and include them in the server's vendored Runner output before npm packing.
 Assembly requires the provider pack's source revision to match `sourceRevision`
@@ -241,9 +255,25 @@ for an image pinned with `@sha256`, after confirmed lease cleanup. The record is
 server-owned and bound to the company, effective provider/image configuration
 and active custom-image identity. Creation and discovery read this record without
 allocating a sandbox. Configuration or image changes invalidate it. Mutable tags,
-provider defaults and name-only snapshots do not establish compatibility; they
-keep automatic Legacy selection until there is verifiable immutable image evidence.
+provider defaults and unverified snapshot names do not establish compatibility;
+they keep automatic Legacy selection until there is verifiable immutable image
+or Daytona snapshot-ID evidence. See managed snapshot qualification below.
 A connection-only success does not establish native readiness.
+
+### Managed Daytona snapshot qualification
+
+Claude's automatic Connect flow can qualify a named Daytona snapshot through the
+existing administrator-only saved environment probe. The bundled Daytona plugin
+resolves the name to its provider snapshot ID, creates the probe sandbox by ID,
+and returns its account and creation identity. OS, architecture and libc facts
+are recorded only after confirmed cleanup. Native execution uses that same
+snapshot ID; discovery does not allocate or perform provider lookups. A deleted
+snapshot fails at the provider rather than silently selecting a replacement with
+the same name. Configuration, resolved credentials and active captured-template
+changes require another probe. Other named provider templates and mutable OCI
+tags remain unqualified. A provider plugin without snapshot identity support
+returns an actionable setup failure; it cannot certify a native default.
+
 
 On Linux, Codex's sandboxed filesystem modes also require the host to permit its
 unprivileged namespaces. A no-privilege Docker container can prohibit nested
@@ -739,6 +769,21 @@ canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
 
 `create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).
+
+
+Linux provider-pack producers run on the corresponding native Linux target and
+retain `provider-pack.json` with a relocatable `provider-pack.tar.gz`. Release
+assembly binds both identities to the same source as its four daemons. The
+historical `remoteProviderPack` field remains the Linux x64 identity. Linux
+ARM64 packs do not qualify Pi, Cursor or Copilot on that target.
+
+For an installed SSH host, install the same release producer's pack at
+`$HOME/.local/share/paperclip-runner/provider-pack` or
+`/opt/paperclip-runner/provider-pack`. A Mac controller selects its packaged
+Linux target identity after probing the selected host. The runtime verifies the
+installed pack before prompting. No development pack override is needed. A
+missing or mismatched pack fails clearly. Existing explicit overrides remain
+authoritative. ARM64 cloud-image production remains deferred.
 
 ### Oversized OpenCode events
 

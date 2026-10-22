@@ -82,6 +82,7 @@ export function adapterSupportsRemoteManagedEnvironments(adapterType: string): b
 }
 
 export function supportedEnvironmentDriversForAdapter(adapterType: string): EnvironmentDriver[] {
+  if (adapterType === "paperclip_runner") return ["local", "ssh", "sandbox", "plugin"];
   return adapterSupportsRemoteManagedEnvironments(adapterType)
     ? ["local", "ssh", "sandbox"]
     : ["local"];
@@ -195,7 +196,7 @@ export function getEnvironmentCapabilities(
       local: "supported",
       ssh: "supported",
       sandbox: "supported",
-      plugin: "unsupported",
+      plugin: adapterTypes.includes("paperclip_runner") ? "supported" : "unsupported",
     },
     sandboxProviders,
   };

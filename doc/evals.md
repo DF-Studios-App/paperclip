@@ -4,6 +4,34 @@
 > in `DF-Studios-App/paperclip`. Local evaluation commands and report formats
 > remain available; do not wait for the Actions campaigns. See
 > [Internal Fork Operations](FORK-OPERATIONS.md).
+The explicit-only [necessary free-text question journey](../tests/runner-e2e/README.md#necessary-free-text-question)
+checks one essential input, the rendered prompt and context, the real answer,
+one bound continuation, and an exact saved confirmation. Its four development
+cells use the recorded Codex and Claude models. Registration and calibration do
+not establish Slack, staging authentication, warm lifecycle, or live qualification.
+
+The explicit-only [case handoff workflow](../tests/runner-e2e/README.md#persistent-case-handoffs-explicit-only)
+contains arithmetic and receipt smoke cells for a same-task round trip among three native agents using real case/task
+APIs, saved documents, handoff receipts, and browser readback. Receipt smoke has
+an explicit terminal handoff to `done` on its fourth run, proving case closure
+through normal task completion without a fifth provider run. It also has
+an initial task-owned brief supplied at kickoff through `initialDocuments`,
+ordinary native task document reads/writes, and case-page rollup readback.
+Earlier case-document campaign results remain preserved and do not qualify
+this subsequent document ownership change. The suite has
+separately selectable local Codex API-key and subscription profiles with the
+same model and limits. The API profile uses an encrypted company-secret
+reference; the subscription profile receives only an explicitly supplied private
+login fixture. The original arithmetic cell remains subscription-only.
+The receipt cell declares exactly four task work runs, 90-second work-run limits,
+a five-minute attempt, and 100-cent accounted-work budgets. Initial agent setup
+also performs production hello probes outside heartbeat counts, budget accounting
+and the work-run usage report. Up to three initial probes are expected; their
+detailed tokens and cost are unavailable, and a timeout need not cancel an
+in-flight probe immediately. These limits do not establish an absolute provider
+inference cap, and unknown setup usage is not free. The original arithmetic cell
+retains its own limits.
+Service tests and workflow discovery remain distinct from a completed provider run.
 
 The [Slack connector probe catalog](../server/src/services/connectors/slack/evals/README.md)
 organizes eleven manual model acceptance probes and a selector for existing
@@ -245,6 +273,11 @@ analytical label.
 
 ## Evidence, provenance, and history
 
+Polling latency is an interval rather than an exact first-detection time. The
+[Product E2E timing contract](../tests/runner-e2e/README.md#latency-observation-bounds)
+keeps last-absent/first-present bounds, resolution, strict or inclusive targets,
+and pass/fail/inconclusive timing verdicts alongside the unchanged workflow grade.
+
 Retained result snapshots and dated measurement reports belong in
 `paperclip-evals`; application tests, Product E2E fixtures/graders, and executable
 scenario inventories remain in this repository. Keep a compact results index
@@ -416,8 +449,9 @@ Remaining native chat boundaries are in the explicit-only
 `agent-chat-qualification` suite: active task reassignment, user Retry after
 verified worker process loss, and multi-turn answers grounded in actual task
 records. See the [workflow and qualification limits](../tests/runner-e2e/README.md#remaining-native-agent-chat-qualification).
-The 26 native `first-task` cells exercise onboarding before native selection
-becomes the UI default. Live results and semantic answer reviews must accompany
+The 26 native `first-task` cells inspect the production wizard's saved native
+default on qualified targets, without an API runner switch. The 26 Legacy cells
+select Legacy explicitly in Advanced. Live results and semantic answer reviews must accompany
 any qualification claim; catalog presence alone is not a pass.
 
 The explicit-only [native question/resume qualification](../tests/runner-e2e/README.md#task-continuation)

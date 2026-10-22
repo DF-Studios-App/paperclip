@@ -1,9 +1,10 @@
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, paperclipRunnerSupportsPlatform, type AgentRunnerChoice, type AgentRunnerAvailability } from "@paperclipai/shared";
 import { normalizeLegacyRunnerProvider, PAPERCLIP_RUNNER_DEFAULT_MODELS } from "@paperclipai/adapter-utils";
+import { resolveClaudeModel } from "@paperclipai/adapter-claude-local";
 import { findActiveServerAdapter, hasActiveAdapterOverride, waitForExternalAdapters } from "../adapters/registry.js";
 import { getDisabledAdapterTypes } from "./adapter-plugin-store.js";
-import { PaperclipRunnerProviderProfileError, resolvePaperclipRunnerNativeProviderInput } from "./native-runtime/provider-profile.js";
+import { claudeRunnerUnsupportedSettings, PaperclipRunnerProviderProfileError, resolvePaperclipRunnerNativeProviderInput } from "./native-runtime/provider-profile.js";
 import { forbidden, unprocessable } from "../errors.js";
 import { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
@@ -16,23 +17,107 @@ export interface AgentRunnerSelection {
   adapterConfig?: Record<string, unknown>;
   runner?: AgentRunnerChoice;
   target?: RunnerTarget;
+  /** Server-owned inactive setup drafts may precede model selection. Never use for a hire or run. */
+  setupOnly?: boolean;
 }
 
-export function agentRunnerAvailability(harness: string, target: RunnerTarget = localAgentRunnerTarget()): AgentRunnerAvailability {
+function runnerAdaptersAvailable(harness: string, driver: string): boolean {
   const disabled = new Set(getDisabledAdapterTypes());
-  const supported = harness === "codex_local"
+  return ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(harness)
     && !disabled.has(harness) && !disabled.has("paperclip_runner")
     && !!findActiveServerAdapter(harness) && !!findActiveServerAdapter("paperclip_runner")
     && !hasActiveAdapterOverride(harness) && !hasActiveAdapterOverride("paperclip_runner")
-    && isEnvironmentDriverSupportedForAdapter("paperclip_runner", target.driver)
+    && isEnvironmentDriverSupportedForAdapter("paperclip_runner", driver);
+}
+
+export function agentRunnerAvailability(harness: string, target: RunnerTarget = localAgentRunnerTarget()): AgentRunnerAvailability {
+  const supported = runnerAdaptersAvailable(harness, target.driver)
     && (target.driver !== "sandbox" || Boolean(target.platform && target.architecture
       && (target.platform !== "linux" || (target.libc === "glibc" && target.glibcVersion))))
-    && (!target.platform || paperclipRunnerSupportsPlatform(harness, target.platform, target.architecture ?? "", target.libc, target.glibcVersion));
-  return { supportedRunners: supported ? ["paperclip", "legacy"] : ["legacy"], defaultRunner: supported ? "paperclip" : "legacy" };
+    && (harness === "claude_local"
+      ? !!target.platform && paperclipRunnerSupportsPlatform(harness, target.platform, target.architecture ?? "", target.libc, target.glibcVersion)
+      : !target.platform || paperclipRunnerSupportsPlatform(harness, target.platform, target.architecture ?? "", target.libc, target.glibcVersion));
+  const automatic = supported && !(harness === "claude_local" && target.driver === "ssh" && target.platform === "darwin");
+  return { supportedRunners: supported ? ["paperclip", "legacy"] : ["legacy"], defaultRunner: automatic ? "paperclip" : "legacy" };
 }
 
 function incompatible(fields: string[]): never {
   throw unprocessable(`Paperclip Runner cannot honor these settings: ${fields.join(", ")}. Remove them or select Legacy runner in Advanced.`, { code: "agent_runner_config_incompatible", fields });
+}
+
+function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const unsupported = ["extraArgs", "args", "modelReasoningEffort", "reasoningEffort", "effort"]
+    .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
+  if (config.command && config.command !== "pi") unsupported.push("command");
+  if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
+  if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
+  const thinking = config.piThinkingLevel ?? config.thinking;
+  if (thinking !== undefined && !["off", "low", "high", "max"].includes(String(thinking))) unsupported.push("thinking");
+  if (config.piThinkingLevel !== undefined && config.thinking !== undefined && config.piThinkingLevel !== config.thinking) unsupported.push("thinking", "piThinkingLevel");
+  if (unsupported.length) incompatible(unsupported);
+  const translated = { ...config };
+  for (const key of ["command", "extraArgs", "args", "thinking", "stdoutLogMode"]) delete translated[key];
+  return {
+    ...translated,
+    provider: "acpx", acpxAgent: "pi",
+    model: typeof config.model === "string" ? config.model.trim() : "",
+    piThinkingLevel: thinking ?? "low",
+    acpxPermissionMode: config.acpxPermissionMode ?? "approve-all",
+    lifecycleMode: config.lifecycleMode ?? "per_turn",
+  };
+}
+
+function resolveOpenCodeRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const unsupported = ["extraArgs", "args", "variant", "modelReasoningEffort", "reasoningEffort", "effort"]
+    .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
+  if (config.command && config.command !== "opencode") unsupported.push("command");
+  // Legacy false inherits local OpenCode permission rules, which the isolated Runner cannot retain.
+  if (config.dangerouslySkipPermissions !== undefined && config.dangerouslySkipPermissions !== true) unsupported.push("dangerouslySkipPermissions");
+  if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
+  if (unsupported.length) incompatible(unsupported);
+  const translated = { ...config };
+  for (const key of ["command", "extraArgs", "args", "variant", "modelReasoningEffort", "reasoningEffort", "effort", "dangerouslySkipPermissions"]) delete translated[key];
+  return {
+    ...translated,
+    provider: "opencode",
+    model: typeof config.model === "string" ? config.model.trim() : "",
+    opencodePermissionMode: config.opencodePermissionMode ?? "allow",
+    lifecycleMode: config.lifecycleMode ?? "per_turn",
+  };
+}
+
+function resolveClaudeRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const translated = { ...config };
+  const legacyPermission = [config.permissionMode, config.acpPermissionMode].find(value => typeof value === "string" && value.trim()) as string | undefined;
+  if (legacyPermission !== undefined) {
+    const mode = legacyPermission.trim();
+    if (!["approve-all", "approve-reads", "deny-all"].includes(mode)
+      || (config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== mode)) incompatible(["permissionMode", "acpPermissionMode"]);
+    translated.acpxPermissionMode = mode;
+  }
+  for (const key of ["permissionMode", "acpPermissionMode"]) {
+    if (config[key] !== undefined && typeof config[key] !== "string") incompatible([key]);
+    delete translated[key];
+  }
+  const unsupported = claudeRunnerUnsupportedSettings(translated);
+  const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort;
+  if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
+  if (unsupported.length) incompatible(unsupported);
+  for (const key of ["engine", "command", "mode", "acpMode", "nonInteractivePermissions", "acpNonInteractivePermissions", "dangerouslySkipPermissions", "chrome", "maxTurnsPerRun", "effort", "reasoningEffort"]) delete translated[key];
+  const env = config.env && typeof config.env === "object" ? config.env as Record<string, unknown> : {};
+  const modelEnv = { ...env };
+  if (!(typeof config.model === "string" && config.model.trim())) {
+    for (const key of ["ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BEDROCK_BASE_URL"]) {
+      const binding = env[key];
+      if (binding === undefined || typeof binding === "string") continue;
+      if (binding && typeof binding === "object" && "type" in binding && binding.type === "plain"
+        && "value" in binding && typeof binding.value === "string") modelEnv[key] = binding.value;
+      else incompatible([`env.${key}`]);
+    }
+  }
+  const model = resolveClaudeModel(config.model, modelEnv);
+  if (!model) incompatible(["model"]);
+  return { ...translated, ...(effort === undefined || effort === "" ? {} : { modelReasoningEffort: effort }), provider: "acpx", acpxAgent: "claude", model, acpxPermissionMode: translated.acpxPermissionMode ?? "approve-all", lifecycleMode: config.lifecycleMode ?? "per_turn" };
 }
 
 export function resolveNewAgentRunner(input: AgentRunnerSelection): { adapterType: string; adapterConfig: Record<string, unknown> } {
@@ -40,12 +125,41 @@ export function resolveNewAgentRunner(input: AgentRunnerSelection): { adapterTyp
   let config = { ...input.adapterConfig };
   const harness = agentHarnessType(adapterType, config);
   const native = adapterType === "paperclip_runner";
-  if (adapterType === "codex_local" && getDisabledAdapterTypes().includes(adapterType)) throw unprocessable("Codex is disabled on this instance. Enable its adapter or choose another harness.", { code: "agent_runner_unavailable" });
+  if (["codex_local", "claude_local", "opencode_local", "pi_local"].includes(adapterType) && getDisabledAdapterTypes().includes(adapterType)) throw unprocessable(`${adapterType === "pi_local" ? "Pi" : adapterType === "opencode_local" ? "OpenCode" : adapterType === "claude_local" ? "Claude" : "Codex"} is disabled on this instance. Enable its adapter or choose another harness.`, { code: "agent_runner_unavailable" });
   if (native && (input.runner === undefined || input.runner === "paperclip" || (harness !== "codex_local" && input.runner !== "legacy"))) return { adapterType, adapterConfig: normalizeLegacyRunnerProvider(config) };
   const availability = agentRunnerAvailability(harness, input.target);
   const choice = input.runner ?? "auto";
   const useNative = choice === "paperclip" || (choice === "auto" && availability.defaultRunner === "paperclip");
   if (!useNative) {
+    if (harness === "pi_local") {
+      if (!native) return { adapterType, adapterConfig: config };
+      const thinking = config.thinking ?? config.piThinkingLevel ?? "low";
+      const unsupported = [
+        ...(config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== "approve-all" ? ["acpxPermissionMode"] : []),
+        ...(config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn" ? ["lifecycleMode"] : []),
+        ...(config.acpxSessionMode !== undefined ? ["acpxSessionMode"] : []),
+        ...(!["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(thinking)) ? [config.thinking !== undefined ? "thinking" : "piThinkingLevel"] : []),
+      ];
+      if (unsupported.length) throw unprocessable(`Legacy Pi cannot honor these settings: ${unsupported.join(", ")}. Keep Paperclip Runner or explicitly choose compatible settings.`, { code: "agent_runner_config_incompatible", fields: unsupported });
+      for (const key of ["provider", "acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "lifecycleMode", "idleTimeoutMs"]) delete config[key];
+      return { adapterType: "pi_local", adapterConfig: { ...config, thinking } };
+    }
+    if (harness === "opencode_local") {
+      if (!native) return { adapterType, adapterConfig: config };
+      if (config.opencodePermissionMode !== undefined && config.opencodePermissionMode !== "allow") incompatible(["opencodePermissionMode"]);
+      if (config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn") incompatible(["lifecycleMode"]);
+      for (const key of ["provider", "opencodePermissionMode", "lifecycleMode", "idleTimeoutMs"]) delete config[key];
+      return { adapterType: "opencode_local", adapterConfig: { ...config, dangerouslySkipPermissions: true } };
+    }
+    if (harness === "claude_local") {
+      if (!native) return { adapterType, adapterConfig: config };
+      if (config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== "approve-all") incompatible(["acpxPermissionMode"]);
+      if (config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn") incompatible(["lifecycleMode"]);
+      const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort;
+      for (const key of ["provider", "acpxAgent", "acpxPermissionMode", "lifecycleMode", "idleTimeoutMs", "modelReasoningEffort", "reasoningEffort"]) delete config[key];
+      if (effort !== undefined) config.effort = effort;
+      return { adapterType: "claude_local", adapterConfig: { ...config, dangerouslySkipPermissions: config.dangerouslySkipPermissions ?? true } };
+    }
     if (!native && harness !== "codex_local") return { adapterType, adapterConfig: config };
     if (!native && !["codexPermissionMode", "lifecycleMode", "idleTimeoutMs"].some(key => config[key] !== undefined)) return { adapterType, adapterConfig: config };
     if (harness !== "codex_local") throw unprocessable("This native harness does not have a runner override in this release.", { code: "agent_runner_unavailable" });
@@ -55,10 +169,40 @@ export function resolveNewAgentRunner(input: AgentRunnerSelection): { adapterTyp
     return { adapterType: "codex_local", adapterConfig: { ...config, dangerouslyBypassApprovalsAndSandbox: config.dangerouslyBypassApprovalsAndSandbox ?? true } };
   }
   if (native && harness !== "codex_local" && choice === "paperclip") return { adapterType, adapterConfig: normalizeLegacyRunnerProvider(config) };
-  if (availability.defaultRunner !== "paperclip") throw unprocessable(input.target?.driver === "sandbox"
+  if (!availability.supportedRunners.includes("paperclip")) throw unprocessable(input.target?.driver === "sandbox"
     ? "Paperclip Runner is unavailable for this sandbox. Choose an immutable OCI image digest and run its environment connection probe to qualify the OS, architecture and libc, or select Legacy runner in Advanced."
     : "Paperclip Runner is unavailable for this harness and environment. Select Legacy runner in Advanced.", { code: "agent_runner_unavailable" });
   if (native) return { adapterType, adapterConfig: normalizeLegacyRunnerProvider(config) };
+  if (harness === "pi_local") {
+    config = resolvePiRunnerConfig(config);
+    if (input.setupOnly && !config.model) return { adapterType: "paperclip_runner", adapterConfig: config };
+    if (typeof config.model !== "string" || !/^[^/\s]+\/\S+$/.test(config.model)) throw unprocessable("Pi requires an explicit provider/model. Select a model before testing or hiring.", { code: "agent_runner_config_incompatible", fields: ["model"] });
+    try { resolvePaperclipRunnerNativeProviderInput({ backend: "acpx_runtime", adapterConfig: config }); }
+    catch (error) {
+      if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
+      throw error;
+    }
+    return { adapterType: "paperclip_runner", adapterConfig: config };
+  }
+  if (harness === "opencode_local") {
+    config = resolveOpenCodeRunnerConfig(config);
+    if (input.setupOnly && !config.model) return { adapterType: "paperclip_runner", adapterConfig: config };
+    try { resolvePaperclipRunnerNativeProviderInput({ backend: "opencode_server", adapterConfig: config }); }
+    catch (error) {
+      if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
+      throw error;
+    }
+    return { adapterType: "paperclip_runner", adapterConfig: config };
+  }
+  if (harness === "claude_local") {
+    config = resolveClaudeRunnerConfig(config);
+    try { resolvePaperclipRunnerNativeProviderInput({ backend: "acpx_runtime", adapterConfig: config }); }
+    catch (error) {
+      if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
+      throw error;
+    }
+    return { adapterType: "paperclip_runner", adapterConfig: config };
+  }
   const aliasSources = new Map<string, string>();
   for (const [canonical, alias] of [
     ["agentCommand", "acpAgentCommand"], ["stateDir", "acpStateDir"],
@@ -114,7 +258,7 @@ export function resolveNewAgentRunner(input: AgentRunnerSelection): { adapterTyp
 }
 
 export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string, input: AgentRunnerSelection & { defaultEnvironmentId?: string | null }) {
-  if (agentHarnessType(input.adapterType ?? "process", input.adapterConfig) !== "codex_local"
+  if (!["codex_local", "claude_local", "opencode_local", "pi_local"].includes(agentHarnessType(input.adapterType ?? "process", input.adapterConfig))
     || input.runner === "legacy" || (input.adapterType === "paperclip_runner" && (input.runner === undefined || input.runner === "paperclip"))) return resolveNewAgentRunner(input);
   const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId);
   return resolveNewAgentRunner({ ...input, target });
@@ -151,7 +295,7 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);
     if (qualified) target = { driver, ...qualified };
   }
-  if (driver === "ssh" && environment && agentRunnerAvailability("codex_local", target).defaultRunner === "paperclip") {
+  if (driver === "ssh" && environment && ["codex_local", "claude_local", "opencode_local", "pi_local"].some(harness => runnerAdaptersAvailable(harness, driver))) {
     const parsed = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment);
     if (parsed.driver !== "ssh") throw unprocessable("The selected SSH environment is unavailable.");
     let output: string;
