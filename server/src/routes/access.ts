@@ -100,7 +100,7 @@ import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
 } from "../lib/join-request-dedupe.js";
-import { assertAuthenticated, assertCompanyAccess } from "./authz.js";
+import { assertAuthenticated, assertCompanyAccess, isBoardOrLeader } from "./authz.js";
 import {
   claimBoardOwnership,
   inspectBoardClaimChallenge
@@ -1177,7 +1177,7 @@ async function loadCompanyAccessSummary(
   access: ReturnType<typeof accessService>,
   companyId: string,
 ) {
-  if (req.actor.type !== "board") {
+  if (!isBoardOrLeader(req)) {
     return {
       currentUserRole: null,
       canManageMembers: false,
@@ -1280,7 +1280,7 @@ async function resolveActorHumanRole(
   access: ReturnType<typeof accessService>,
   companyId: string,
 ): Promise<HumanCompanyMembershipRole | null> {
-  if (req.actor.type !== "board") return null;
+  if (!isBoardOrLeader(req)) return null;
   if (isLocalImplicit(req) || req.actor.isInstanceAdmin) return "owner";
   const userId = req.actor.userId ?? null;
   if (!userId) return null;
@@ -1301,7 +1301,7 @@ async function getProtectedMemberReason(
   },
 ): Promise<string | null> {
   if (member.principalType !== "user") return "Only human company members can be removed.";
-  if (req.actor.type !== "board") return "Board access is required to remove members.";
+  if (!isBoardOrLeader(req)) return "Board access is required to remove members.";
   if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
     ? opts.instanceAdminUserIds.has(member.principalId)
@@ -2703,7 +2703,7 @@ export function accessRoutes(
   });
 
   async function assertInstanceAdmin(req: Request) {
-    if (req.actor.type !== "board") throw unauthorized();
+    if (!isBoardOrLeader(req)) throw unauthorized();
     if (isLocalImplicit(req)) return;
     const allowed = await access.isInstanceAdmin(req.actor.userId);
     if (!allowed) throw forbidden("Instance admin required");
@@ -2727,7 +2727,7 @@ export function accessRoutes(
     if (!token) throw notFound("Board claim challenge not found");
     if (!code) throw badRequest("Claim code is required");
     if (
-      req.actor.type !== "board" ||
+      !isBoardOrLeader(req) ||
       req.actor.source !== "session" ||
       !req.actor.userId
     ) {
@@ -2765,7 +2765,7 @@ export function accessRoutes(
       throw notFound("Browser first-admin claim is not available");
     }
     if (
-      req.actor.type !== "board" ||
+      !isBoardOrLeader(req) ||
       req.actor.source !== "session" ||
       !req.actor.userId
     ) {
@@ -2843,7 +2843,7 @@ export function accessRoutes(
     async (req, res) => {
       const id = (req.params.id as string).trim();
       if (
-        req.actor.type !== "board" ||
+        !isBoardOrLeader(req) ||
         (!req.actor.userId && !isLocalImplicit(req))
       ) {
         throw unauthorized("Sign in before approving CLI access");
@@ -2967,7 +2967,7 @@ export function accessRoutes(
   });
 
   router.post("/cli-auth/revoke-current", async (req, res) => {
-    if (req.actor.type !== "board" || req.actor.source !== "board_key") {
+    if (!isBoardOrLeader(req) || req.actor.source !== "board_key") {
       throw badRequest("Current board API key context is required");
     }
     const key = await boardAuth.assertCurrentBoardKey(
@@ -2995,7 +2995,7 @@ export function accessRoutes(
       if (!allowed) throw forbidden("Permission denied");
       return;
     }
-    if (req.actor.type !== "board") throw unauthorized();
+    if (!isBoardOrLeader(req)) throw unauthorized();
     if (isLocalImplicit(req)) return;
     const allowed = await access.canUser(
       companyId,
@@ -3021,7 +3021,7 @@ export function accessRoutes(
       }
       return;
     }
-    if (req.actor.type !== "board") throw unauthorized();
+    if (!isBoardOrLeader(req)) throw unauthorized();
     if (isLocalImplicit(req)) return;
     const allowed = await access.canUser(companyId, req.actor.userId, "users:invite");
     if (!allowed) throw forbidden("Permission denied");
@@ -3640,7 +3640,7 @@ export function accessRoutes(
           throw badRequest("Bootstrap invite requires human request type");
         }
         if (
-          req.actor.type !== "board" ||
+          !isBoardOrLeader(req) ||
           (!req.actor.userId && !isLocalImplicit(req))
         ) {
           throw unauthorized(
@@ -3692,7 +3692,7 @@ export function accessRoutes(
         throw badRequest(`Invite does not allow ${requestType} joins`);
       }
 
-      if (requestType === "human" && req.actor.type !== "board") {
+      if (requestType === "human" && !isBoardOrLeader(req)) {
         throw unauthorized(
           "Human invite acceptance requires authenticated user"
         );

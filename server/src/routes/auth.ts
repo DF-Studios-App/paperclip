@@ -1,3 +1,4 @@
+import { isBoardOrLeader } from "./authz.js";
 import { Router } from "express";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -39,7 +40,7 @@ export function authRoutes(db: Db) {
   const router = Router();
 
   router.get("/get-session", async (req, res) => {
-    if (req.actor.type !== "board" || !req.actor.userId) {
+    if (!isBoardOrLeader(req) || !req.actor.userId) {
       throw unauthorized("Board authentication required");
     }
 
@@ -61,7 +62,7 @@ export function authRoutes(db: Db) {
   });
 
   router.get("/profile", async (req, res) => {
-    if (req.actor.type !== "board" || !req.actor.userId) {
+    if (!isBoardOrLeader(req) || !req.actor.userId) {
       throw unauthorized("Board authentication required");
     }
 
@@ -69,7 +70,7 @@ export function authRoutes(db: Db) {
   });
 
   router.patch("/profile", validate(updateCurrentUserProfileSchema), async (req, res) => {
-    if (req.actor.type !== "board" || !req.actor.userId) {
+    if (!isBoardOrLeader(req) || !req.actor.userId) {
       throw unauthorized("Board authentication required");
     }
 

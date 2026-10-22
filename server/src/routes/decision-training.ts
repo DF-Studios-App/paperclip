@@ -4,7 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { authorizationService, issueReadSqlCondition } from "../services/authorization.js";
 import { validate } from "../middleware/validate.js";
 import { decisionTrainingService, logActivity } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess, isBoardOrLeader } from "./authz.js";
 
 const sourceKindSchema = z.enum(["interaction", "approval", "execution_decision"]);
 const exampleIdSchema = z.string().guid();
@@ -22,7 +22,7 @@ const previewSchema = z.object({
 }).strict();
 
 function requireHumanUser(req: Request, res: Response) {
-  if (req.actor.type !== "board") {
+  if (!isBoardOrLeader(req)) {
     res.status(403).json({ error: "Decision training writes require a human user" });
     return null;
   }
