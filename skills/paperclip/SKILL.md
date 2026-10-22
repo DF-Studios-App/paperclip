@@ -791,4 +791,4 @@ so the answer resumes verification. A handoff comment asking the user to comment
 back or reassign the task is not a confirmation card. The card records the user's
 answer; verify the provider's gate and publish result before continuing.
 
-Repository routing for this Paperclip fork is in `references/repository-routing.md`. Read it before creating issues, pull requests, or pushes.
+Repository routing for this Paperclip fork: keep changes and GitHub work in `DF-Studios-App/paperclip`. Create issues and pull requests there only, targeting `master`, and push through `origin`. Treat `upstream` (`paperclipai/paperclip`) as read-only: never push to it or create issues or pull requests there. If the target repository is not clearly `DF-Studios-App/paperclip`, stop and ask the user. Full details: `references/repository-routing.md`.
