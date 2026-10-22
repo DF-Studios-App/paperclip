@@ -13,6 +13,8 @@ import {
   toggleAllGitHubRepositoriesSchema,
   createAiConnectionSchema,
   updateDecisionModelSchema,
+  startAgyAccountLoginSchema,
+  submitAgyAccountLoginCodeSchema,
   aiConnectionPoolConfigSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
@@ -1388,6 +1390,12 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/decision-model",
   "PUT /api/companies/{companyId}/decision-model",
   "POST /api/companies/{companyId}/decision-model/test",
+  "GET /api/companies/{companyId}/agy-accounts",
+  "POST /api/companies/{companyId}/agy-accounts/logins",
+  "GET /api/companies/{companyId}/agy-accounts/logins/{loginId}",
+  "POST /api/companies/{companyId}/agy-accounts/logins/{loginId}/code",
+  "DELETE /api/companies/{companyId}/agy-accounts/logins/{loginId}",
+  "DELETE /api/companies/{companyId}/agy-accounts/{accountId}",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -11073,6 +11081,38 @@ registerCurrentRoute({
   method: "post", path: "/api/companies/{companyId}/decision-model/test", tags: ["decision-models"],
   summary: "Run the fixed billed three-question setup test as a connection manager",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/companies/{companyId}/agy-accounts", tags: ["agy-accounts"],
+  summary: "List the company's Antigravity CLI accounts, their quota state, and the active sign-in",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "post", path: "/api/companies/{companyId}/agy-accounts/logins", tags: ["agy-accounts"],
+  summary: "Add an Antigravity CLI account and start its Google sign-in on the Paperclip host",
+  body: startAgyAccountLoginSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/companies/{companyId}/agy-accounts/logins/{loginId}", tags: ["agy-accounts"],
+  summary: "Read an Antigravity CLI sign-in, including its Google sign-in URL while it waits for a code",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registerCurrentRoute({
+  method: "post", path: "/api/companies/{companyId}/agy-accounts/logins/{loginId}/code", tags: ["agy-accounts"],
+  summary: "Send the authorization code from the Antigravity sign-in page to the CLI",
+  body: submitAgyAccountLoginCodeSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+registerCurrentRoute({
+  method: "delete", path: "/api/companies/{companyId}/agy-accounts/logins/{loginId}", tags: ["agy-accounts"],
+  summary: "Cancel an Antigravity CLI sign-in",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registerCurrentRoute({
+  method: "delete", path: "/api/companies/{companyId}/agy-accounts/{accountId}", tags: ["agy-accounts"],
+  summary: "Remove a company Antigravity CLI account and its sign-in",
+  responses: { 204: r.noContent, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/decision-model/history", tags: ["decision-models"],

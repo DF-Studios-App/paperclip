@@ -169,14 +169,30 @@ export function parseAgyResetDurationMs(raw: string): number | null {
   return totalMs > 0 ? totalMs : null;
 }
 
+/**
+ * Subset of AGY_QUOTA_RE that means the signed-in account itself ran out of
+ * quota, as opposed to a short-lived upstream error such as a 503 or 429.
+ * Only these switch a multi-account agent to its next account.
+ */
+const AGY_ACCOUNT_QUOTA_RE =
+  /(?:individual\s+quota\s+reached|quota\s+(?:reached|exceeded|exhausted)|resource[_\s]exhausted|overages\s+(?:not\s+)?enabled|resets?\s+in\s+\d)/i;
+
+export type AgyQuotaKind = "quota" | "transient";
+
 export function detectAgyQuotaExhausted(input: {
   stdout: string;
   stderr: string;
-}): { exhausted: boolean; resetHint: string | null; retryNotBefore: string | null } {
+}): {
+  exhausted: boolean;
+  kind: AgyQuotaKind | null;
+  resetHint: string | null;
+  retryNotBefore: string | null;
+} {
   const combined = `${input.stdout}\n${input.stderr}`;
   const exhausted = AGY_QUOTA_RE.test(combined);
 
-  if (!exhausted) return { exhausted: false, resetHint: null, retryNotBefore: null };
+  if (!exhausted) return { exhausted: false, kind: null, resetHint: null, retryNotBefore: null };
+  const kind: AgyQuotaKind = AGY_ACCOUNT_QUOTA_RE.test(combined) ? "quota" : "transient";
 
   const resetMatch = combined.match(/resets?\s+in\s+([\dhms\s]+)/i);
   const resetHint = resetMatch ? `Resets in ${resetMatch[1].trim()}` : null;
@@ -189,7 +205,7 @@ export function detectAgyQuotaExhausted(input: {
     }
   }
 
-  return { exhausted, resetHint, retryNotBefore };
+  return { exhausted, kind, resetHint, retryNotBefore };
 }
 
 export const detectAntigravityQuotaExhausted = detectAgyQuotaExhausted;

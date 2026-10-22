@@ -17,6 +17,8 @@ import { DEFAULT_AGY_LOCAL_MODEL, models } from "@paperclipai/adapter-agy-local"
 import { parseAgyStdoutLine, buildAgyLocalConfig } from "@paperclipai/adapter-agy-local/ui";
 import { printAgyStreamEvent } from "@paperclipai/adapter-agy-local/cli";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
+import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import { resolveAgyAccountPool, resolveAgyCompanyAccountsDir } from "@paperclipai/adapter-agy-local/server";
 
 describe("agy_local parser", () => {
   it("extracts session, summary, and terminal error message from text output", () => {
@@ -121,6 +123,16 @@ describe("agy_local quota detection", () => {
     expect(detectAgyQuotaExhausted({ stdout: "", stderr: "429 Too Many Requests" }).exhausted).toBe(true);
   });
 
+  it("separates exhausted account quota from short upstream errors", () => {
+    expect(
+      detectAgyQuotaExhausted({ stdout: "", stderr: "Individual quota reached. Resets in 4h3m21s." }).kind,
+    ).toBe("quota");
+    expect(detectAgyQuotaExhausted({ stdout: "RESOURCE_EXHAUSTED", stderr: "" }).kind).toBe("quota");
+    expect(detectAgyQuotaExhausted({ stdout: "", stderr: "503 Service Unavailable" }).kind).toBe("transient");
+    expect(detectAgyQuotaExhausted({ stdout: "", stderr: "429 Too Many Requests" }).kind).toBe("transient");
+    expect(detectAgyQuotaExhausted({ stdout: "Task completed", stderr: "" }).kind).toBeNull();
+  });
+
   it("does not flag normal output as quota exhausted", () => {
     const r = detectAgyQuotaExhausted({ stdout: "Task completed successfully", stderr: "" });
     expect(r.exhausted).toBe(false);
@@ -149,6 +161,7 @@ describe("agy_local session codec", () => {
     const params = {
       sessionId: "12345678-1234-4234-8234-123456789abc",
       cwd: "/workspace/project",
+      agyAccountId: "conta2",
       workspaceId: "ws-1",
       repoUrl: "https://github.com/org/repo",
       repoRef: "main",
@@ -638,6 +651,317 @@ describe("agy_local execute argument construction & session retry", () => {
         onLog: vi.fn(),
       }),
     ).rejects.toThrow('Command not found in PATH: "agy"');
+  });
+});
+
+describe("agy_local multi-account failover", () => {
+  const QUOTA_4H = "Individual quota reached. Contact your administrator to enable overages. Resets in 4h3m21s.";
+  const SESSION_A = "aaaaaaaa-1111-4111-8111-111111111111";
+  const SESSION_B = "bbbbbbbb-2222-4222-8222-222222222222";
+  let commandResolvableSpy: ReturnType<typeof vi.spyOn>;
+  let root: string;
+  let homeA: string;
+  let homeB: string;
+
+  type ProcResult = { exitCode: number; signal: null; timedOut: false; stdout: string; stderr: string };
+  const quota = (stderr = QUOTA_4H): ProcResult => ({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr });
+  const ok = (sessionId: string): ProcResult => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: `Antigravity CLI init (session: ${sessionId})\nDone`,
+    stderr: "",
+  });
+
+  const accountsConfig = () => ({
+    command: "agy",
+    cwd: process.cwd(),
+    accounts: [
+      { id: "conta1", home: homeA },
+      `conta2=${homeB}`,
+    ],
+  });
+
+  const mockByHome = (responses: Record<string, ProcResult>) =>
+    vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess").mockImplementation(
+      // The default account does not override HOME, so it resolves to the process HOME.
+      async (_runId, _target, _command, _args, options) =>
+        responses[options.env?.HOME || process.env.HOME || ""] ?? ok(SESSION_A),
+    );
+
+  const readState = async (home: string) =>
+    JSON.parse(await fs.readFile(path.join(home, ".gemini", ".paperclip-agy-quota.json"), "utf8")) as {
+      exhaustedUntil: string;
+    };
+
+  const writeState = async (home: string, exhaustedUntil: string) => {
+    await fs.mkdir(path.join(home, ".gemini"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".gemini", ".paperclip-agy-quota.json"),
+      JSON.stringify({ exhaustedUntil, resetHint: null, updatedAt: new Date().toISOString() }),
+    );
+  };
+
+  beforeEach(async () => {
+    commandResolvableSpy = vi
+      .spyOn(executionTarget, "ensureAdapterExecutionTargetCommandResolvable")
+      .mockResolvedValue(undefined);
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "agy-accounts-"));
+    homeA = path.join(root, "conta1");
+    homeB = path.join(root, "conta2");
+    await fs.mkdir(homeA, { recursive: true });
+    await fs.mkdir(homeB, { recursive: true });
+  });
+
+  afterEach(async () => {
+    commandResolvableSpy?.mockRestore();
+    vi.restoreAllMocks();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("moves the turn to the next account when quota runs out and records the reset", async () => {
+    const runProcessSpy = mockByHome({ [homeA]: quota(), [homeB]: ok(SESSION_B) });
+    const onLog = vi.fn();
+    const before = Date.now();
+
+    const result = await execute({
+      runId: "run-failover",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: {
+        sessionId: SESSION_A,
+        sessionParams: { sessionId: SESSION_A, cwd: process.cwd(), agyAccountId: "conta1" },
+        sessionDisplayId: SESSION_A,
+      },
+      config: accountsConfig(),
+      context: {},
+      onLog,
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(2);
+    expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBe(homeA);
+    expect(runProcessSpy.mock.calls[0][3]).toContain("--conversation");
+    expect(runProcessSpy.mock.calls[1][4].env?.HOME).toBe(homeB);
+    expect(runProcessSpy.mock.calls[1][3]).not.toContain("--conversation");
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect(result.sessionId).toBe(SESSION_B);
+    expect(result.sessionParams).toMatchObject({ sessionId: SESSION_B, agyAccountId: "conta2" });
+    expect(onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining('account "conta1" quota exhausted (Resets in 4h3m21s); switching to account "conta2"'),
+    );
+
+    const state = await readState(homeA);
+    const expectedMs = before + (4 * 3600 + 3 * 60 + 21 + 60) * 1000;
+    expect(Date.parse(state.exhaustedUntil)).toBeGreaterThanOrEqual(expectedMs - 1000);
+    expect(Date.parse(state.exhaustedUntil)).toBeLessThanOrEqual(expectedMs + 5000);
+  });
+
+  it("skips an account that is still out of quota", async () => {
+    await writeState(homeA, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    const runProcessSpy = mockByHome({ [homeB]: ok(SESSION_B) });
+
+    const result = await execute({
+      runId: "run-skip-exhausted",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: {
+        sessionId: SESSION_A,
+        sessionParams: { sessionId: SESSION_A, cwd: process.cwd(), agyAccountId: "conta1" },
+        sessionDisplayId: SESSION_A,
+      },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(1);
+    expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBe(homeB);
+    expect(runProcessSpy.mock.calls[0][3]).not.toContain("--conversation");
+    expect(result.sessionParams).toMatchObject({ agyAccountId: "conta2" });
+  });
+
+  it("resumes the saved conversation on the account that owns it", async () => {
+    const runProcessSpy = mockByHome({ [homeB]: ok(SESSION_B) });
+
+    await execute({
+      runId: "run-owner-resume",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: {
+        sessionId: SESSION_B,
+        sessionParams: { sessionId: SESSION_B, cwd: process.cwd(), agyAccountId: "conta2" },
+        sessionDisplayId: SESSION_B,
+      },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(1);
+    expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBe(homeB);
+    const args = runProcessSpy.mock.calls[0][3];
+    expect(args[args.indexOf("--conversation") + 1]).toBe(SESSION_B);
+  });
+
+  it("fails with the earliest reset when every account is out of quota", async () => {
+    const runProcessSpy = mockByHome({
+      [homeA]: quota(),
+      [homeB]: quota("Individual quota reached. Resets in 1h."),
+    });
+    const before = Date.now();
+
+    const result = await execute({
+      runId: "run-all-exhausted",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(2);
+    expect(result.errorCode).toBe("agy_quota_exhausted");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorMessage).toContain("All configured AGY accounts are out of quota");
+    const retryMs = Date.parse(result.retryNotBefore ?? "");
+    expect(retryMs).toBeGreaterThanOrEqual(before + 61 * 60 * 1000 - 1000);
+    expect(retryMs).toBeLessThanOrEqual(before + 61 * 60 * 1000 + 5000);
+  });
+
+  it("does not start AGY when every account is already out of quota", async () => {
+    const soon = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    await writeState(homeA, new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString());
+    await writeState(homeB, soon);
+    const runProcessSpy = mockByHome({});
+
+    const result = await execute({
+      runId: "run-none-available",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).not.toHaveBeenCalled();
+    expect(result.errorCode).toBe("agy_quota_exhausted");
+    expect(result.retryNotBefore).toBe(soon);
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("stays on the account for short upstream errors", async () => {
+    const runProcessSpy = mockByHome({ [homeA]: quota("503 Service Unavailable") });
+
+    const result = await execute({
+      runId: "run-transient",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(1);
+    expect(result.errorCode).toBe("agy_quota_exhausted");
+    await expect(
+      fs.access(path.join(homeA, ".gemini", ".paperclip-agy-quota.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the company accounts after the host sign-in when the agent lists none", async () => {
+    const previousHome = process.env.HOME;
+    const hostHome = path.join(root, "host-home");
+    // The test setup points PAPERCLIP_HOME and PAPERCLIP_INSTANCE_ID at a temporary instance.
+    const instanceRoot = resolvePaperclipInstanceRootForAdapter({ env: process.env });
+    const companyHome = path.join(instanceRoot, "companies", "c1", "agy-accounts", "account-1");
+    for (const home of [hostHome, companyHome]) {
+      await fs.mkdir(path.join(home, ".gemini", "antigravity-cli"), { recursive: true });
+      await fs.writeFile(path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "token");
+    }
+    await fs.writeFile(path.join(companyHome, "account.json"), JSON.stringify({ label: "Conta 2", createdAt: "2026-10-22T00:00:00.000Z" }));
+    process.env.HOME = hostHome;
+    try {
+      const runProcessSpy = mockByHome({ [hostHome]: quota(), [companyHome]: ok(SESSION_B) });
+      const pool = await resolveAgyAccountPool({
+        config: {},
+        companyAccountsDir: resolveAgyCompanyAccountsDir(instanceRoot, "c1"),
+        defaultHome: hostHome,
+      });
+      expect(pool.accounts.map((account) => account.id)).toEqual(["default", "account-1"]);
+      const result = await execute({
+        runId: "run-company-accounts",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: { command: "agy", cwd: process.cwd() },
+        context: {},
+        onLog: vi.fn(),
+      });
+
+      expect(runProcessSpy).toHaveBeenCalledTimes(2);
+      // The default account keeps the process HOME; the company account overrides it.
+      expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBeUndefined();
+      expect(runProcessSpy.mock.calls[1][4].env?.HOME).toBe(companyHome);
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionParams).toMatchObject({ agyAccountId: "account-1" });
+      expect((await readState(hostHome)).exhaustedUntil).toEqual(expect.any(String));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it("gives the next account a handoff with the previous summary and the workspace state", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "agy-handoff-"));
+    const { execFileSync } = await import("node:child_process");
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: workspace });
+      await fs.writeFile(path.join(workspace, "feature.ts"), "export const done = true;\n");
+      const runProcessSpy = mockByHome({
+        [homeA]: { exitCode: 1, signal: null, timedOut: false, stdout: "Planning the change\nWrote feature.ts", stderr: QUOTA_4H },
+        [homeB]: ok(SESSION_B),
+      });
+
+      await execute({
+        runId: "run-handoff",
+        agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        config: { ...accountsConfig(), cwd: workspace },
+        context: {},
+        onLog: vi.fn(),
+      });
+
+      expect(runProcessSpy).toHaveBeenCalledTimes(2);
+      const stdin = JSON.parse(runProcessSpy.mock.calls[1][4].stdin?.trim() ?? "{}") as { message?: { content?: string } };
+      const prompt = stdin.message?.content ?? "";
+      expect(prompt).toContain("stopped because");
+      expect(prompt).toContain("Wrote feature.ts");
+      expect(prompt).toContain("feature.ts");
+      expect(prompt).toContain("Review these changes first");
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an account that is not signed in without recording quota", async () => {
+    const runProcessSpy = mockByHome({
+      [homeA]: { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "Error: Not logged in" },
+      [homeB]: ok(SESSION_B),
+    });
+
+    const result = await execute({
+      runId: "run-not-signed-in",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionParams).toMatchObject({ agyAccountId: "conta2" });
+    await expect(
+      fs.access(path.join(homeA, ".gemini", ".paperclip-agy-quota.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

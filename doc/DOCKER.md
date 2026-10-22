@@ -12,6 +12,16 @@ docker build -t paperclip-local .
 
 The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`), the Claude, Codex, OpenCode, Gemini, and Kimi CLIs, and the Antigravity CLI (`agy`) from its vendor install script. Installing `agy` does not sign it in; the `agy_local` adapter still needs an authenticated local account.
 
+To give `agy_local` agents more than one Antigravity account, sign in each extra
+account under its own HOME inside the data volume, then list the accounts in the
+agent's `accounts` field (see `packages/adapters/agy-local/README.md`):
+
+```sh
+docker exec -it -u node <container> sh -c 'mkdir -p /paperclip/agy-accounts/conta2 && HOME=/paperclip/agy-accounts/conta2 agy'
+```
+
+When one account runs out of quota, the run continues on the next account.
+
 Build arguments:
 
 | Arg | Default | Purpose |

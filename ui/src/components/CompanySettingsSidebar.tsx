@@ -5,6 +5,7 @@ import {
   Download,
   FlaskConical,
   KeyRound,
+  UserRoundCog,
   Link2,
   MonitorCog,
   Puzzle,
@@ -148,6 +149,7 @@ export function CompanySettingsSidebar() {
           {fastResponsesEnabled && (
             <SidebarNavItem to="/company/settings/connections" label="Connections" icon={Link2} end />
           )}
+          <SidebarNavItem to="/company/settings/agy-accounts" label="Antigravity accounts" icon={UserRoundCog} end />
           {showPage("instance.access") && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/access`}

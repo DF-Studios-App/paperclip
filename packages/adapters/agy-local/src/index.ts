@@ -54,6 +54,7 @@ Core fields:
 - command (string, optional): CLI command override, defaults to "agy".
 - extraArgs (string[], optional): additional CLI args.
 - env (object, optional): KEY=VALUE environment variables.
+- accounts (array, optional): AGY accounts in priority order, each \`{ "id": "conta2", "home": "/paperclip/agy-accounts/conta2" }\` or the string \`"conta2=/paperclip/agy-accounts/conta2"\`. An entry without \`home\` uses the default sign-in. When an account runs out of quota, the run continues on the next account that has quota, in a fresh conversation. Local Linux execution only (for example the Docker image).
 
 Every run prefixes its prompt with Antigravity's \`/goal\` slash command. Do not configure \`-goal\` or \`--goal\` in \`extraArgs\`; those are not CLI startup flags and are ignored.
 

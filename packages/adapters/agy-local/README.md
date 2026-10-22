@@ -32,6 +32,39 @@ The `agy_local` adapter allows Paperclip agents to execute tasks through the loc
 | `sandbox` | `boolean` | `true` | When true, passes `--sandbox` flag. Set to false if bypassing sandbox. |
 | `dangerouslySkipPermissions` | `boolean` | `false` | When true, adds `--dangerously-skip-permissions` and auto-approves AGY tool actions. Enable only when unattended actions are intended. |
 | `instructionsFilePath` | `string` | `undefined` | Path to persistent agent instructions file. |
+| `accounts` | `Array<{ id, home? } \| string>` | `undefined` | AGY accounts in priority order for quota failover. See [Multiple accounts](#multiple-accounts). |
+
+## Multiple accounts
+
+AGY keeps its sign-in in `$HOME/.gemini`. On Linux hosts (including the Docker
+image) the sign-in is a file there, so a separate HOME is a separate account.
+Sign in each extra account once:
+
+```sh
+mkdir -p /paperclip/agy-accounts/conta2
+HOME=/paperclip/agy-accounts/conta2 agy
+```
+
+Then list the accounts in priority order. An entry without `home` uses the
+default sign-in. Strings of the form `id` or `id=/absolute/home` are also accepted.
+
+```json
+"accounts": [
+  { "id": "conta1" },
+  { "id": "conta2", "home": "/paperclip/agy-accounts/conta2" },
+  { "id": "conta3", "home": "/paperclip/agy-accounts/conta3" }
+]
+```
+
+How switching works:
+
+- A run uses the first account that has quota. A saved conversation resumes only on the account that created it; the account is stored as `agyAccountId` in the session parameters.
+- When AGY reports exhausted account quota (for example `Individual quota reached ... Resets in 4h3m21s`), the adapter records the reset time in `<home>/.gemini/.paperclip-agy-quota.json` and runs the same turn again on the next account, in a fresh conversation with the full prompt. Every agent that lists the account reads the same file. Without a reset time, the account is skipped for 5 hours.
+- An account that is not signed in is skipped for that run.
+- Short upstream errors (`503`, `429`, rate limits without a quota message) do not switch accounts.
+- When every account is out of quota, the run fails with `agy_quota_exhausted` and `retryNotBefore` set to the earliest reset, so the heartbeat retries then.
+- With a separate HOME, the run keeps reading git and gh configuration from the default HOME (`GIT_CONFIG_GLOBAL`, `GH_CONFIG_DIR`) unless the run sets them already. Paperclip skills are linked into each account's `.gemini/skills`.
+- Accounts apply to local execution only. On Windows and macOS AGY stores its sign-in in the OS credential store, which a separate HOME does not isolate.
 
 ## Canonical Models
 
