@@ -47,7 +47,7 @@ each one).
 * **Migrations**: numbered incrementally with no conflicts against master. If
   master moved and took your number, renumber on top. Make migrations
   **idempotent** so users who already applied the old number are safe.
-* **Greptile file limit**: keep each PR under **100 changed files**; if a PR
+* **PR size**: keep each PR under **100 changed files**; if a PR
   exceeds that, split it into two.
 
 ## 4. Open the PR
@@ -60,18 +60,16 @@ each one).
 
 ## 5. Review loops
 
-* Run the **/greploop** company skill: trigger Greptile review, address its
-  comments, push, and repeat until Greptile gives **5/5 with zero unresolved
-  comments** (max 20 turns). Do not stop early while turns remain.
-* Then run the **/prcheckloop** company skill and address any verification /
+* Run the **/prcheckloop** company skill and address any verification /
   CI failures you can.
-* RUN GREPTILE UNTIL IT GETS TO 5/5 - DO NOT STOP UNTIL GREPTILE IS 5/5, all
-  tests pass, all verification checks pass, and there are no merge conflicts.
+* Address every reviewer comment, push, and re-check.
+* Do not stop until all tests pass, all verification checks pass, there are no
+  merge conflicts, and no reviewer comment is unresolved.
 
 ## 6. Report back and hand off
 
 * Comment on the driving task: what you did, the PR URL(s), the worktree path
-  (use `~` for home), Greptile score, and check status.
+  (use `~` for home), and check status.
 * Create a `pull_request` work product for each opened PR (plus `branch` /
   `commit` work products where the branch or a commit is itself the handoff).
 * If the task requires follow-up per PR (e.g. sub-issues per PR), create them

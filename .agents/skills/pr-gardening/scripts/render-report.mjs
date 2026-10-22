@@ -65,7 +65,6 @@ export function renderReport(readiness) {
         `- Head: \`${entry.headSha}\``,
         `- Originating issue: ${issueLabel(entry.originatingIssue)}`,
         `- Checks: ${entry.checks.checks.length - entry.checks.pending.length - entry.checks.failing.length} green, ${entry.checks.pending.length} pending, ${entry.checks.failing.length} failing`,
-        `- Greptile: ${entry.greptile.clean ? "clean" : entry.greptile.present ? "not clean/current" : "missing"}`,
         `- Base distance: ${entry.behindBy} commit(s) behind \`${entry.baseRefName}\``,
         `- Reasons: ${reasonText(entry)}`,
         "",
