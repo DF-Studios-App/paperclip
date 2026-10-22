@@ -11,7 +11,7 @@ import {
 import { validate } from "../middleware/validate.js";
 import { badRequest, forbidden } from "../errors.js";
 import { folderService, logActivity } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 
 export function folderRoutes(db: Db) {
   const router = Router();
@@ -55,7 +55,7 @@ export function folderRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      if (req.actor.type !== "board" || !req.actor.userId) {
+      if (!isBoardOrLeader(req) || !req.actor.userId) {
         throw forbidden("A signed-in board user is required to create a personal skill folder");
       }
       const folder = await svc.ensureMyFolder(companyId, req.actor.userId, req.actor.userName ?? null, req.body.slug);

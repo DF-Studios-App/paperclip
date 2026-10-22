@@ -5,11 +5,11 @@ import {
   updateResourceMembershipSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { getActorInfo } from "./authz.js";
+import { getActorInfo, isBoardOrLeader } from "./authz.js";
 import { logActivity, resourceMembershipService } from "../services/index.js";
 
 function requireBoardUserId(req: Request, res: Response): string | null {
-  if (req.actor.type !== "board" || !req.actor.userId) {
+  if (!isBoardOrLeader(req) || !req.actor.userId) {
     res.status(403).json({ error: "Board user access required" });
     return null;
   }

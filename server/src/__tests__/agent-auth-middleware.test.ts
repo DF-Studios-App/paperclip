@@ -42,6 +42,9 @@ function createDbState(input: {
     companyId: input.agent.companyId,
     status: input.agent.status ?? "active",
     lifecycleHolds: input.agent.lifecycleHolds ?? [],
+    role: "engineer",
+    reportsTo: null,
+    metadata: null,
   };
   const keyRow = input.agentKey
     ? {

@@ -4,7 +4,7 @@ import { setAgentAvatarSchema } from "@paperclipai/shared";
 import { z } from "zod";
 import type { StorageService } from "../storage/types.js";
 import { forbidden } from "../errors.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 import { accessService } from "../services/access.js";
 import { setAgentProfileAvatar } from "../services/agent-profile-avatar.js";
 
@@ -19,7 +19,7 @@ export function agentProfileAvatarRoutes(db: Db, storage: StorageService) {
         throw forbidden("Task-scoped credentials cannot update agent profiles");
       }
       if (req.actor.agentId !== agentId) throw forbidden("Agents can update only their own avatar");
-    } else if (req.actor.type !== "board" || req.actor.memberships?.find(m => m.companyId === companyId)?.membershipRole === "viewer") {
+    } else if (!isBoardOrLeader(req) || req.actor.memberships?.find(m => m.companyId === companyId)?.membershipRole === "viewer") {
       throw forbidden("Operator or agent access required");
     }
     if (req.actor.type === "board") {

@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 import { inboxDismissalService, logActivity } from "../services/index.js";
 
 const ITEM_KEY_RE = /^(approval|join|run|attention):.+$/;
@@ -34,7 +34,7 @@ const inboxDismissalSchema = z.object({
 });
 
 function requireBoardUser(req: Request, res: Response) {
-  if (req.actor.type !== "board") {
+  if (!isBoardOrLeader(req)) {
     res.status(403).json({ error: "Board authentication required" });
     return null;
   }

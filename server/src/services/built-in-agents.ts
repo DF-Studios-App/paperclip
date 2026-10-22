@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { and, desc, eq, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers } from "@paperclipai/db";
-import { agentHarnessType, agentRunner, syncRoutineVariablesWithTemplate, type AgentRunnerChoice } from "@paperclipai/shared";
+import { activityLog, agents, authUsers, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers } from "@paperclipai/db";
+import { agentHarnessType, agentRunner, PERMISSION_KEYS, syncRoutineVariablesWithTemplate, type AgentRunnerChoice } from "@paperclipai/shared";
 import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrigger, RoutineVariable } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
@@ -24,6 +24,7 @@ import {
   readBuiltInAgentMarker,
   withBuiltInAgentMarker,
 } from "../lib/built-in-agent-metadata.js";
+import { leaderUserIdForCompany } from "../lib/root-leader-agent.js";
 import { companySkillService } from "./company-skills.js";
 import { routineService } from "./routines.js";
 import { accessService } from "./access.js";
@@ -485,7 +486,9 @@ const DEFINITIONS_BY_KEY = new Map(DEFINITIONS.map((definition) => [definition.k
 // seeded. Add a definition key here to restore automatic provisioning.
 const AUTO_PROVISION_ON_COMPANY_CREATE_KEYS = new Set<string>([]);
 
-const ROOT_AGENT_DEFAULT_CHANGE_GRANTS: PermissionKey[] = ["agents:configure", "skills:create"];
+// The root CEO is the company's leader agent and holds every permission key so
+// no permission-gated API action is blocked by a missing grant.
+const ROOT_AGENT_DEFAULT_GRANTS: PermissionKey[] = [...PERMISSION_KEYS];
 const BUILT_IN_AGENT_DEFAULT_GRANTS: Record<string, PermissionKey[]> = {
   "reflection-coach": ["agents:suggest-changes", "skills:suggest-changes"],
 };
@@ -825,12 +828,17 @@ export function builtInAgentService(db: Db) {
     return nonBuiltInRoots.length === 1 ? nonBuiltInRoots[0]!.id : null;
   }
 
-  async function ensureAgentDefaultGrants(companyId: string, agentId: string, grantKeys: PermissionKey[]) {
+  async function ensureAgentDefaultGrants(
+    companyId: string,
+    agentId: string,
+    grantKeys: PermissionKey[],
+    grantScope: (permissionKey: PermissionKey) => Record<string, unknown> | null = () => null,
+  ) {
     if (grantKeys.length === 0) return 0;
     await accessSvc.ensureMembership(companyId, "agent", agentId, "member", "active");
     let ensured = 0;
     for (const permissionKey of grantKeys) {
-      await accessSvc.setPrincipalPermission(companyId, "agent", agentId, permissionKey, true, null);
+      await accessSvc.setPrincipalPermission(companyId, "agent", agentId, permissionKey, true, null, grantScope(permissionKey));
       ensured += 1;
     }
     return ensured;
@@ -857,7 +865,31 @@ export function builtInAgentService(db: Db) {
       agent.status !== "pending_approval"
     );
     if (rootCeoRows.length !== 1) return 0;
-    return ensureAgentDefaultGrants(companyId, rootCeoRows[0]!.id, ROOT_AGENT_DEFAULT_CHANGE_GRANTS);
+    const rootCeoId = rootCeoRows[0]!.id;
+    // tasks:assign_scope needs a structured scope to match anything. Scoping it
+    // to the root's own subtree keeps it from narrowing the unscoped tasks:assign
+    // grant, which already covers every assignment.
+    const scopeFor = (permissionKey: PermissionKey) =>
+      permissionKey === "tasks:assign_scope" ? { subtreeRootAgentId: rootCeoId } : null;
+    const ensured = await ensureAgentDefaultGrants(companyId, rootCeoId, ROOT_AGENT_DEFAULT_GRANTS, scopeFor);
+
+    // Synthetic user identity for the leader: board-only routes that need a human
+    // user id resolve the leader to it, and it carries the same grant set.
+    const leaderUserId = leaderUserIdForCompany(companyId);
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: leaderUserId,
+      name: "Company leader",
+      email: `${leaderUserId}@leader.invalid`,
+      emailVerified: false,
+      createdAt: now,
+      updatedAt: now,
+    }).onConflictDoNothing({ target: authUsers.id });
+    await accessSvc.ensureMembership(companyId, "user", leaderUserId, "owner", "active");
+    for (const permissionKey of ROOT_AGENT_DEFAULT_GRANTS) {
+      await accessSvc.setPrincipalPermission(companyId, "user", leaderUserId, permissionKey, true, null, scopeFor(permissionKey));
+    }
+    return ensured;
   }
 
   async function ensureCompanyDefaultAgentGrants(companyId: string) {

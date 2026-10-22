@@ -29,7 +29,7 @@ import {
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
-import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { assertBoardOrgAccess, getActorInfo, isBoardOrLeader } from "./authz.js";
 
 function sameJsonValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -87,7 +87,7 @@ function publishActivitiesBestEffort(publications: ActivityPublication[], action
 }
 
 function assertCanManageInstanceSettings(req: Request) {
-  if (req.actor.type !== "board") {
+  if (!isBoardOrLeader(req)) {
     throw forbidden("Board access required");
   }
   if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {

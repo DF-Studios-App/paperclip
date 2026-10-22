@@ -29,13 +29,27 @@ export function assertAuthenticated(req: Request) {
   }
 }
 
+// The company's root CEO acts with board authority. Its actor is limited to its
+// own company by companyIds here and by the agent company check in assertCompanyAccess.
+function isLeaderActor(req: Request) {
+  return req.actor.type === "agent" && req.actor.isLeaderAgent === true;
+}
+
+/** Board operators and the company's leader agent. Use for board-only type gates. */
+export function isBoardOrLeader(req: Request) {
+  return req.actor.type === "board" || isLeaderActor(req);
+}
+
 export function assertBoard(req: Request) {
-  if (req.actor.type !== "board") {
+  if (req.actor.type !== "board" && !isLeaderActor(req)) {
     throw forbidden("Board access required");
   }
 }
 
 export function hasBoardOrgAccess(req: Request) {
+  if (isLeaderActor(req)) {
+    return true;
+  }
   if (req.actor.type !== "board") {
     return false;
   }
@@ -66,7 +80,7 @@ export function assertBoardOrAgent(req: Request) {
 
 export function assertInstanceAdmin(req: Request) {
   assertBoard(req);
-  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
+  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin || isLeaderActor(req)) {
     return;
   }
   throw forbidden("Instance admin access required");
@@ -77,7 +91,7 @@ export function assertCompanyAccess(req: Request, companyId: string) {
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
     throw forbidden("Agent key cannot access another company");
   }
-  if (req.actor.type === "agent" && req.actor.onBehalfOfUserId?.trim()) {
+  if (req.actor.type === "agent" && req.actor.onBehalfOfUserId?.trim() && !isLeaderActor(req)) {
     const membership = req.actor.onBehalfOfMemberships?.find(
       (item) => item.companyId === companyId && item.status === "active",
     );
