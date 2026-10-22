@@ -211,11 +211,10 @@ test("normalizes check runs and status contexts", () => {
   assert.equal(normalizeCheck({ __typename: "StatusContext", context: "legacy", state: "FAILURE" }).green, false);
 });
 
-test("drafts are report-only and missing Greptile blocks normal PRs", () => {
+test("drafts are report-only and failing checks block normal PRs", () => {
   const base = {
     pullRequest: { state: "OPEN", isDraft: false, mergeable: "MERGEABLE", reviewDecision: "APPROVED" },
-    checks: { checks: [{}], pending: [], failing: [] },
-    greptile: { present: false, pending: false, clean: false },
+    checks: { checks: [{ name: "ci" }], pending: [], failing: [{ name: "ci" }] },
     behindBy: 0,
     originatingIssue: { status: "done", identifier: "PAP-1" },
   };
@@ -227,7 +226,6 @@ test("unresolved nullable mergeability is reported instead of crashing", () => {
   const result = readinessVerdict({
     pullRequest: { state: "OPEN", isDraft: false, mergeable: null, mergeStateStatus: null, reviewDecision: "" },
     checks: { checks: [{}], pending: [], failing: [] },
-    greptile: { present: true, pending: false, clean: true },
     behindBy: 0,
     originatingIssue: { status: "done", identifier: "PAP-1" },
   });
@@ -249,7 +247,6 @@ test("renders scope, purpose, confidence groups, and immutable guardrail", () =>
     headSha: "abc",
     originatingIssue: { identifier: "PAP-1", status: "done" },
     checks: { checks: [{}], pending: [], failing: [] },
-    greptile: { clean: true, present: true },
     behindBy: 0,
     baseRefName: "master",
     reasons: [],
@@ -291,7 +288,6 @@ test("escapes contributor-controlled Markdown in report titles and purposes", ()
         headSha: "def",
         originatingIssue: null,
         checks: { checks: [{}], pending: [], failing: [] },
-        greptile: { clean: false, present: false },
         behindBy: 0,
         baseRefName: "master",
         reasons: [],

@@ -74,7 +74,7 @@ Each job has `name`, `status`, `stage`, and `web_url`.
 glab api "projects/:fullpath/merge_requests/<MR_IID>/notes?per_page=100"
 ```
 
-Filter by `author.username` to find Greptile bot comments. The exact bot username depends on the Greptile installation - check the first Greptile comment to identify it.
+Filter by `author.username` to find review bot comments. The exact bot username depends on the bot installation - check the first bot comment to identify it.
 
 ## Post a comment on an MR
 

@@ -56,7 +56,7 @@ For `server/src/services/chat-channels.ts` and everything under
 For `server/src/services/heartbeat.ts`, `server/src/services/heartbeat/`,
 heartbeat-prefixed sibling services, and heartbeat regression tests, read
 [`rules/heartbeat-execution-boundaries.mdc`](rules/heartbeat-execution-boundaries.mdc).
-See [`rules/README.md`](rules/README.md) for rule authoring and Greptile setup.
+See [`rules/README.md`](rules/README.md) for rule authoring.
 
 ## 3. Repo Map
 

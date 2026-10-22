@@ -22,39 +22,7 @@ function assessChecks(contexts) {
   };
 }
 
-function assessGreptile(checkRuns) {
-  const runs = checkRuns.filter((run) => /greptile/i.test(run.name));
-  const completed = runs.filter((run) => run.status === "completed");
-  const clean = completed.filter((run) => run.conclusion === "success" || run.conclusion === "neutral");
-  const blocking = completed.filter((run) => run.conclusion !== "success" && run.conclusion !== "neutral");
-  return {
-    present: runs.length > 0,
-    pending: runs.some((run) => run.status !== "completed"),
-    clean: clean.length > 0 && blocking.length === 0,
-    runs: runs.map((run) => ({
-      name: run.name,
-      status: run.status,
-      conclusion: run.conclusion,
-      detailsUrl: run.details_url ?? null,
-    })),
-  };
-}
-
-function fetchCheckRuns(repository, headSha) {
-  const runs = [];
-  for (let page = 1; page <= 100; page += 1) {
-    const response = ghJson([
-      "api",
-      `repos/${repository}/commits/${headSha}/check-runs?per_page=100&page=${page}`,
-    ]);
-    const pageRuns = response.check_runs ?? [];
-    runs.push(...pageRuns);
-    if (pageRuns.length < 100) return runs;
-  }
-  throw new Error(`Check-run pagination exceeded 100 pages for ${headSha}`);
-}
-
-export function readinessVerdict({ pullRequest, checks, greptile, behindBy, originatingIssue }) {
+export function readinessVerdict({ pullRequest, checks, behindBy, originatingIssue }) {
   const reasons = [];
   if (pullRequest.state !== "OPEN") reasons.push(reason("pr_not_open", `PR is ${pullRequest.state.toLowerCase()}`));
   const mergeable = pullRequest.mergeable ?? "UNKNOWN";
@@ -67,9 +35,6 @@ export function readinessVerdict({ pullRequest, checks, greptile, behindBy, orig
     reasons.push(reason("checks_failing", `${checks.failing.length} check(s) are not green`, "blocking", { names: checks.failing.map((check) => check.name) }));
   }
   if (checks.checks.length === 0) reasons.push(reason("checks_missing", "No status checks were found at the current head"));
-  if (!greptile.present) reasons.push(reason("greptile_missing", "No Greptile check-run exists at the current head"));
-  else if (greptile.pending) reasons.push(reason("greptile_pending", "Greptile has not completed at the current head"));
-  else if (!greptile.clean) reasons.push(reason("greptile_not_clean", "Greptile did not conclude success or neutral at the current head"));
   if (pullRequest.reviewDecision === "CHANGES_REQUESTED") reasons.push(reason("changes_requested", "A review requests changes"));
   if (pullRequest.reviewDecision === "REVIEW_REQUIRED") reasons.push(reason("review_required", "Required review approval is missing"));
   if (behindBy > 0) reasons.push(reason("base_behind", `Head is ${behindBy} commit(s) behind base`, "blocking", { behindBy }));
@@ -87,9 +52,6 @@ export function confidenceFor(entry) {
   const codes = new Set(entry.reasons.map((entryReason) => entryReason.code));
   const lowConfidenceCodes = [
     "originating_issue_missing",
-    "greptile_missing",
-    "greptile_pending",
-    "greptile_not_clean",
     "checks_missing",
     "checks_failing",
     "checks_pending",
@@ -117,17 +79,14 @@ export async function checkReadiness(candidatesDocument, options = {}) {
       "--json",
       "number,url,title,author,body,state,isDraft,headRefOid,baseRefName,headRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,updatedAt",
     ]);
-    const checkRuns = fetchCheckRuns(repository, pullRequest.headRefOid);
     const comparison = ghJson([
       "api",
       `repos/${repository}/compare/${encodeURIComponent(pullRequest.baseRefName)}...${encodeURIComponent(pullRequest.headRefOid)}`,
     ]);
     const checks = assessChecks(pullRequest.statusCheckRollup ?? []);
-    const greptile = assessGreptile(checkRuns);
     const assessment = readinessVerdict({
       pullRequest,
       checks,
-      greptile,
       behindBy: comparison.behind_by ?? 0,
       originatingIssue: candidate.originatingIssue,
     });
@@ -147,7 +106,6 @@ export async function checkReadiness(candidatesDocument, options = {}) {
       reviewDecision: pullRequest.reviewDecision || null,
       behindBy: comparison.behind_by ?? 0,
       checks,
-      greptile,
       originatingIssue: candidate.originatingIssue,
       sourceIssues: candidate.sourceIssues,
       ...assessment,

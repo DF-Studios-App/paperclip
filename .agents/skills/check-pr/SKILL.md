@@ -78,7 +78,7 @@ gh api "repos/$OWNER_REPO/pulls/<PR_NUMBER>/comments"
 gh api --paginate "repos/$OWNER_REPO/issues/<PR_NUMBER>/comments?per_page=100"
 ```
 
-GitHub PRs are also issues, so general PR comments live on the issue comments endpoint. Greptile may edit a single general PR comment on each review cycle instead of creating a new review or comment. Always inspect the latest Greptile-authored general comment by `updated_at`, including any "Prompt to fix all with AI" section, before concluding that the PR is clear.
+GitHub PRs are also issues, so general PR comments live on the issue comments endpoint. A review bot may edit a single general PR comment on each review cycle instead of creating a new review or comment. Always inspect the latest bot-authored general comment by `updated_at` before concluding that the PR is clear.
 
 **GitLab:**
 ```bash
@@ -124,101 +124,7 @@ Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipp
 
 **Perforce:** Perforce doesn't have built-in CI checks natively. If the team uses a review tool (Swarm, etc.) or an external CI triggered by shelve events, check the relevant system. Otherwise, proceed to analysis immediately.
 
-### 4. Require a fresh Greptile review for the current head
-
-For GitHub PRs, do not treat an existing Greptile review, comment, or summary as current unless it is tied to the PR's exact current `headRefOid`. This is especially important after pushing a new commit to an existing PR: a Greptile review on an older commit is stale, even if the PR still has a Greptile comment or prior review.
-
-Fetch the current head SHA immediately before the Greptile gate:
-
-```bash
-HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid -q .headRefOid)
-```
-
-Then inspect check-runs for that commit and require a completed Greptile run:
-
-```bash
-OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-GREPTILE_CHECKS=$(gh api "repos/$OWNER_REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
-  --jq '[.check_runs[] | select(.name | test("greptile"; "i"))]')
-
-# A run only counts as a valid fresh pass when it has completed AND concluded cleanly.
-# GitHub check-run conclusions: success, neutral, skipped, failure, timed_out,
-# cancelled, action_required, stale. Treat success/neutral as clean;
-# everything else (especially failure and action_required) must block.
-FRESH_GREPTILE_COMPLETED=$(echo "$GREPTILE_CHECKS" \
-  | jq '[.[] | select(.status == "completed")] | length')
-FRESH_GREPTILE_CLEAN=$(echo "$GREPTILE_CHECKS" \
-  | jq '[.[] | select(.status == "completed" and (.conclusion | IN("success","neutral")))] | length')
-FRESH_GREPTILE_BLOCKING=$(echo "$GREPTILE_CHECKS" \
-  | jq '[.[] | select(.status == "completed" and ((.conclusion | IN("success","neutral")) | not))] | length')
-
-if [ "$FRESH_GREPTILE_COMPLETED" = "0" ]; then
-  echo "Blocked: no completed Greptile review/check is tied to current PR head $HEAD_SHA."
-  echo "Request a fresh Greptile review against this head before marking the PR check done."
-  echo "Suggested trigger: gh pr comment <PR_NUMBER> --body \"@greptile review\""
-  exit 1
-fi
-
-if [ "$FRESH_GREPTILE_BLOCKING" != "0" ] || [ "$FRESH_GREPTILE_CLEAN" = "0" ]; then
-  echo "Blocked: Greptile completed on head $HEAD_SHA but did not conclude clean"
-  echo "(conclusion was failure/action_required/timed_out/cancelled/stale, or no clean run exists)."
-  echo "Address the findings, push, and re-run Greptile until it concludes success/clean on the new head."
-  exit 1
-fi
-```
-
-If a Greptile check exists for the current head but is still pending or in progress, wait for it with the same polling pattern used by `greploop` rather than proceeding from older review material. If no Greptile check appears for the current head after a reasonable wait, report the PR as blocked on a fresh Greptile review for `HEAD_SHA` and stop. Do not mark the check complete from PR comments, PR reviews, or Greptile summaries that cannot be associated with the current head SHA.
-
-For GitLab installations with Greptile integration, apply the same freshness rule against the MR's current head SHA:
-
-```bash
-# 1. Get the MR's current head SHA
-MR_SHA=$(glab mr view <MR_IID> --output json | jq -r '.sha // .diff_refs.head_sha')
-
-# 2. Find the latest pipeline for that EXACT sha, then the Greptile job within it.
-LATEST_PIPELINE_ID=$(glab api "projects/:fullpath/merge_requests/<MR_IID>/pipelines" \
-  | jq -r --arg sha "$MR_SHA" '[.[] | select(.sha == $sha)] | sort_by(.id) | last | .id // empty')
-
-if [ -n "$LATEST_PIPELINE_ID" ]; then
-  GREPTILE_JOBS=$(glab api "projects/:fullpath/pipelines/$LATEST_PIPELINE_ID/jobs" \
-    | jq --arg sha "$MR_SHA" '[.[] | select(.name | test("greptile"; "i"))
-        | {name, status, pipeline_sha: $sha}]')
-else
-  GREPTILE_JOBS='[]'
-fi
-
-GREPTILE_JOB_SUCCESS=$(echo "$GREPTILE_JOBS" \
-  | jq '[.[] | select(.status == "success")] | length')
-GREPTILE_JOB_BLOCKING=$(echo "$GREPTILE_JOBS" \
-  | jq '[.[] | select(.status != "success")] | length')
-
-# 3. If Greptile integrates via MR notes instead of a CI job, require the newest
-#    Greptile note to reference the current head sha and report a clean review.
-GREPTILE_NOTES=$(glab api "projects/:fullpath/merge_requests/<MR_IID>/discussions?per_page=100" \
-  | jq --arg sha "$MR_SHA" '[.[].notes[]
-      | select(.author.username | test("greptile"; "i"))]
-      | sort_by(.updated_at // .created_at)')
-GREPTILE_NOTE_CLEAN=$(echo "$GREPTILE_NOTES" \
-  | jq --arg sha "$MR_SHA" 'if length == 0 then 0
-      elif ((last.body // "") | contains($sha) and test("Confidence Score:[[:space:]]*5/5|Confidence:[[:space:]]*5/5|\\b5/5\\b"; "i") and (test("Prompt To Fix|blocking issue|failed|action required"; "i") | not)) then 1
-      else 0 end')
-
-if [ "$GREPTILE_JOB_SUCCESS" = "0" ] && [ "$GREPTILE_NOTE_CLEAN" = "0" ]; then
-  echo "Blocked: no successful Greptile job or completed-clean current-head Greptile note is tied to MR head $MR_SHA."
-  exit 1
-fi
-
-if [ "$GREPTILE_JOB_BLOCKING" != "0" ]; then
-  echo "Blocked: at least one Greptile job for MR head $MR_SHA did not succeed."
-  exit 1
-fi
-```
-
-Block completion if, for `MR_SHA`, there is (a) no Greptile job or note at all (missing), (b) the newest Greptile job/note is tied to a different sha (stale), or (c) the Greptile job status is not `success`. A completed Greptile result for a different SHA is stale and must block completion.
-
-For Perforce installations with Greptile integration, apply the same rule using the CL's current shelved-revision identity and the Greptile webhook/review artifact tied to it; a Greptile result for an earlier shelf is stale and must block completion.
-
-### 5. Analyze the PR/MR
+### 4. Analyze the PR/MR
 
 Once all checks are complete, evaluate these areas:
 
@@ -236,18 +142,18 @@ Once all checks are complete, evaluate these areas:
 #### C. Review Comments
 
 - Inline code review comments that need addressing
-- Look for bot review comments (e.g. from `greptile-apps[bot]` on GitHub, or the Greptile bot user on GitLab, linters, etc.)
+- Look for bot review comments (e.g. code review bots, linters, etc.)
 - Human reviewer comments
 - **Perforce:** review comments from `p4 review` or external review tools
 
 #### D. General Comments
 
 - Discussion comments on the PR/MR
-- For GitHub, check the issue comments endpoint and use `updated_at` to catch bot comments edited in place. Greptile's latest edited summary can contain actionable items even when there are no new inline comments.
+- For GitHub, check the issue comments endpoint and use `updated_at` to catch bot comments edited in place. A review bot's latest edited summary can contain actionable items even when there are no new inline comments.
 - Bot comments (deploy previews, etc.) - usually informational
 - **Perforce:** CL description should include a clear summary, affected files rationale, and testing notes
 
-### 6. Categorize issues
+### 5. Categorize issues
 
 For each issue found, categorize as:
 
@@ -257,7 +163,7 @@ For each issue found, categorize as:
 | **Informational** | Verification notes, questions, or FYIs that don't require changes |
 | **Already addressed** | Issues that appear to be resolved by subsequent commits |
 
-### 7. Report findings
+### 6. Report findings
 
 Present a summary table:
 
@@ -268,7 +174,7 @@ Present a summary table:
 | Description | TODO placeholder in test plan | Actionable | Fill in test plan |
 | Review | "Looks good" - @teammate | Informational | None |
 
-### 8. Fix issues (if requested)
+### 7. Fix issues (if requested)
 
 If there are actionable items:
 
@@ -290,7 +196,7 @@ p4 edit <file>
 p4 shelve -f -c <CL_NUMBER>
 ```
 
-### 9. Resolve review threads
+### 8. Resolve review threads
 
 After addressing comments, resolve the corresponding review threads.
 
@@ -356,7 +262,7 @@ glab api --method PUT \
 
 Repeat for each unresolved discussion ID.
 
-### 10. Multiple PRs/MRs/CLs
+### 9. Multiple PRs/MRs/CLs
 
 If checking a chain of PRs/MRs/CLs, process them sequentially.
 
