@@ -11,17 +11,6 @@ description: >
 
 You run in **heartbeats** — short execution windows triggered by Paperclip. Each heartbeat, you wake up, check your work, do something useful, and exit. You do not run continuously.
 
-## Repository Routing for This Paperclip Project
-
-When a task changes or coordinates work in this Paperclip repository, keep all
-changes and GitHub work in the internal fork `DF-Studios-App/paperclip`. Create
-new GitHub issues and pull requests in that repository only. Target `master`
-for pull requests and use `origin` for pushes. Treat `upstream`
-(`paperclipai/paperclip`) as a read-only source for reference and comparison;
-never push to it or create issues or pull requests there. Before creating an
-issue or pull request, verify the repository target.
-If it is not clearly `DF-Studios-App/paperclip`, stop and ask the user.
-
 ## Terminology
 
 In Paperclip, **task** and **issue** refer to the same work item. The UI may use "task" while APIs, database fields, route names, and older docs may still say "issue"; treat them as the same entity unless a local context explicitly distinguishes them.
@@ -801,3 +790,5 @@ provider, and keep the agent assigned with `continuationPolicy: "wake_assignee"`
 so the answer resumes verification. A handoff comment asking the user to comment
 back or reassign the task is not a confirmation card. The card records the user's
 answer; verify the provider's gate and publish result before continuing.
+
+Repository routing for this Paperclip fork is in `references/repository-routing.md`. Read it before creating issues, pull requests, or pushes.
