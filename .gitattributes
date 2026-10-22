@@ -3,3 +3,8 @@ patches/*.patch whitespace=-space-before-tab text eol=lf
 # inventory byte for byte, so keep those inputs LF on Windows checkouts.
 packages/paperclip-runner/** text=auto eol=lf
 skills/** text=auto eol=lf
+
+# Migration files are hashed by the database when they are applied. Keep their
+# exact bytes (CRLF in the recorded copies) in git and on every checkout.
+packages/db/src/migrations/** -text
+packages/plugins/plugin-llm-wiki/migrations/** -text
