@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { readAgyUsage, type AgyUsageGroup } from "./usage.js";
 
 /**
  * Multi-account support for the AGY CLI.
@@ -264,6 +265,14 @@ export function pickAgyAccount(
   return usable.find((candidate) => candidate.account.id === options.preferId) ?? usable[0] ?? null;
 }
 
+async function writeAgyAccountState(home: string, state: AgyAccountQuotaState, now: number): Promise<void> {
+  const target = agyAccountStatePath(home);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.${now}.tmp`;
+  await fs.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await fs.rename(temp, target);
+}
+
 export async function markAgyAccountExhausted(
   home: string,
   input: { retryNotBefore: string | null; resetHint: string | null },
@@ -274,12 +283,66 @@ export async function markAgyAccountExhausted(
     resetHint: input.resetHint,
     updatedAt: new Date(now).toISOString(),
   };
-  const target = agyAccountStatePath(home);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  const temp = `${target}.${process.pid}.${now}.tmp`;
-  await fs.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await fs.rename(temp, target);
+  await writeAgyAccountState(home, state, now);
   return state;
+}
+
+/**
+ * When `/usage` shows a limit at zero, the account waits for the earliest reset
+ * of those limits. Disabled limits do not count. Null when every limit has quota.
+ */
+export function agyUsageExhaustedUntil(groups: AgyUsageGroup[], now = Date.now()): string | null {
+  let earliest: number | null = null;
+  for (const group of groups) {
+    for (const bucket of group.buckets) {
+      if (bucket.disabled || bucket.remainingFraction === null || bucket.remainingFraction > 0) continue;
+      const reset = bucket.resetAt ? Date.parse(bucket.resetAt) : NaN;
+      const until = Number.isFinite(reset) && reset > now ? reset : now + AGY_DEFAULT_QUOTA_WINDOW_MS;
+      if (earliest === null || until < earliest) earliest = until;
+    }
+  }
+  return earliest === null ? null : new Date(earliest).toISOString();
+}
+
+/**
+ * Writes the account's quota state from a live `/usage` read, so the state
+ * follows the limits AGY reports. An account that has quota again is cleared.
+ */
+export async function syncAgyAccountQuotaFromUsage(
+  home: string,
+  groups: AgyUsageGroup[],
+  now = Date.now(),
+): Promise<AgyAccountQuotaState | null> {
+  const current = await readAgyAccountState(home);
+  const exhaustedUntil = agyUsageExhaustedUntil(groups, now);
+  if ((current?.exhaustedUntil ?? null) === exhaustedUntil) return current;
+  const state: AgyAccountQuotaState = {
+    exhaustedUntil,
+    resetHint: exhaustedUntil ? (current?.resetHint ?? null) : null,
+    updatedAt: new Date(now).toISOString(),
+  };
+  await writeAgyAccountState(home, state, now);
+  return state;
+}
+
+/**
+ * Asks `/usage` about the accounts that the state marks as exhausted, and
+ * clears the ones that have quota again. Accounts with quota are not asked.
+ */
+export async function refreshExhaustedAgyAccounts(
+  candidates: AgyAccountCandidate[],
+  options: { command?: string; now?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now();
+  await Promise.all(
+    candidates
+      .filter((candidate) => !isAgyAccountAvailable(candidate.state, now))
+      .map(async (candidate) => {
+        const result = await readAgyUsage({ home: candidate.home, command: options.command });
+        if (!result.ok) return;
+        candidate.state = await syncAgyAccountQuotaFromUsage(candidate.home, result.groups, now);
+      }),
+  );
 }
 
 /** Earliest moment any configured account gets quota back, for retryNotBefore. */

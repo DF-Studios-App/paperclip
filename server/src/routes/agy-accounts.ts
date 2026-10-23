@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import {
   startAgyAccountLoginSchema,
   submitAgyAccountLoginCodeSchema,
+  type AgyAccountsQuotaResponse,
   type AgyAccountsResponse,
   type DeploymentExposure,
   type DeploymentMode,
@@ -48,6 +49,14 @@ export function agyAccountRoutes(
       accounts: await service.list(companyId),
       login: canManage ? service.activeLogin(companyId) : null,
     };
+    res.json(body);
+  });
+
+  router.get("/companies/:companyId/agy-accounts/quota", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const body: AgyAccountsQuotaResponse = { accounts: await service.quota(companyId) };
     res.json(body);
   });
 

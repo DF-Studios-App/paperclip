@@ -8,9 +8,18 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
+  agyUsageExhaustedUntil,
+  createAgyCompanyAccount,
+  isAgyAccountAvailable,
+  markAgyAccountExhausted,
+  parseAgyUsageOutput,
+  readAgyAccountState,
+  resolveAgyCompanyAccountsDir,
   startAgyLogin,
+  syncAgyAccountQuotaFromUsage,
   type AgyLoginOutcome,
   type AgyLoginProcess,
+  type AgyUsageResult,
   type StartAgyLoginOptions,
 } from "@paperclipai/adapter-agy-local/server";
 
@@ -206,6 +215,7 @@ describe("agy account routes", () => {
       submitCode: vi.fn(),
       cancelLogin: vi.fn(),
       remove: vi.fn(async () => undefined),
+      quota: vi.fn(async () => []),
     };
     const app = express();
     app.use(express.json());
@@ -223,6 +233,16 @@ describe("agy account routes", () => {
     const res = await request(app).post(`/api/companies/${COMPANY_ID}/agy-accounts/logins`).send({ label: "Conta 2" });
     expect(res.status).toBe(201);
     expect(service.beginLogin).toHaveBeenCalledWith(COMPANY_ID, "alice", { label: "Conta 2" });
+  });
+
+  it("returns the remaining limits of each account to a board member", async () => {
+    const { app, service } = makeApp(viewer);
+    const quota = [{ accountId: "default", status: "ok", checkedAt: "", groups: [], error: null }];
+    service.quota.mockResolvedValueOnce(quota as never);
+    const res = await request(app).get(`/api/companies/${COMPANY_ID}/agy-accounts/quota`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ accounts: quota });
+    expect(service.quota).toHaveBeenCalledWith(COMPANY_ID);
   });
 
   it("shows a viewer the accounts without the sign-in and blocks changes", async () => {
@@ -250,6 +270,142 @@ describe("agy account routes", () => {
     const res = await request(app).post(`/api/companies/${COMPANY_ID}/agy-accounts/logins/login-1/code`).send({ code: "" });
     expect(res.status).toBe(400);
     expect(service.submitCode).not.toHaveBeenCalled();
+  });
+});
+
+describe("agy account quota", () => {
+  const usageGroups = [
+    {
+      name: "Gemini Models",
+      buckets: [
+        { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remainingFraction: 0, resetAt: "2026-10-26T13:03:19Z", disabled: false },
+      ],
+    },
+  ];
+
+  it("reads the limits of each signed-in account and does not ask an account without a sign-in", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "agy-accounts-quota-"));
+    try {
+      const defaultHome = path.join(root, "host-home");
+      const instanceRoot = path.join(root, "instance");
+      await writeSignIn(defaultHome);
+      const accountsDir = resolveAgyCompanyAccountsDir(instanceRoot, COMPANY_ID);
+      const signedIn = await createAgyCompanyAccount(accountsDir, { label: "Conta 2" });
+      await writeSignIn(signedIn.home);
+      await createAgyCompanyAccount(accountsDir, { label: "Conta 3" });
+
+      const readUsage = vi.fn(async (_options: { home: string }): Promise<AgyUsageResult> => ({ ok: true, groups: usageGroups }));
+      const service = agyAccountService({} as Db, {
+        instanceRoot,
+        defaultHome,
+        platform: "linux",
+        startLogin: fakeLoginFactory().startLogin,
+        readUsage,
+      });
+
+      const quota = await service.quota(COMPANY_ID);
+      expect(readUsage.mock.calls.map(([options]) => options.home)).toEqual([defaultHome, signedIn.home]);
+      expect(quota).toEqual([
+        { accountId: "default", status: "ok", checkedAt: expect.any(String), groups: usageGroups, error: null },
+        { accountId: signedIn.id, status: "ok", checkedAt: expect.any(String), groups: usageGroups, error: null },
+        { accountId: "account-2", status: "not_signed_in", checkedAt: expect.any(String), groups: [], error: null },
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an account whose usage read fails, without the other accounts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "agy-accounts-quota-error-"));
+    try {
+      const defaultHome = path.join(root, "host-home");
+      await writeSignIn(defaultHome);
+      const readUsage = vi.fn(async (_options: { home: string }): Promise<AgyUsageResult> => ({ ok: false, error: "AGY did not answer in time." }));
+      const service = agyAccountService({} as Db, {
+        instanceRoot: path.join(root, "instance"),
+        defaultHome,
+        platform: "linux",
+        startLogin: fakeLoginFactory().startLogin,
+        readUsage,
+      });
+
+      expect(await service.quota(COMPANY_ID)).toEqual([
+        { accountId: "default", status: "error", checkedAt: expect.any(String), groups: [], error: "AGY did not answer in time." },
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for the earliest reset of the limits at zero, and ignores disabled limits", () => {
+    const now = Date.parse("2026-10-22T20:00:00.000Z");
+    const groups = [
+      {
+        name: "Gemini Models",
+        buckets: [
+          { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remainingFraction: 0, resetAt: "2026-10-22T21:00:00.000Z", disabled: false },
+          { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remainingFraction: 0, resetAt: "2026-10-26T13:03:19.000Z", disabled: false },
+          { id: "gemini-off", name: "Off", window: "5h", remainingFraction: 0, resetAt: "2026-10-22T20:30:00.000Z", disabled: true },
+        ],
+      },
+      { name: "Claude", buckets: [{ id: "3p-weekly", name: "Weekly", window: "weekly", remainingFraction: 1, resetAt: null, disabled: false }] },
+    ];
+    expect(agyUsageExhaustedUntil(groups, now)).toBe("2026-10-22T21:00:00.000Z");
+    expect(agyUsageExhaustedUntil(usageGroups, now)).toBe("2026-10-26T13:03:19.000Z");
+    expect(agyUsageExhaustedUntil([{ name: "Claude", buckets: [{ id: "x", name: "x", window: "5h", remainingFraction: 0.5, resetAt: null, disabled: false }] }], now)).toBeNull();
+  });
+
+  it("clears the quota state of an account that has quota again", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "agy-accounts-sync-"));
+    try {
+      const home = path.join(root, "account-1");
+      await markAgyAccountExhausted(home, { retryNotBefore: "2099-01-01T00:00:00.000Z", resetHint: "Resets in 1h" });
+      const stillOut = [{ name: "Gemini Models", buckets: [{ id: "g", name: "Weekly", window: "weekly", remainingFraction: 0, resetAt: "2099-02-01T00:00:00.000Z", disabled: false }] }];
+      expect(await syncAgyAccountQuotaFromUsage(home, stillOut)).toMatchObject({ exhaustedUntil: "2099-02-01T00:00:00.000Z", resetHint: "Resets in 1h" });
+
+      const withQuota = [{ name: "Gemini Models", buckets: [{ id: "g", name: "Weekly", window: "weekly", remainingFraction: 0.9, resetAt: "2099-02-01T00:00:00.000Z", disabled: false }] }];
+      await syncAgyAccountQuotaFromUsage(home, withQuota);
+      expect(await readAgyAccountState(home)).toMatchObject({ exhaustedUntil: null, resetHint: null });
+      expect(isAgyAccountAvailable(await readAgyAccountState(home))).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the groups and buckets from the /usage JSON", () => {
+    const stdout = JSON.stringify({
+      conversation_id: "",
+      status: "SUCCESS",
+      command: {
+        name: "usage",
+        data: {
+          groups: [
+            {
+              name: "Gemini Models",
+              buckets: [
+                { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", disabled: true, remaining_fraction: 0.9999 },
+                { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remaining_fraction: 0, reset_time: "2026-10-26T13:03:19Z" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    expect(parseAgyUsageOutput(stdout)).toEqual([
+      {
+        name: "Gemini Models",
+        buckets: [
+          { id: "gemini-5h", name: "Five Hour Limit Remaining", window: "5h", remainingFraction: 0.9999, resetAt: null, disabled: true },
+          { id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remainingFraction: 0, resetAt: "2026-10-26T13:03:19Z", disabled: false },
+        ],
+      },
+    ]);
+  });
+
+  it("returns null when the output has no usage report", () => {
+    expect(parseAgyUsageOutput("not json")).toBeNull();
+    expect(parseAgyUsageOutput(JSON.stringify({ status: "SUCCESS", response: "hi" }))).toBeNull();
   });
 });
 
