@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import type {
   AgyAccountLogin,
   AgyAccountLoginStatus,
+  AgyAccountQuota,
   AgyAccountSummary,
   DeploymentExposure,
   DeploymentMode,
@@ -15,9 +16,11 @@ import {
   isAgyHomeSignedIn,
   listAgyCompanyAccounts,
   readAgyAccountState,
+  readAgyUsage,
   removeAgyCompanyAccount,
   resolveAgyCompanyAccountsDir,
   startAgyLogin,
+  syncAgyAccountQuotaFromUsage,
   type AgyLoginHandle,
 } from "@paperclipai/adapter-agy-local/server";
 import { conflict, notFound } from "../errors.js";
@@ -78,11 +81,13 @@ export interface AgyAccountServiceOptions {
   platform?: NodeJS.Platform;
   defaultHome?: string;
   startLogin?: typeof startAgyLogin;
+  readUsage?: typeof readAgyUsage;
 }
 
 export function agyAccountService(db: Db, options: AgyAccountServiceOptions = {}) {
   const platform = options.platform ?? process.platform;
   const startLogin = options.startLogin ?? startAgyLogin;
+  const readUsage = options.readUsage ?? readAgyUsage;
   const defaultHome = options.defaultHome ?? (process.env.HOME || os.homedir());
   const accountsDir = (companyId: string) =>
     resolveAgyCompanyAccountsDir(options.instanceRoot ?? resolvePaperclipInstanceRoot(), companyId);
@@ -133,6 +138,33 @@ export function agyAccountService(db: Db, options: AgyAccountServiceOptions = {}
       });
     }
     return summaries;
+  }
+
+  /**
+   * Remaining limits of every account, read the way the CLI reads `/usage`.
+   * Accounts without a sign-in are not asked. The read does not spend quota.
+   */
+  async function quota(companyId: string): Promise<AgyAccountQuota[]> {
+    if (!availability().available) return [];
+    const homes = new Map<string, string>([[AGY_DEFAULT_ACCOUNT_ID, defaultHome]]);
+    for (const record of await listAgyCompanyAccounts(accountsDir(companyId))) homes.set(record.id, record.home);
+    const accounts = await list(companyId);
+    return Promise.all(
+      accounts.map(async (account): Promise<AgyAccountQuota> => {
+        const checkedAt = new Date().toISOString();
+        const home = homes.get(account.id);
+        if (!account.signedIn || !home) {
+          return { accountId: account.id, status: "not_signed_in", checkedAt, groups: [], error: null };
+        }
+        const result = await readUsage({ home });
+        if (!result.ok) {
+          return { accountId: account.id, status: "error", checkedAt, groups: [], error: result.error };
+        }
+        // Keep the quota state that runs use in step with what AGY reports now.
+        await syncAgyAccountQuotaFromUsage(home, result.groups).catch(() => undefined);
+        return { accountId: account.id, status: "ok", checkedAt, groups: result.groups, error: null };
+      }),
+    );
   }
 
   function activeLogin(companyId: string): AgyAccountLogin | null {
@@ -282,7 +314,7 @@ export function agyAccountService(db: Db, options: AgyAccountServiceOptions = {}
     });
   }
 
-  return { availability, list, activeLogin, beginLogin, getLogin, submitCode, cancelLogin, remove };
+  return { availability, list, quota, activeLogin, beginLogin, getLogin, submitCode, cancelLogin, remove };
 }
 
 /** Test helper: forgets every in-memory sign-in. */

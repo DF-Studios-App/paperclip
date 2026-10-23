@@ -1,8 +1,14 @@
-import type { AgyAccountLogin, AgyAccountsResponse, StartAgyAccountLogin } from "@paperclipai/shared";
+import type {
+  AgyAccountLogin,
+  AgyAccountsQuotaResponse,
+  AgyAccountsResponse,
+  StartAgyAccountLogin,
+} from "@paperclipai/shared";
 import { api } from "./client";
 
 export const agyAccountsApi = {
   list: (companyId: string) => api.get<AgyAccountsResponse>(`/companies/${companyId}/agy-accounts`),
+  quota: (companyId: string) => api.get<AgyAccountsQuotaResponse>(`/companies/${companyId}/agy-accounts/quota`),
   startLogin: (companyId: string, body: StartAgyAccountLogin) =>
     api.post<AgyAccountLogin>(`/companies/${companyId}/agy-accounts/logins`, body),
   getLogin: (companyId: string, loginId: string) =>

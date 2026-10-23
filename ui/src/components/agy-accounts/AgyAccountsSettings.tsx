@@ -1,12 +1,22 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { AgyAccountLogin, AgyAccountSummary } from "@paperclipai/shared";
+import type {
+  AgyAccountLogin,
+  AgyAccountQuota,
+  AgyAccountQuotaBucket,
+  AgyAccountSummary,
+} from "@paperclipai/shared";
 import { agyAccountsApi } from "@/api/agy-accounts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
 const LOGIN_POLL_MS = 2000;
+/** How often the page reads the limits again while it is open. */
+const QUOTA_REFRESH_MS = 5 * 60_000;
+const QUOTA_STALE_MS = 60_000;
+/** A bucket at or below this share of its limit is drawn as nearly spent. */
+const QUOTA_LOW_FRACTION = 0.1;
 
 function isLoginActive(login: AgyAccountLogin | null | undefined): boolean {
   return login?.status === "starting" || login?.status === "waiting_for_code" || login?.status === "verifying";
@@ -26,6 +36,49 @@ function AccountStatus({ account }: { account: AgyAccountSummary }) {
     );
   }
   return <Badge variant="default">Ready</Badge>;
+}
+
+function QuotaBucketRow({ bucket }: { bucket: AgyAccountQuotaBucket }) {
+  const fraction = bucket.remainingFraction;
+  const percent = fraction === null ? null : Math.round(fraction * 100);
+  const nearlySpent = fraction !== null && fraction <= QUOTA_LOW_FRACTION;
+  return (
+    <div className={`flex items-center gap-3 text-xs ${bucket.disabled ? "text-muted-foreground" : ""}`}>
+      <div className="min-w-0 w-40 shrink-0">
+        <p className="truncate">{bucket.name}</p>
+        {bucket.resetAt && (
+          <p className="truncate text-muted-foreground">Resets {new Date(bucket.resetAt).toLocaleString()}</p>
+        )}
+      </div>
+      <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+        {!bucket.disabled && percent !== null && (
+          <div className={`h-full ${nearlySpent ? "bg-destructive" : "bg-primary"}`} style={{ width: `${percent}%` }} />
+        )}
+      </div>
+      <span className="w-20 shrink-0 text-right tabular-nums">
+        {bucket.disabled ? "Disabled" : percent === null ? "—" : `${percent}% left`}
+      </span>
+    </div>
+  );
+}
+
+function AccountQuotaDetail({ quota, loading }: { quota: AgyAccountQuota | undefined; loading: boolean }) {
+  if (!quota) return loading ? <p className="mt-2 text-xs text-muted-foreground">Checking usage…</p> : null;
+  if (quota.status === "not_signed_in") return null;
+  if (quota.status === "error") return <p className="mt-2 text-xs text-destructive">{quota.error}</p>;
+  return (
+    <div className="mt-3 space-y-3">
+      {quota.groups.map((group) => (
+        <div key={group.name} className="space-y-2">
+          <p className="text-xs font-medium text-muted-foreground">{group.name}</p>
+          {group.buckets.map((bucket) => (
+            <QuotaBucketRow key={bucket.id} bucket={bucket} />
+          ))}
+        </div>
+      ))}
+      <p className="text-xs text-muted-foreground">Checked {new Date(quota.checkedAt).toLocaleTimeString()}</p>
+    </div>
+  );
 }
 
 function LoginPanel({
@@ -107,9 +160,27 @@ export function AgyAccountsSettingsSection({ companyId }: { companyId: string })
     queryFn: () => agyAccountsApi.list(companyId),
     refetchInterval: (current) => (isLoginActive(current.state.data?.login) ? LOGIN_POLL_MS : false),
   });
+  const quotaKey = ["agy-accounts-quota", companyId];
+  const quotaQuery = useQuery({
+    queryKey: quotaKey,
+    queryFn: async () => {
+      const quota = await agyAccountsApi.quota(companyId);
+      // The read also updates each account's quota state, which the list shows.
+      void client.invalidateQueries({ queryKey: key });
+      return quota;
+    },
+    enabled: Boolean(query.data?.available) && (query.data?.accounts.length ?? 0) > 0,
+    staleTime: QUOTA_STALE_MS,
+    refetchInterval: QUOTA_REFRESH_MS,
+    refetchOnWindowFocus: false,
+  });
+  const quotaByAccount = new Map((quotaQuery.data?.accounts ?? []).map((quota) => [quota.accountId, quota]));
   const [label, setLabel] = useState("");
   const [code, setCode] = useState("");
-  const refresh = () => client.invalidateQueries({ queryKey: key });
+  const refresh = () => {
+    void client.invalidateQueries({ queryKey: key });
+    void client.invalidateQueries({ queryKey: quotaKey });
+  };
 
   const start = useMutation({
     mutationFn: () => agyAccountsApi.startLogin(companyId, label.trim() ? { label: label.trim() } : {}),
@@ -168,33 +239,48 @@ export function AgyAccountsSettingsSection({ companyId }: { companyId: string })
       ) : (
         <ul className="divide-y divide-border rounded-md border border-border">
           {data.accounts.map((account) => (
-            <li key={account.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium">{account.label}</p>
-                <p className="text-xs text-muted-foreground">
-                  {account.isDefault ? "Signed in on the Paperclip host" : account.id}
-                </p>
+            <li key={account.id} className="px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{account.label}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {account.isDefault ? "Signed in on the Paperclip host" : account.id}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <AccountStatus account={account} />
+                  {!account.isDefault && data.canManage && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={remove.isPending}
+                      onClick={() => {
+                        if (window.confirm(`Remove "${account.label}" and its Antigravity sign-in?`)) {
+                          remove.mutate(account.id);
+                        }
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <AccountStatus account={account} />
-                {!account.isDefault && data.canManage && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={remove.isPending}
-                    onClick={() => {
-                      if (window.confirm(`Remove "${account.label}" and its Antigravity sign-in?`)) {
-                        remove.mutate(account.id);
-                      }
-                    }}
-                  >
-                    Remove
-                  </Button>
-                )}
-              </div>
+              {account.signedIn && (
+                <AccountQuotaDetail quota={quotaByAccount.get(account.id)} loading={quotaQuery.isFetching} />
+              )}
             </li>
           ))}
         </ul>
+      )}
+      {quotaQuery.error && (
+        <p role="alert" className="text-sm text-destructive">Could not read the account usage.</p>
+      )}
+      {quotaQuery.data && data.accounts.length > 0 && (
+        <div>
+          <Button variant="outline" size="sm" disabled={quotaQuery.isFetching} onClick={() => void quotaQuery.refetch()}>
+            {quotaQuery.isFetching ? "Checking usage…" : "Refresh usage"}
+          </Button>
+        </div>
       )}
       {remove.error && <p role="alert" className="text-sm text-destructive">{remove.error.message}</p>}
 

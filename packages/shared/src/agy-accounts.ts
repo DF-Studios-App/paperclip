@@ -28,6 +28,38 @@ export interface AgyAccountSummary {
   createdAt: string | null;
 }
 
+/** One limit of an AGY account, as the CLI shows it under `/usage`. */
+export interface AgyAccountQuotaBucket {
+  id: string;
+  name: string;
+  /** The window AGY names, for example "5h" or "weekly". */
+  window: string;
+  /** Share of the limit left, from 0 to 1. Null when AGY reports no value. */
+  remainingFraction: number | null;
+  resetAt: string | null;
+  /** AGY shows the bucket as disabled. */
+  disabled: boolean;
+}
+
+export interface AgyAccountQuotaGroup {
+  name: string;
+  buckets: AgyAccountQuotaBucket[];
+}
+
+export type AgyAccountQuotaStatus = "ok" | "not_signed_in" | "error";
+
+export interface AgyAccountQuota {
+  accountId: string;
+  status: AgyAccountQuotaStatus;
+  checkedAt: string;
+  groups: AgyAccountQuotaGroup[];
+  error: string | null;
+}
+
+export interface AgyAccountsQuotaResponse {
+  accounts: AgyAccountQuota[];
+}
+
 export type AgyAccountLoginStatus =
   | "starting"
   | "waiting_for_code"

@@ -1,4 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Before it skips an account marked as exhausted, the adapter asks AGY for the
+// live limits. The tests below write the account state themselves, so the
+// live read reports nothing unless a test sets its own answer.
+vi.mock("../../../packages/adapters/agy-local/src/server/usage.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../packages/adapters/agy-local/src/server/usage.js")>()),
+  readAgyUsage: vi.fn(async () => ({ ok: false as const, error: "AGY usage is not read in this test." })),
+}));
+import { readAgyUsage } from "../../../packages/adapters/agy-local/src/server/usage.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +27,7 @@ import { parseAgyStdoutLine, buildAgyLocalConfig } from "@paperclipai/adapter-ag
 import { printAgyStreamEvent } from "@paperclipai/adapter-agy-local/cli";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
-import { resolveAgyAccountPool, resolveAgyCompanyAccountsDir } from "@paperclipai/adapter-agy-local/server";
+import { readAgyAccountState, resolveAgyAccountPool, resolveAgyCompanyAccountsDir } from "@paperclipai/adapter-agy-local/server";
 
 describe("agy_local parser", () => {
   it("extracts session, summary, and terminal error message from text output", () => {
@@ -778,6 +787,31 @@ describe("agy_local multi-account failover", () => {
     expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBe(homeB);
     expect(runProcessSpy.mock.calls[0][3]).not.toContain("--conversation");
     expect(result.sessionParams).toMatchObject({ agyAccountId: "conta2" });
+  });
+
+  it("uses an account that AGY reports to have quota again, even when its state says exhausted", async () => {
+    await writeState(homeA, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    vi.mocked(readAgyUsage).mockResolvedValueOnce({
+      ok: true,
+      groups: [
+        { name: "Gemini Models", buckets: [{ id: "gemini-weekly", name: "Weekly Limit Remaining", window: "weekly", remainingFraction: 0.9, resetAt: null, disabled: false }] },
+      ],
+    });
+    const runProcessSpy = mockByHome({ [homeA]: ok(SESSION_A) });
+
+    const result = await execute({
+      runId: "run-live-quota",
+      agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      config: accountsConfig(),
+      context: {},
+      onLog: vi.fn(),
+    });
+
+    expect(runProcessSpy).toHaveBeenCalledTimes(1);
+    expect(runProcessSpy.mock.calls[0][4].env?.HOME).toBe(homeA);
+    expect(result.sessionParams).toMatchObject({ agyAccountId: "conta1" });
+    expect(await readAgyAccountState(homeA)).toMatchObject({ exhaustedUntil: null });
   });
 
   it("resumes the saved conversation on the account that owns it", async () => {
