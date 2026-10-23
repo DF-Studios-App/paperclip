@@ -58,6 +58,7 @@ import {
   markAgyAccountExhausted,
   pickAgyAccount,
   readAgyAccountCandidates,
+  refreshExhaustedAgyAccounts,
   resolveAgyAccountPool,
   resolveAgyCompanyAccountsDir,
   type AgyAccountCandidate,
@@ -518,6 +519,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     asString(runtimeSessionParams.agyAccountId, "") ||
     agyAccountCandidates.find((candidate) => candidate.home === defaultAgyHome)?.account.id ||
     null;
+  // An account marked as exhausted may have quota again. Its state is set from
+  // the last failed run, so ask AGY before skipping it.
+  await refreshExhaustedAgyAccounts(agyAccountCandidates, { command: resolvedCommand });
   const initialAgyAccount =
     agyAccountCandidates.length > 0
       ? pickAgyAccount(agyAccountCandidates, { preferId: runtimeSessionAccountId })

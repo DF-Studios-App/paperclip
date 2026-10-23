@@ -1405,6 +1405,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PUT /api/companies/{companyId}/decision-model",
   "POST /api/companies/{companyId}/decision-model/test",
   "GET /api/companies/{companyId}/agy-accounts",
+  "GET /api/companies/{companyId}/agy-accounts/quota",
   "POST /api/companies/{companyId}/agy-accounts/logins",
   "GET /api/companies/{companyId}/agy-accounts/logins/{loginId}",
   "POST /api/companies/{companyId}/agy-accounts/logins/{loginId}/code",
@@ -11206,6 +11207,11 @@ registerCurrentRoute({
 registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/agy-accounts", tags: ["agy-accounts"],
   summary: "List the company's Antigravity CLI accounts, their quota state, and the active sign-in",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/companies/{companyId}/agy-accounts/quota", tags: ["agy-accounts"],
+  summary: "Read the remaining Antigravity CLI limits of each signed-in company account",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 registerCurrentRoute({

@@ -15,10 +15,14 @@ export {
   isAgyHomeSignedIn,
   isAgyAccountAvailable,
   listAgyCompanyAccounts,
+  agyUsageExhaustedUntil,
+  markAgyAccountExhausted,
   readAgyAccountState,
+  refreshExhaustedAgyAccounts,
   removeAgyCompanyAccount,
   resolveAgyAccountPool,
   resolveAgyCompanyAccountsDir,
+  syncAgyAccountQuotaFromUsage,
   type AgyCompanyAccountRecord,
 } from "./accounts.js";
 export {
@@ -34,6 +38,14 @@ export {
   type AgyLoginProcess,
   type StartAgyLoginOptions,
 } from "./login.js";
+export {
+  parseAgyUsageOutput,
+  readAgyUsage,
+  AGY_USAGE_TIMEOUT_MS,
+  type AgyUsageBucket,
+  type AgyUsageGroup,
+  type AgyUsageResult,
+} from "./usage.js";
 export {
   parseAgyOutput,
   parseAntigravityOutput,
