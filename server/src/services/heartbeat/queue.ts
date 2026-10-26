@@ -98,6 +98,7 @@ import {
   HttpError,
   notFound,
 } from "../../errors.js";
+import { asRoutineExecutionSlotConflict } from "../../db-errors.js";
 import { logger } from "../../middleware/logger.js";
 import { publishLiveEvent } from "../live-events.js";
 import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
@@ -1230,12 +1231,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
     async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
       if (!claimedRun || !issueId || !ownsIssue) return;
-      await tx.update(issues).set({
-        executionRunId: claimedRun.id,
-        executionAgentNameKey: normalizeAgentNameKey(agent.name),
-        executionLockedAt: claimedAt,
-        updatedAt: claimedAt,
-      }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      try {
+        await tx.update(issues).set({
+          executionRunId: claimedRun.id,
+          executionAgentNameKey: normalizeAgentNameKey(agent.name),
+          executionLockedAt: claimedAt,
+          updatedAt: claimedAt,
+        }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      } catch (err) {
+        throw asRoutineExecutionSlotConflict(err);
+      }
     }
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
