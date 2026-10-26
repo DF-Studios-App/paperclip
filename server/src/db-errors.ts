@@ -1,3 +1,5 @@
+import { conflict } from "./errors.js";
+
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
 const MAX_CAUSE_DEPTH = 4;
@@ -49,4 +51,22 @@ export function isForeignKeyViolation(error: unknown): boolean {
     current = candidate.cause;
   }
   return false;
+}
+
+const ROUTINE_EXECUTION_SLOT_CONSTRAINT = "issues_open_routine_execution_uq";
+
+/**
+ * Maps the routine execution slot conflict to a 409.
+ *
+ * Only one open issue per routine execution may hold an active run. When a
+ * claim tries to bind a second issue, the database rejects it. Thrown as a
+ * plain error, that failure stops the server during startup recovery. As a
+ * 409 it counts as a deferrable claim rejection: the run stays queued and the
+ * next pass retries it once the slot is free. Other errors pass through.
+ */
+export function asRoutineExecutionSlotConflict(error: unknown): unknown {
+  if (!isUniqueViolation(error, ROUTINE_EXECUTION_SLOT_CONSTRAINT)) return error;
+  return conflict(
+    "Another open issue already holds this routine's execution slot. The run stays queued until the slot is free.",
+  );
 }

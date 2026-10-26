@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isUniqueViolation } from "../db-errors.js";
+import { asRoutineExecutionSlotConflict, isUniqueViolation } from "../db-errors.js";
+import { HttpError } from "../errors.js";
 
 const CONSTRAINT = "issues_open_routine_execution_uq";
 
@@ -47,5 +48,26 @@ describe("isUniqueViolation", () => {
     const looped: { cause?: unknown } = {};
     looped.cause = looped;
     expect(isUniqueViolation(looped, CONSTRAINT)).toBe(false);
+  });
+});
+
+describe("asRoutineExecutionSlotConflict", () => {
+  const SLOT = "issues_open_routine_execution_uq";
+  const wrapped = (constraint: string) => ({
+    message: "Failed query: update \"issues\" set ...",
+    cause: { code: "23505", constraint_name: constraint, message: `duplicate key value violates unique constraint "${constraint}"` },
+  });
+
+  it("turns the routine slot conflict into a 409 that the claim treats as deferrable", () => {
+    const mapped = asRoutineExecutionSlotConflict(wrapped(SLOT));
+    expect(mapped).toBeInstanceOf(HttpError);
+    expect((mapped as HttpError).status).toBe(409);
+  });
+
+  it("passes other unique violations and other errors through unchanged", () => {
+    const other = wrapped("issues_identifier_uq");
+    expect(asRoutineExecutionSlotConflict(other)).toBe(other);
+    const plain = new Error("connection reset");
+    expect(asRoutineExecutionSlotConflict(plain)).toBe(plain);
   });
 });
