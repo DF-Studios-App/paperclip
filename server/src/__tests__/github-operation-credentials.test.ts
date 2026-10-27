@@ -605,6 +605,42 @@ const support = await getEmbeddedPostgresTestSupport();
         {},
       );
     });
+    it("treats a personal-access-token GitHub connection as MCP-only, not a managed identity", async () => {
+      const input = await seed();
+      const token = await grant(input, "A");
+      await db
+        .update(toolConnections)
+        .set({ config: { sourceTemplateKey: "github", connectionMethodKey: "mcp-key" } })
+        .where(eq(toolConnections.id, token.connectionId));
+      await db
+        .update(connectionGrants)
+        .set({
+          credentialSecretRefs: [
+            { secretId: token.secretId, configPath: "credentials.authorization", versionSelector: "latest" },
+          ],
+        })
+        .where(eq(connectionGrants.id, token.id));
+      // Unconfigured lets a standard local run keep the host's own gh login.
+      expect(
+        await resolveManagedGitHubIdentitySelection(db, input.companyId, {
+          agentId: input.agentId,
+          responsibleUserId: "A",
+        }),
+      ).toEqual({ configured: false });
+      const [connection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, token.connectionId));
+      expect(
+        (await filterResolvedGitHubConnectionsForRun({
+          db,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          responsibleUserId: "A",
+          connections: [connection!],
+        })).map((candidate) => candidate.id),
+      ).toEqual([token.connectionId]);
+    });
     it.each([false, true])(
       "withholds sponsor and dedicated credentials from every low-trust policy source (dedicated=%s)",
       async (dedicated) => {

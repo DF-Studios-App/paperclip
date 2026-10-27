@@ -9,6 +9,7 @@ import {
   userSecretDefinitions,
   type Db,
 } from "@paperclipai/db";
+import { APP_DEFINITIONS } from "@paperclipai/shared";
 import { and, eq, inArray, or } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
@@ -293,6 +294,24 @@ export function createGitRemoteAuthProvider(
   };
 }
 
+const githubAppMethods = APP_DEFINITIONS.find((app) => app.slug === "github")?.methods ?? [];
+
+/**
+ * Only OAuth-authorized GitHub connections carry a managed GitHub identity for
+ * shell Git, gh and identity-pinned MCP calls. A personal-access-token
+ * connection is an ordinary MCP connection: it must not displace the host's
+ * own GitHub login with an identity it cannot supply.
+ */
+export function isManagedGitHubIdentityConnection(connection: { config?: unknown; transportConfig?: unknown }): boolean {
+  const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};
+  const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
+    ? connection.transportConfig as Record<string, unknown>
+    : {};
+  if (config.sourceTemplateKey !== "github" && transportConfig.sourceTemplateKey !== "github") return false;
+  if (typeof config.connectionMethodKey !== "string") return true;
+  return githubAppMethods.find((method) => method.key === config.connectionMethodKey)?.auth === "oauth";
+}
+
 export async function resolveManagedGitHubIdentitySelection(
   db: Db,
   companyId: string,
@@ -311,13 +330,7 @@ export async function resolveManagedGitHubIdentitySelection(
   const connections = await db.select().from(toolConnections).where(and(
     eq(toolConnections.companyId, companyId),
   ));
-  const githubConnections = connections.filter((connection) => {
-    const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};
-    const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
-      ? connection.transportConfig as Record<string, unknown>
-      : {};
-    return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
-  });
+  const githubConnections = connections.filter(isManagedGitHubIdentityConnection);
   if (githubConnections.length === 0) return { configured: false };
 
   const connectionIds = githubConnections.map((connection) => connection.id);
@@ -440,15 +453,8 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   responsibleUserId?: string | null;
   connections: T[];
 }): Promise<T[]> {
-  const githubConnections = input.connections.filter((connection) => {
-    const config = connection.config && typeof connection.config === "object"
-      ? connection.config as Record<string, unknown>
-      : {};
-    const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
-      ? connection.transportConfig as Record<string, unknown>
-      : {};
-    return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
-  });
+  // Token connections are not identity candidates and stay available as MCP tools.
+  const githubConnections = input.connections.filter(isManagedGitHubIdentityConnection);
   if (githubConnections.length === 0) return input.connections;
   const selection = await resolveManagedGitHubIdentitySelection(input.db, input.companyId, {
     agentId: input.agentId,
