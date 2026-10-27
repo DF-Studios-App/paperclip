@@ -596,6 +596,27 @@ describe("instance settings routes", () => {
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
   });
 
+  it("lets the company leader agent update instance settings", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "leader-agent",
+      companyId: "company-1",
+      source: "agent_key",
+      isLeaderAgent: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ censorUsernameInLogs: true, feedbackDataSharingPreference: "allowed" });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      censorUsernameInLogs: true,
+      feedbackDataSharingPreference: "allowed",
+    });
+  });
+
   it("rejects agent callers", async () => {
     const app = await createApp({
       type: "agent",
