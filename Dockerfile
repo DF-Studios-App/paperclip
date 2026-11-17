@@ -328,6 +328,9 @@ RUN node server/scripts/prepare-runner-vendor.mjs
 ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
+# The plugin loader reads each plugin's manifest from its package root at startup.
+# Compile the bundled llm-wiki plugin here so dist/manifest.js ships in the image.
+RUN pnpm --filter @paperclipai/plugin-llm-wiki build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
