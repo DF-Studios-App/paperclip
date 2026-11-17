@@ -399,7 +399,9 @@ COPY --from=tailscale-client /out/LICENSE /usr/local/share/licenses/tailscale/LI
 RUN gosu node tailscale version && gosu node tailscaled --version
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# A Windows checkout with core.autocrlf=true copies CRLF line endings into the image.
+# A CRLF shebang makes the kernel fail to run the script, so strip the CR here.
+RUN tr -d '\r' < /usr/local/bin/docker-entrypoint.sh > /usr/local/bin/docker-entrypoint.sh.lf && mv /usr/local/bin/docker-entrypoint.sh.lf /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Installed dependencies are ~2.9 GB of /app and change only with the lockfile.
 # Copied from the deps stage as their own layer, a commit that leaves the
