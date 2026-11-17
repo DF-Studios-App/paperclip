@@ -44,7 +44,7 @@ function stageBody(source: string, stageName: string): string {
 it("keeps per-build runtime metadata out of the weekly CLI-install cache", () => {
   const production = stageBody(dockerfile, "production");
   const tools = production.search(/^RUN echo "cli-tools-epoch:/m);
-  const entrypoint = production.search(/^RUN chmod \+x \/usr\/local\/bin\/docker-entrypoint\.sh/m);
+  const entrypoint = production.search(/^RUN .*chmod \+x \/usr\/local\/bin\/docker-entrypoint\.sh/m);
   const runtime = production.search(/^ENV NODE_ENV=production/m);
   const epoch = production.search(/^ARG CLI_TOOLS_CACHE_EPOCH\b/m);
   expect(tools).toBeGreaterThanOrEqual(0);
