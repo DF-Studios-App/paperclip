@@ -94,6 +94,16 @@ describePostgres("project environment rolling migration", () => {
     }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
+  it("keeps rejecting unknown environment ids after the NOT VALID repair", async () => {
+    await sql`DELETE FROM projects`;
+    const companyId = randomUUID();
+    await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}, 'Legacy company', ${`N${companyId.slice(0, 6)}`})`;
+    const projectId = randomUUID();
+    await sql`INSERT INTO projects (id, company_id, name) VALUES (${projectId}, ${companyId}, 'Legacy project')`;
+    await expect(sql`UPDATE projects SET environment_id = ${randomUUID()} WHERE id = ${projectId}`)
+      .rejects.toThrow("projects_environment_id_environments_id_fk");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
   it("rolls back both DDL and genuine receipts if restoring the legacy values fails", async () => {
     await prepare();
     const before = Array.from(await rows());

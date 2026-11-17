@@ -2,7 +2,7 @@
 
 Owner: fork maintainer (Daniel), executed from worktree
 `antigravity-fork-support-cf9f8b`, branch `claude/antigravity-fork-support-cf9f8b`.
-Status: upstream merge and migration changes committed on `sync/upstream-antigravity-support`; review PR against `DF-Studios-App/paperclip` `master`. `migration-compatibility.ts --check` still fails on 0467 (`lock_hazard_validated_foreign_key`, pinned by `PROJECT_ENVIRONMENT_OVERLAP`). 0452 passes with a measured override (0 rows on the live database) and the accepted `ON DELETE CASCADE` change. The three server skill-package suites fail the same way at HEAD on Windows (49 of 63 tests), so CI on Linux is the check for them. The rest of the guard passes after overrides and deferrals (see `packages/db/src/migrations-deferred/README.md`).
+Status: upstream merge and migration changes committed on `sync/upstream-antigravity-support`; review PR against `DF-Studios-App/paperclip` `master`. `migration-compatibility.ts --check` passes. 0452 uses a measured override (0 rows on the live database) and the accepted `ON DELETE CASCADE` change. 0467 adds its foreign key `NOT VALID`, and its `repairSha256` pin in `PROJECT_ENVIRONMENT_OVERLAP` is recomputed. The three server skill-package suites fail the same way at HEAD on Windows (49 of 63 tests), so CI on Linux is the check for them. The rest of the guard passes after overrides and deferrals (see `packages/db/src/migrations-deferred/README.md`).
 
 ## Questions and answers
 
