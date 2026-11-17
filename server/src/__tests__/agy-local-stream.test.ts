@@ -81,10 +81,10 @@ describe("AGY stream execution and session recovery", () => {
     vi.spyOn(serverUtils, "readPaperclipRuntimeSkillEntries").mockResolvedValue([]);
     vi.spyOn(executionTarget, "ensureAdapterExecutionTargetCommandResolvable").mockResolvedValue(undefined);
     const processSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess");
-    for (const stdout of outputs) processSpy.mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, stdout, stderr: "" });
+    for (const stdout of outputs) processSpy.mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: null, stdout, stderr: "" });
     const result = await execute({
       runId: "stream-run", agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: "saved-session", sessionParams: { sessionId: "saved-session", cwd: sessionCwd }, sessionDisplayId: "saved-session" },
+      runtime: { sessionId: "saved-session", sessionParams: { sessionId: "saved-session", cwd: sessionCwd }, taskKey: null, sessionDisplayId: "saved-session" },
       config: { cwd: process.cwd(), command: process.execPath }, context: {}, onLog: vi.fn(),
     });
     return { result, args: processSpy.mock.calls.map((call) => call[3]) };
@@ -361,14 +361,14 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
     vi.spyOn(serverUtils, "readPaperclipRuntimeSkillEntries").mockResolvedValue([]);
     vi.spyOn(executionTarget, "ensureAdapterExecutionTargetCommandResolvable").mockResolvedValue(undefined);
     const processSpy = vi.spyOn(executionTarget, "runAdapterExecutionTargetProcess");
-    processSpy.mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, stdout: params.stdout, stderr: "" });
+    processSpy.mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: null, stdout: params.stdout, stderr: "" });
     return execute({
       runId: params.runId,
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
       runtime: {
         sessionId: params.sessionId ?? null,
         sessionParams: params.sessionParams ?? null,
-        sessionDisplayId: params.sessionId ?? null,
+        taskKey: null, sessionDisplayId: params.sessionId ?? null,
       },
       config: { cwd: process.cwd(), command: process.execPath },
       context: {},
@@ -412,7 +412,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
 
       const hb1 = simulateHeartbeatNormalization({
         sessionId: "sess-1",
-        rawUsage: res1.usage,
+        rawUsage: res1.usage ?? null,
         usageBasis: res1.usageBasis,
         previousRawUsage: null,
       });
@@ -460,9 +460,9 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       // Heartbeat normalization must NOT subtract previous run's 1000 tokens to get 200:
       const hb2 = simulateHeartbeatNormalization({
         sessionId: "sess-1",
-        rawUsage: res2.usage,
+        rawUsage: res2.usage ?? null,
         usageBasis: res2.usageBasis,
-        previousRawUsage: res1.usage,
+        previousRawUsage: res1.usage ?? null,
       });
       expect(hb2.normalizedUsage).toEqual({ inputTokens: 1200, outputTokens: 120, cachedInputTokens: 60 });
       expect(hb2.derivedFromSessionTotals).toBe(false);
@@ -541,7 +541,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       // Heartbeat derives delta from previous run's raw usage (1000):
       const hb3 = simulateHeartbeatNormalization({
         sessionId: "sess-no-steps",
-        rawUsage: res3.usage,
+        rawUsage: res3.usage ?? null,
         usageBasis: res3.usageBasis,
         previousRawUsage: { inputTokens: 1000, outputTokens: 100, cachedInputTokens: 50 },
       });
@@ -573,7 +573,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
         }),
       ].join("\n");
       const res1 = await executeTurn({ runId: "r-1", stdout: turn1Output });
-      expect(res1.usage.inputTokens).toBe(1000);
+      expect(res1.usage!.inputTokens).toBe(1000);
       expect(res1.usageBasis).toBe("per_run");
 
       // Turn 2: Fallback cumulative (no step usage), cumulative result = 2200
@@ -585,7 +585,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
         }),
       ].join("\n");
       const res2 = await executeTurn({ runId: "r-2", sessionId: "sess-alt", sessionParams: res1.sessionParams, stdout: turn2Output });
-      expect(res2.usage.inputTokens).toBe(1200); // 2200 - 1000
+      expect(res2.usage!.inputTokens).toBe(1200); // 2200 - 1000
       expect(res2.usageBasis).toBe("per_run");
 
       // Turn 3: Step usage = 500, cumulative result = 2700
@@ -607,7 +607,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
         }),
       ].join("\n");
       const res3 = await executeTurn({ runId: "r-3", sessionId: "sess-alt", sessionParams: res2.sessionParams, stdout: turn3Output });
-      expect(res3.usage.inputTokens).toBe(500);
+      expect(res3.usage!.inputTokens).toBe(500);
       expect(res3.usageBasis).toBe("per_run");
 
       // Turn 4: Fallback cumulative (no step usage), cumulative result = 3000
@@ -619,11 +619,11 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
         }),
       ].join("\n");
       const res4 = await executeTurn({ runId: "r-4", sessionId: "sess-alt", sessionParams: res3.sessionParams, stdout: turn4Output });
-      expect(res4.usage.inputTokens).toBe(300); // 3000 - 2700
+      expect(res4.usage!.inputTokens).toBe(300); // 3000 - 2700
       expect(res4.usageBasis).toBe("per_run");
 
       // Verify total across all 4 runs equals 3000:
-      const totalInputTokens = res1.usage.inputTokens + res2.usage.inputTokens + res3.usage.inputTokens + res4.usage.inputTokens;
+      const totalInputTokens = res1.usage!.inputTokens + res2.usage!.inputTokens + res3.usage!.inputTokens + res4.usage!.inputTokens;
       expect(totalInputTokens).toBe(3000);
     } finally {
       vi.restoreAllMocks();
@@ -657,7 +657,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       ].join("\n");
       const res1 = await executeTurn({ runId: "r-old", stdout: turn1Output });
       expect(res1.sessionId).toBe("sess-old");
-      expect(res1.usage.inputTokens).toBe(1000);
+      expect(res1.usage!.inputTokens).toBe(1000);
       expect(res1.usageBasis).toBe("per_run");
 
       // Turn 2 is attempted on sess-old, but AGY CLI starts a brand new conversation sess-new with 500 tokens
@@ -677,7 +677,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
 
       expect(res2.sessionId).toBe("sess-new");
       // Must NOT subtract sess-old's 1000 tokens to get 0:
-      expect(res2.usage.inputTokens).toBe(500);
+      expect(res2.usage!.inputTokens).toBe(500);
       expect(res2.usageBasis).toBe("per_run");
       expect(res2.sessionParams).toMatchObject({
         sessionId: "sess-new",
@@ -705,7 +705,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       ].join("\n");
 
       const res1 = await executeTurn({ runId: "r-1", stdout: turn1Output });
-      expect(res1.usage.inputTokens).toBe(1000);
+      expect(res1.usage!.inputTokens).toBe(1000);
       expect(res1.usageBasis).toBe("per_run");
 
       // Pass through resolveNextSessionState (which serializes and deserializes via sessionCodec)
@@ -747,7 +747,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
         sessionParams: persistedParams1,
         stdout: turn2Output,
       });
-      expect(res2.usage.inputTokens).toBe(200);
+      expect(res2.usage!.inputTokens).toBe(200);
       expect(res2.usageBasis).toBe("per_run");
 
       const nextSession2 = resolveNextSessionState({
@@ -791,7 +791,7 @@ describe("AGY resumed session token accounting and heartbeat normalization", () 
       // Before fix: sessionCodec discarded cumulativeUsage, so Turn 3 had no previousCumulativeUsage,
       // and counted all 1,500 tokens as session_cumulative.
       // With fix: 1500 - 1200 = 300 tokens, basis per_run!
-      expect(res3.usage.inputTokens).toBe(300);
+      expect(res3.usage!.inputTokens).toBe(300);
       expect(res3.usageBasis).toBe("per_run");
       expect(res3.sessionParams).toMatchObject({
         sessionId: "sess-persist-test",

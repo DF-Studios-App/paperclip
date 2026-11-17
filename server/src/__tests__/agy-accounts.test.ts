@@ -25,6 +25,15 @@ import {
 
 const activity = vi.hoisted(() => ({ logActivity: vi.fn(async () => ({})) }));
 vi.mock("../services/activity-log.js", () => activity);
+// The route's permission check goes through the connection-management service,
+// which needs a real database. These tests use a stub db and cover the route's
+// own rules; the authorization service has its own suite.
+vi.mock("../services/connection-management.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/connection-management.js")>()),
+  connectionManagementService: () => ({
+    capability: vi.fn(async () => ({ allowed: true, reason: null, operation: "manage" })),
+  }),
+}));
 
 import { agyAccountService, resetAgyAccountLoginsForTests } from "../services/agy-accounts.js";
 import { agyAccountRoutes } from "../routes/agy-accounts.js";
