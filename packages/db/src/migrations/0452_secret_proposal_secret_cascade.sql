@@ -1,3 +1,4 @@
+-- paperclip:migration-compat online_compatible: company_secret_proposals holds 0 rows on the database behind the running server (measured 2026-11-17), so the drop and the NOT VALID re-add touch an empty table and no cascade runs; the ON DELETE CASCADE change is the accepted decision; other deployments are unmeasured.
 ALTER TABLE "company_secret_proposals" DROP CONSTRAINT IF EXISTS "company_secret_proposals_secret_id_company_secrets_id_fk";
 --> statement-breakpoint
 ALTER TABLE "company_secret_proposals" ADD CONSTRAINT "company_secret_proposals_secret_id_company_secrets_id_fk" FOREIGN KEY ("secret_id") REFERENCES "public"."company_secrets"("id") ON DELETE cascade ON UPDATE no action NOT VALID;
