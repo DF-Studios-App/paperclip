@@ -2,7 +2,7 @@
 
 Owner: fork maintainer (Daniel), executed from worktree
 `antigravity-fork-support-cf9f8b`, branch `claude/antigravity-fork-support-cf9f8b`.
-Status: upstream merge committed on the sync branch; PR open for review. The migration guard still reports 8 `unknown` migrations (see the PR).
+Status: upstream merge and migration changes committed on `sync/upstream-antigravity-support`; review PR against `DF-Studios-App/paperclip` `master`. `migration-compatibility.ts --check` still fails on 0452 (`drop_constraint`, cascade semantics awaiting a decision) and 0467 (`lock_hazard_validated_foreign_key`, pinned by `PROJECT_ENVIRONMENT_OVERLAP`). The three server skill-package suites fail the same way at HEAD on Windows (49 of 63 tests), so CI on Linux is the check for them. The rest of the guard passes after overrides and deferrals (see `packages/db/src/migrations-deferred/README.md`).
 
 ## Questions and answers
 

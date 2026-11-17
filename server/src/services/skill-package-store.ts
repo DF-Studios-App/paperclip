@@ -457,7 +457,7 @@ export function skillPackageStore(db: Db, suppliedStorage?: StorageService, cach
       const upload = { token, legacy: false, provider: storage().provider, archiveKey: `${prefix}/files.tar.gz`, manifestKey: `${prefix}/manifest.json`, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() };
       const [created] = await db.transaction(async tx => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillPackages);
-        return tx.insert(snapshots).values({ companyId, contentHash: manifest.contentHash, upload, restore,
+        return tx.insert(snapshots).values({ companyId, contentHash: manifest.contentHash, fileInventory: [], upload, restore,
           migrationAt: null, maintenanceAt: new Date(Date.now() + 24 * 60 * 60_000) }).onConflictDoNothing().returning(descriptorColumns);
       });
       let existing = created ?? (await db.select(descriptorColumns).from(snapshots).where(and(eq(snapshots.companyId, companyId), eq(snapshots.contentHash, manifest.contentHash))))[0]!;

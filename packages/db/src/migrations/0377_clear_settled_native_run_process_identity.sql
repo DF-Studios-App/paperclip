@@ -1,3 +1,4 @@
+-- paperclip:migration-compat online_compatible: the UPDATE only clears process fields on settled native runs older than one day; its outer filter matches 0 rows on the database behind the running server (2026-11-16), so it takes no row lock there, and other deployments are unmeasured.
 UPDATE "heartbeat_runs" AS "run"
 SET "process_pid" = NULL, "process_group_id" = NULL, "process_started_at" = NULL
 WHERE "run"."runtime_mode" = 'native'

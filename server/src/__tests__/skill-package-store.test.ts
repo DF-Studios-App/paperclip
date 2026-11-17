@@ -508,7 +508,7 @@ describe.skipIf(!support.supported)("external skill packages", () => {
   it("does not delete an orphan whose expired upload was reclaimed after selection", async () => {
     const companyId = await company();
     const upload = { token: randomUUID(), provider: "local_disk" as const, archiveKey: `${companyId}/old/archive`, manifestKey: `${companyId}/old/manifest`, expiresAt: new Date(0).toISOString() };
-    const [row] = await db.insert(snapshots).values({ companyId, contentHash: skillSnapshotHash(files), createdAt: new Date(0), upload }).returning();
+    const [row] = await db.insert(snapshots).values({ companyId, contentHash: skillSnapshotHash(files), fileInventory: [], createdAt: new Date(0), upload }).returning();
     const renewed = { ...upload, token: randomUUID(), expiresAt: new Date(Date.now() + 600_000).toISOString() };
     let unlock!: () => void, locked!: () => void, waiting!: () => void;
     const release = new Promise<void>(resolve => { unlock = resolve; });
