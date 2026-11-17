@@ -24,7 +24,7 @@ export function resolveClaudeModel(
 export const type = "claude_local";
 
 export function claudeLocalReasoningEffortsForModel(model: string): readonly string[] {
-  const id = model.trim().replace(/\[1m\]$/, "").replace(/^(?:(?:us|eu|apac|global)\.)?anthropic\./, "");
+  const id = model.trim().replace(/\[1m\]$/, "").replace(/^(?:(?:us|eu|apac|global|jp|au)\.)?anthropic\./, "");
   // Haiku 5.5 is the first Haiku with effort levels; older Haiku models take none.
   if (/^claude-haiku-/.test(id) && id !== "claude-haiku-5-5") return [];
   if (/^claude-(?:opus-5(?:-5)?|opus-4-[78]|sonnet-5(?:-5)?|fable-5(?:-1)?|haiku-5-5)$/.test(id)) {

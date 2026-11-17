@@ -1,0 +1,8 @@
+-- paperclip:migration-compat online_compatible: this index is created by 0409 in this same batch and does not exist on the database behind the running server (measured 2026-11-16: 371 migrations applied, index absent), so no running release uses it; DROP INDEX CONCURRENTLY and CREATE INDEX CONCURRENTLY take only SHARE UPDATE EXCLUSIVE, which does not block reads or writes.
+-- Listed in MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS because CONCURRENTLY cannot run in a transaction. Both statements use IF EXISTS / IF NOT EXISTS, and the DROP runs first, so a rerun after a failed build removes the INVALID index it left and rebuilds it.
+DROP INDEX CONCURRENTLY IF EXISTS "heartbeat_runs_cancelled_workspace_preservation_idx";--> statement-breakpoint
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_cancelled_workspace_preservation_idx" ON "heartbeat_runs" USING btree ("id","company_id") WHERE "heartbeat_runs"."runtime_mode" = 'native' AND "heartbeat_runs"."status" = 'cancelled'
+        AND "heartbeat_runs"."runner_profile_json"->'nativeWorkspaceSync'->>'state' = 'prepared'
+        AND "heartbeat_runs"."result_json"->'nativeCancellation'->>'dispatchState' = 'acknowledged'
+        AND ("heartbeat_runs"."result_json"->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
+          AND "heartbeat_runs"."result_json"->>'workspaceRestoreFailure' IN ('restore_permission_denied', 'restore_lock_timeout', 'restore_unsafe_archive', 'restore_invalid_metadata', 'restore_failed')) IS NOT TRUE;

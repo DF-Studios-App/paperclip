@@ -6,11 +6,28 @@ import { readCodexAuthInfo, fetchCodexQuota } from "@paperclipai/adapter-codex-l
 import { parseGrokAuthPayload, hasUsableGrokAuthValue } from "@paperclipai/adapter-grok-local/server";
 import type { AiProvider } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { verifyAntigravityCredential } from "../vendor/paperclip-runner/index.js";
 import {
   parseClaudeSubscriptionCredential,
   serializeClaudeSubscriptionCredential,
   type ClaudeSubscriptionCredential,
 } from "./claude-subscription-credential.js";
+
+export async function readVerifiedLocalAiCredentialDetails(
+  provider: AiProvider,
+  loginHome: string,
+  options: { storable?: boolean } = {},
+) {
+  if (provider === "google") {
+    try {
+      const verified = await verifyAntigravityCredential(loginHome);
+      return { credential: verified.credential, accountLabel: verified.accountEmail };
+    } catch {
+      throw unprocessable("Could not verify the Google account. Finish browser sign-in, then try Connect again.");
+    }
+  }
+  return { credential: await readVerifiedLocalAiCredential(provider, loginHome, options), accountLabel: undefined };
+}
 
 /**
  * Read and verify a connection-specific login home. `storable` returns the
@@ -27,6 +44,7 @@ export async function readVerifiedLocalAiCredential(
     ? "Start local sign-in for this connection before connecting."
     : "Start browser sign-in for this connection before connecting.");
   try {
+    if (provider === "google") return (await verifyAntigravityCredential(loginHome)).credential;
     if (provider === "anthropic") {
       // Never change process.env or fall back to the server account when an
       // authenticated user's isolated login is missing or invalid.

@@ -1,0 +1,3 @@
+-- paperclip:migration-compat online_compatible: Both statements are catalog-only on PostgreSQL 11 and later: SET DEFAULT rewrites no rows, and ADD COLUMN with a constant default and NOT NULL is not rewritten. The previous release's inserts still succeed and only pick up the new default.
+ALTER TABLE "user_workspace_preferences" ALTER COLUMN "coordinator_workspace_enabled" SET DEFAULT true;--> statement-breakpoint
+ALTER TABLE "user_workspace_preferences" ADD COLUMN IF NOT EXISTS "classic_workspace_enabled" boolean DEFAULT false NOT NULL;

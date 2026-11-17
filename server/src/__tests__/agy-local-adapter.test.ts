@@ -282,7 +282,7 @@ describe("agy_local ui build config", () => {
       extraArgs: "--verbose, --timeout=60",
       envVars: "FOO=BAR\nBAZ=QUX",
       dangerouslyBypassSandbox: true,
-    });
+    } as never);
 
     expect(config.cwd).toBe("/repo");
     expect(config.model).toBe("gemini-3.8-flash-high");
@@ -297,7 +297,7 @@ describe("agy_local ui build config", () => {
   });
 
   it("defaults model to DEFAULT_AGY_LOCAL_MODEL when empty", () => {
-    const config = buildAgyLocalConfig({});
+    const config = buildAgyLocalConfig({} as never);
     expect(config.model).toBe(DEFAULT_AGY_LOCAL_MODEL);
   });
 });
@@ -373,6 +373,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Antigravity CLI init (session: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)\nDone",
       stderr: "",
     });
@@ -380,7 +382,7 @@ describe("agy_local execute argument construction & session retry", () => {
     const result = await execute({
       runId: "run-1",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: {
         command: "agy",
         model: "auto",
@@ -419,6 +421,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Done",
       stderr: "",
     });
@@ -427,7 +431,7 @@ describe("agy_local execute argument construction & session retry", () => {
       await execute({
         runId: "run-runtime-mcp",
         agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
         config: { command: "agy", model: "auto", cwd },
         context: {},
         runtimeMcp: {
@@ -466,6 +470,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Done",
       stderr: "",
     });
@@ -473,7 +479,7 @@ describe("agy_local execute argument construction & session retry", () => {
     await execute({
       runId: "run-skip-permissions",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: {
         command: "agy",
         model: "auto",
@@ -494,6 +500,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Done",
       stderr: "",
     });
@@ -501,7 +509,7 @@ describe("agy_local execute argument construction & session retry", () => {
     await execute({
       runId: "run-goal-prefix",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: {
         command: "agy",
         model: "auto",
@@ -532,6 +540,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Done",
       stderr: "",
     });
@@ -539,7 +549,7 @@ describe("agy_local execute argument construction & session retry", () => {
     await execute({
       runId: "run-2",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: {
         command: "agy",
         model: "gemini-3.8-flash-high",
@@ -563,6 +573,8 @@ describe("agy_local execute argument construction & session retry", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Resumed",
       stderr: "",
     });
@@ -573,7 +585,7 @@ describe("agy_local execute argument construction & session retry", () => {
       runtime: {
         sessionId: "sess-resumed",
         sessionParams: { sessionId: "sess-resumed", cwd: process.cwd() },
-        sessionDisplayId: "sess-resumed",
+        taskKey: null, sessionDisplayId: "sess-resumed",
       },
       config: {
         cwd: process.cwd(),
@@ -600,6 +612,8 @@ describe("agy_local execute argument construction & session retry", () => {
           exitCode: 1,
           signal: null,
           timedOut: false,
+          pid: null,
+          startedAt: null,
           stdout: "",
           stderr: "Error: unknown conversation sess-stale",
         };
@@ -608,6 +622,8 @@ describe("agy_local execute argument construction & session retry", () => {
         exitCode: 0,
         signal: null,
         timedOut: false,
+        pid: null,
+        startedAt: null,
         stdout: "Started fresh conversation 99999999-9999-4999-8999-999999999999\nDone",
         stderr: "",
       };
@@ -620,7 +636,7 @@ describe("agy_local execute argument construction & session retry", () => {
       runtime: {
         sessionId: "sess-stale",
         sessionParams: { sessionId: "sess-stale", cwd: process.cwd() },
-        sessionDisplayId: "sess-stale",
+        taskKey: null, sessionDisplayId: "sess-stale",
       },
       config: {
         cwd: process.cwd(),
@@ -651,7 +667,7 @@ describe("agy_local execute argument construction & session retry", () => {
       execute({
         runId: "run-unresolvable",
         agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
         config: {
           command: "agy",
           cwd: process.cwd(),
@@ -672,12 +688,14 @@ describe("agy_local multi-account failover", () => {
   let homeA: string;
   let homeB: string;
 
-  type ProcResult = { exitCode: number; signal: null; timedOut: false; stdout: string; stderr: string };
-  const quota = (stderr = QUOTA_4H): ProcResult => ({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr });
+  type ProcResult = { exitCode: number; signal: null; timedOut: false; pid: null; startedAt: null; stdout: string; stderr: string };
+  const quota = (stderr = QUOTA_4H): ProcResult => ({ exitCode: 1, signal: null, timedOut: false, pid: null, startedAt: null, stdout: "", stderr });
   const ok = (sessionId: string): ProcResult => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
+    pid: null,
+    startedAt: null,
     stdout: `Antigravity CLI init (session: ${sessionId})\nDone`,
     stderr: "",
   });
@@ -739,7 +757,7 @@ describe("agy_local multi-account failover", () => {
       runtime: {
         sessionId: SESSION_A,
         sessionParams: { sessionId: SESSION_A, cwd: process.cwd(), agyAccountId: "conta1" },
-        sessionDisplayId: SESSION_A,
+        taskKey: null, sessionDisplayId: SESSION_A,
       },
       config: accountsConfig(),
       context: {},
@@ -776,7 +794,7 @@ describe("agy_local multi-account failover", () => {
       runtime: {
         sessionId: SESSION_A,
         sessionParams: { sessionId: SESSION_A, cwd: process.cwd(), agyAccountId: "conta1" },
-        sessionDisplayId: SESSION_A,
+        taskKey: null, sessionDisplayId: SESSION_A,
       },
       config: accountsConfig(),
       context: {},
@@ -802,7 +820,7 @@ describe("agy_local multi-account failover", () => {
     const result = await execute({
       runId: "run-live-quota",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: accountsConfig(),
       context: {},
       onLog: vi.fn(),
@@ -823,7 +841,7 @@ describe("agy_local multi-account failover", () => {
       runtime: {
         sessionId: SESSION_B,
         sessionParams: { sessionId: SESSION_B, cwd: process.cwd(), agyAccountId: "conta2" },
-        sessionDisplayId: SESSION_B,
+        taskKey: null, sessionDisplayId: SESSION_B,
       },
       config: accountsConfig(),
       context: {},
@@ -846,7 +864,7 @@ describe("agy_local multi-account failover", () => {
     const result = await execute({
       runId: "run-all-exhausted",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: accountsConfig(),
       context: {},
       onLog: vi.fn(),
@@ -870,7 +888,7 @@ describe("agy_local multi-account failover", () => {
     const result = await execute({
       runId: "run-none-available",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: accountsConfig(),
       context: {},
       onLog: vi.fn(),
@@ -888,7 +906,7 @@ describe("agy_local multi-account failover", () => {
     const result = await execute({
       runId: "run-transient",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: accountsConfig(),
       context: {},
       onLog: vi.fn(),
@@ -924,7 +942,7 @@ describe("agy_local multi-account failover", () => {
       const result = await execute({
         runId: "run-company-accounts",
         agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
         config: { command: "agy", cwd: process.cwd() },
         context: {},
         onLog: vi.fn(),
@@ -950,14 +968,14 @@ describe("agy_local multi-account failover", () => {
       execFileSync("git", ["init", "-q"], { cwd: workspace });
       await fs.writeFile(path.join(workspace, "feature.ts"), "export const done = true;\n");
       const runProcessSpy = mockByHome({
-        [homeA]: { exitCode: 1, signal: null, timedOut: false, stdout: "Planning the change\nWrote feature.ts", stderr: QUOTA_4H },
+        [homeA]: { exitCode: 1, signal: null, timedOut: false, pid: null, startedAt: null, stdout: "Planning the change\nWrote feature.ts", stderr: QUOTA_4H },
         [homeB]: ok(SESSION_B),
       });
 
       await execute({
         runId: "run-handoff",
         agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+        runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
         config: { ...accountsConfig(), cwd: workspace },
         context: {},
         onLog: vi.fn(),
@@ -977,14 +995,14 @@ describe("agy_local multi-account failover", () => {
 
   it("skips an account that is not signed in without recording quota", async () => {
     const runProcessSpy = mockByHome({
-      [homeA]: { exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "Error: Not logged in" },
+      [homeA]: { exitCode: 1, signal: null, timedOut: false, pid: null, startedAt: null, stdout: "", stderr: "Error: Not logged in" },
       [homeB]: ok(SESSION_B),
     });
 
     const result = await execute({
       runId: "run-not-signed-in",
       agent: { id: "a1", companyId: "c1", name: "Agent", adapterType: "agy_local", adapterConfig: {} },
-      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null },
+      runtime: { sessionId: null, sessionParams: null, taskKey: null, sessionDisplayId: null },
       config: accountsConfig(),
       context: {},
       onLog: vi.fn(),
@@ -1017,6 +1035,8 @@ describe("agy_local testEnvironment", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
+      pid: null,
+      startedAt: null,
       stdout: "Usage of agy:\n  --help",
       stderr: "",
     });
