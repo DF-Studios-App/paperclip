@@ -25,7 +25,7 @@ import { describe, expect, it } from "vitest";
  */
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const read = (...segments: string[]) => readFileSync(path.join(repoRoot, ...segments), "utf8");
+const read = (...segments: string[]) => readFileSync(path.join(repoRoot, ...segments), "utf8").replace(/\r\n/g, "\n"); // Windows checkouts use CRLF; the patterns below expect LF.
 
 const dockerfile = read("Dockerfile");
 const agentRuntimeBase = read("docker", "agent-runtime", "Dockerfile.base");
